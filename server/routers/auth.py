@@ -11,12 +11,20 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
-from lib.i18n import Translator
-from server.auth import CurrentUser, check_credentials, create_token
+from server.auth import (
+    CurrentUser,
+    check_credentials,
+    create_token,
+    is_auth_enabled,
+)
+from server.i18n import Translator
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# 公开端点：拿到 token 之前必须可达，注册时不挂 Bearer 依赖。
+public_router = APIRouter()
 
 
 # ==================== 响应模型 ====================
@@ -32,10 +40,26 @@ class VerifyResponse(BaseModel):
     username: str
 
 
+class AuthStatusResponse(BaseModel):
+    enabled: bool
+
+
 # ==================== 路由 ====================
 
 
-@router.post("/auth/token", response_model=TokenResponse)
+@public_router.get("/auth/status", response_model=AuthStatusResponse)
+async def auth_status():
+    """暴露 ``AUTH_ENABLED`` 状态供前端 bootstrap 判断是否需要登录拦截。
+
+    前端 ``auth-store.initialize()`` 在 localStorage 无 token 时调用本接口：
+    ``enabled=false`` 时跳过登录页直接进主界面；``enabled=true`` 时保留原
+    登录链路。本接口本身**不要求认证**——一个 boolean 比 401 探针更直观，
+    且实际"是否需要登录"通过 401/200 也能从外部观察到，因此不增量泄露。
+    """
+    return AuthStatusResponse(enabled=is_auth_enabled())
+
+
+@public_router.post("/auth/token", response_model=TokenResponse)
 async def login_for_access_token(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     _t: Translator,
@@ -43,8 +67,10 @@ async def login_for_access_token(
     """用户登录
 
     使用 OAuth2 标准表单格式验证凭据，成功返回 access_token。
+    ``AUTH_ENABLED=false`` 时跳过凭据校验，直接签发 token，让前端
+    LoginPage 即便被打开也能正常跳转主界面。
     """
-    if not check_credentials(form_data.username, form_data.password):
+    if is_auth_enabled() and not check_credentials(form_data.username, form_data.password):
         logger.warning("登录失败: 用户名或密码错误 (用户: %s)", form_data.username)
         raise HTTPException(
             status_code=401,

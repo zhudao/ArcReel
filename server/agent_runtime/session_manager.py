@@ -8,50 +8,73 @@ import json
 import logging
 import os
 import time
-from collections.abc import AsyncIterable, Callable
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Literal, Optional
 from uuid import uuid4
 
-from lib.i18n import LOCALE_LANGUAGE_MAP
-from server.agent_runtime.message_utils import extract_plain_user_content
-from server.agent_runtime.models import SessionMeta, SessionStatus
+from lib.agent.agent_memory_paths import project_memory_dir
+from lib.agent.credential_tiers import AgentPricing
+from lib.db.base import DEFAULT_USER_ID
+from lib.i18n import DEFAULT_LOCALE
+from lib.infra.data_root_layout import DataRootLayout
+from lib.infra.logging_utils import redact_diagnostic_text
+from lib.infra.path_safety import PathTraversalError, safe_join
+from server.agent_runtime.agent_access_policy import AgentAccessPolicy
+from server.agent_runtime.entry_pipeline import SessionEntryPipeline
+from server.agent_runtime.event_log import (
+    REPLAYED_USER_ECHO_ENTRY_UUID_KEY,
+    REPLAYED_USER_ECHO_KEY,
+    EventLogStore,
+    build_user_entry,
+)
+from server.agent_runtime.failure_observation import (
+    build_startup_failure_observation,
+    failure_observation_json,
+)
+from server.agent_runtime.message_serialization import (
+    is_main_turn_activity,
+    message_to_dict,
+    utc_now_iso,
+)
+from server.agent_runtime.models import (
+    Heartbeat,
+    LiveMessage,
+    QueuedMessage,
+    QueuedMessageState,
+    SessionMeta,
+    SessionStatus,
+    SessionStreamEvent,
+    SubscriptionReady,
+    WithdrawalIntent,
+)
+from server.agent_runtime.options_assembler import OptionsAssembler, agent_pricing_of
+from server.agent_runtime.result_status import resolve_result_status
+from server.agent_runtime.sdk_frames import CommandLifecycle
 from server.agent_runtime.session_actor import SessionActor, SessionCommand
 from server.agent_runtime.session_store import SessionMetaStore
+from server.agent_runtime.usage_extraction import ModelTurnUsage, TurnUsageMeter
+from server.sse_channel import IDLE, EvictNonCriticalAndSignal, SseChannel
 
 logger = logging.getLogger(__name__)
 
-try:
-    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
-    from claude_agent_sdk.types import HookMatcher, PermissionResultAllow, SystemPromptPreset
+from claude_agent_sdk import ClaudeSDKClient
+from claude_agent_sdk.types import (
+    PermissionResultAllow,
+    PermissionResultDeny,
+    SettingSource,
+)
 
-    try:
-        from claude_agent_sdk.types import PermissionResultDeny
-    except ImportError:
-        PermissionResultDeny = None
-    try:
-        from claude_agent_sdk import tag_session
-    except ImportError:
-        tag_session = None
+from lib.backends.providers import PROVIDER_ANTHROPIC, CallStatus
+from lib.billing.ledger import Ledger
+from lib.billing.metering import Usage, token_usage
+from lib.config.service import ConfigService
+from lib.db import async_session_factory
+from lib.db.repositories.usage_repo import AgentModelCall
+from lib.i18n.display_names import agent_provider_id
 
-    SDK_AVAILABLE = True
-except ImportError:
-    ClaudeSDKClient = None
-    ClaudeAgentOptions = None
-    HookMatcher = None
-    PermissionResultAllow = None
-    PermissionResultDeny = None
-    tag_session = None
-    SDK_AVAILABLE = False
-
-try:
-    from lib.config.service import ConfigService
-    from lib.db import async_session_factory
-except ImportError:
-    async_session_factory = None  # type: ignore[assignment]
-    ConfigService = None  # type: ignore[assignment]
+SDK_AVAILABLE = True
 
 
 # inbox 积压告警阈值：~1s 内 100 条 stream_event（典型流式频率上限）；
@@ -60,15 +83,106 @@ _INBOX_BACKLOG_WARN_THRESHOLD = 100
 _INBOX_BACKLOG_RESET_THRESHOLD = 50  # 降至此水位以下才重置告警状态，避免抖动刷屏
 
 
+class _StartupStderrCollector:
+    """在 sdk_session_id 就绪前无损收集 stderr，随后停止并释放。"""
+
+    def __init__(self) -> None:
+        self._active = True
+        self._lines: list[str] = []
+
+    def __call__(self, line: str) -> None:
+        logger.warning("claude_agent_sdk stderr: %s", redact_diagnostic_text(line))
+        if self._active:
+            self._lines.append(line)
+
+    def render(self) -> str:
+        return "\n".join(self._lines)
+
+    def stop(self) -> None:
+        self._active = False
+        self._lines.clear()
+
+
 class SessionCapacityError(Exception):
     """所有并发槽位已被 running 会话占满，无法创建新连接。"""
 
-    pass
+
+class UnrecordedMessageError(Exception):
+    """同键重试命中的消息已被 Agent 接纳，但没能写入事件日志：不再送入 CLI，避免同一消息执行两次。"""
 
 
-def _utc_now_iso() -> str:
-    """Return current UTC timestamp in ISO-8601 format."""
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+class QueuedMessageNotFoundError(Exception):
+    """要撤回的消息不是本会话排队过的消息（或会话已不在内存中，排队消息随之清理）。"""
+
+
+class QueuedMessageWithdrawalPendingError(Exception):
+    """同一条排队消息的撤回仍在等待 CLI 答复。"""
+
+
+WithdrawalOutcome = Literal["withdrawn", "accepted"]
+"""撤回排队消息的结果：``withdrawn`` 已撤回并移出排队，``accepted`` 已被 Agent 接收、照常进入对话。"""
+
+SendNowOutcome = Literal["sent", "accepted"]
+"""立即发送的结果：``sent`` 已以 now 优先级重新送入，``accepted`` 已被 Agent 接收、不再重发。"""
+
+
+class AgentStartupError(RuntimeError):
+    """ClaudeSDKClient 启动失败时携带 SDK stderr 的异常。
+
+    SDK 内部用 ``ProcessError`` 抛子进程非 0 退出，但其 ``stderr`` 字段写死为
+    ``"Check stderr output for details"`` —— 真实 stderr 只能通过
+    ``ClaudeAgentOptions.stderr`` 回调拿到。本异常把回调收集的 stderr 行打包
+    透传给 router/前端，让用户能看到 SDK 给出的安装指引（例如 Windows 缺
+    bash.exe / pwsh.exe 时的下载链接）。
+
+    ``__str__`` 直接返回 message + stderr 的完整拼接，让 router 的通用
+    ``except Exception: str(exc)`` 分支也能自动透传，不需要每条路径都加专门
+    捕获。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        sdk_stderr: str = "",
+        *,
+        failure_observation: dict[str, Any] | None = None,
+    ) -> None:
+        self.message = message
+        self.sdk_stderr = sdk_stderr
+        self.failure_observation = failure_observation
+        super().__init__(self._compose())
+
+    def _compose(self) -> str:
+        if self.sdk_stderr:
+            return f"{self.message}\n\n{self.sdk_stderr}"
+        return self.message
+
+
+def _make_agent_startup_error(
+    exc: BaseException,
+    *,
+    project_name: str,
+    session_id: str | None,
+    sdk_stderr: str = "",
+) -> AgentStartupError:
+    """在 runtime 边界统一保留、脱敏并包装启动阶段实际观测。"""
+    failure = build_startup_failure_observation(
+        exc,
+        project_name=project_name,
+        session_id=session_id,
+        sdk_stderr=sdk_stderr,
+    )
+    logger.error(
+        "Agent 启动失败 project_name=%s session_id=%s failure_observation=%s",
+        project_name,
+        session_id,
+        failure_observation_json(failure),
+    )
+    return AgentStartupError(
+        redact_diagnostic_text(exc),
+        sdk_stderr=redact_diagnostic_text(sdk_stderr),
+        failure_observation=failure,
+    )
 
 
 @dataclass
@@ -78,6 +192,105 @@ class PendingQuestion:
     question_id: str
     payload: dict[str, Any]
     answer_future: asyncio.Future[dict[str, str]]
+
+
+@dataclass(frozen=True)
+class _ActorExitNotice:
+    """Actor 的完成事件；异常随队列顺序交给 inbox processor 处理。"""
+
+    error: BaseException | None = None
+
+
+@dataclass(frozen=True)
+class _CliIdleNotice:
+    """CLI 报告空闲；``epoch`` 是读到这一帧时的进入 running 计数，由 inbox 在本轮条目之后处理。"""
+
+    epoch: int
+
+
+@dataclass(frozen=True)
+class _CliBusyNotice:
+    """CLI 报告开始工作，会话因此从非 running 切入：由 inbox 持久化并发出自主轮次通知。"""
+
+
+@dataclass(frozen=True)
+class _QueuedMessageSettled:
+    """CLI 报告一条排队消息的去向（被并入一轮，或被丢弃），由 inbox 在此前的输出之后处理。"""
+
+    lifecycle: CommandLifecycle
+    preempted: bool = False
+    """CLI 报告时有立即发送的消息尚未被接纳：这次丢弃来自被它打断的那一轮。"""
+
+
+def _user_message_frame(
+    content: str | list[dict[str, Any]], cli_uuid: str, *, priority: Literal["now"] | None = None
+) -> dict[str, Any]:
+    """送入 CLI 的用户消息帧。带 uuid 的消息才会有 ``command_lifecycle`` 帧，回放也保留这个 uuid。
+
+    ``priority="now"`` 让 CLI 打断当前轮先处理这条消息（立即发送）。
+    """
+    frame: dict[str, Any] = {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": None,
+        "uuid": cli_uuid,
+    }
+    if priority is not None:
+        frame["priority"] = priority
+    return frame
+
+
+def _agent_model_call(usage: ModelTurnUsage) -> AgentModelCall:
+    """一个模型一轮的用量转成记账输入：各次请求按用量契约各出一份计量，token 列记各次之和。"""
+    total = usage.total
+    return AgentModelCall(
+        model=usage.model,
+        requests=tuple(
+            Usage(
+                quantities=token_usage(
+                    input_tokens=request.total_input,
+                    output_tokens=request.output,
+                    cache_read_tokens=request.cache_read,
+                    cache_write_5m_tokens=request.cache_write_5m,
+                    cache_write_1h_tokens=request.cache_write_1h,
+                )
+            )
+            for request in usage.requests
+        ),
+        input_tokens=total.total_input,
+        output_tokens=total.output,
+        cache_read_tokens=total.cache_read,
+        cache_write_5m_tokens=total.cache_write_5m,
+        cache_write_1h_tokens=total.cache_write_1h,
+    )
+
+
+def _content_text(content: str | list[dict[str, Any]]) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(str(block.get("text", "")) for block in content if block.get("type") == "text")
+
+
+def _make_session_channel() -> SseChannel:
+    """会话订阅广播通道：溢出策略为「逐出非关键消息 + 溢出信号」。
+
+    关键消息（result/runtime_status/log_entry/log_turn_complete/queued_message）不得静默丢弃；订阅者
+    队列彻底跟不上时其流被结束，流结束即重连信号（见 docs/adr/0046）。
+    """
+    return SseChannel(
+        overflow=EvictNonCriticalAndSignal(
+            is_critical=lambda message: message.get("type") in ManagedSession._CRITICAL_MESSAGE_TYPES,
+        ),
+    )
+
+
+@dataclass
+class _DetachedQueue:
+    """``ManagedSession.detach_queued_messages`` 取走的排队消息与幂等记录。"""
+
+    messages: list[QueuedMessage]
+    sent_message_entries: dict[str, str]
+    sent_client_keys: dict[str, str]
 
 
 @dataclass
@@ -90,13 +303,49 @@ class ManagedSession:
     project_name: str = ""  # 用于 _register_new_session
     sdk_id_event: asyncio.Event = field(default_factory=asyncio.Event)
     resolved_sdk_id: str | None = None  # consumer 设置，send_new_session 读取
-    message_buffer: list[dict[str, Any]] = field(default_factory=list)
-    subscribers: set[asyncio.Queue] = field(default_factory=set)
-    buffer_max_size: int = 100
+    channel: SseChannel = field(default_factory=_make_session_channel)
     pending_questions: dict[str, PendingQuestion] = field(default_factory=dict)
-    pending_user_echoes: list[str] = field(default_factory=list)
+    # 排队消息，按发送顺序：已交给 CLI、尚未被接纳进对话。CLI 报告开始处理（started）时写入日志并移出。
+    queued_messages: list[QueuedMessage] = field(default_factory=list)
+    # 送入 CLI 的消息 uuid → 用户条目 uuid：保留到会话清理，迟到的重复回放同样幂等忽略。
+    sent_message_entries: dict[str, str] = field(default_factory=dict)
+    # 幂等键 → 用户条目 uuid：排队期间的重试凭此返回同一条排队消息，接纳后由事件日志承担。
+    sent_client_keys: dict[str, str] = field(default_factory=dict)
+    # 以 now 优先级送入、CLI 尚未接纳的消息 uuid。非空期间以 aborted_* 结束的轮次是被立即发送打断的，
+    # 按中断处理；这期间被 CLI 丢弃、还没进入对话的排队消息重新送入。
+    now_messages_in_flight: set[str] = field(default_factory=set)
+    # 发送路径的串行锁：等待者按到达顺序获锁，消息进入 CLI 的顺序与排队顺序一致。
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 事件日志写入点管道（UI 时间线唯一读源的 live 写侧）。
+    entry_pipeline: SessionEntryPipeline | None = None
+    # 新会话首条用户消息：sdk_session_id 就绪后由 inbox 任务写入日志（seq 0），
+    # 保证用户条目先于任何 assistant 条目分配身份。
+    pending_initial_user_entry: dict[str, Any] | None = None
+    initial_user_log_entry: dict[str, Any] | None = None
+    # 首条用户消息落库失败的异常：inbox 任务记录，send_new_session 醒来后
+    # 据此显式回报失败（事件日志是时间线唯一读源，seq 0 缺失不可接受）。
+    initial_user_entry_error: Exception | None = None
+    # 用量记账的 prompt：本轮 result 之前被接纳的消息并入同一轮，依次追加；result 之后被接纳的消息开新一轮。
+    last_user_prompt: str = ""
+    turn_usage_recorded: bool = True
+    # 会话连接时注入环境变量的 Agent 凭证及其当时的倍率与档位绑定：本连接的轮次按它计价（docs/adr/0017、0102）。
+    # 回退到系统设置时为默认值（无凭证、倍率 1、没有绑定）。
+    agent_pricing: AgentPricing = field(default_factory=AgentPricing)
+    # 本连接的用量计量：流内请求与 model_usage 的差分基线（docs/adr/0102）。
+    usage_meter: TurnUsageMeter = field(default_factory=lambda: TurnUsageMeter(resumed=False))
     interrupt_requested: bool = False
     last_activity: float | None = None  # updated on every send/receive
+    # 最近一轮的结局：一轮的 result 收尾时记下，会话离开 running 时取用；开启新一轮时清空。
+    turn_outcome: SessionStatus | None = None
+    # 最近一轮的 result（带 session_status），离开 running 时随状态下发其 subtype 等字段。
+    last_turn_result: dict[str, Any] | None = None
+    # 进入 running 的信号计数：送达消息、读到 CLI 报告非 idle 时递增。CLI 报 idle 时记下当时的值，
+    # inbox 处理到它时若计数已变，说明其后又有消息送达或 CLI 又开始工作，这个 idle 已过时。
+    _running_epoch: int = 0
+    # 最近一次读到 CLI 报 idle 时的进入 running 计数；与当前计数相同说明此后没有进入 running 的信号。
+    _cli_idle_epoch: int | None = None
+    # inbox 已停止处理：actor 仍在读帧，但读到 CLI 开始工作也不再切入 running，否则无人收尾。
+    _inbox_stopped: bool = False
     _cleanup_task: asyncio.Task | None = None  # current cleanup timer (idle TTL or terminal delay)
     _inbox: asyncio.Queue = field(default_factory=asyncio.Queue)  # async post-processing queue
     _inbox_warned: bool = False  # edge-triggered backlog warning state
@@ -104,44 +353,156 @@ class ManagedSession:
     _interrupting: bool = False  # send_interrupt re-entry guard (distinct from interrupt_requested)
 
     # Message types that must never be silently dropped from subscriber queues.
-    _CRITICAL_MESSAGE_TYPES = {"result", "runtime_status", "user", "assistant"}
-    # Transient types that are evicted first when buffer is full.
-    _TRANSIENT_BUFFER_TYPES = {"stream_event"}
+    _CRITICAL_MESSAGE_TYPES: ClassVar[set[str]] = {
+        "result",
+        "runtime_status",
+        "log_entry",
+        "log_turn_complete",
+        "queued_message",
+    }
 
-    def add_message(self, message: dict[str, Any]) -> None:
-        """Add message to buffer and notify subscribers."""
-        self.message_buffer.append(message)
-        if len(self.message_buffer) > self.buffer_max_size:
-            self._evict_oldest_buffer_entry()
-        self._broadcast_to_subscribers(message)
+    def enter_running(self) -> bool:
+        """消息送达 CLI 或读到 CLI 开始工作：会话进入 running。返回本次是否从非 running 切入。
+
+        同步执行（发送路径与 actor 回调都在事件循环上），这一刻起闲置清理与驱逐就都把会话
+        当作进行中，此前读出的 idle 随之过时。
+        """
+        self._running_epoch += 1
+        self.last_activity = time.monotonic()
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            self._cleanup_task = None
+        if self.status == "running":
+            return False
+        self.status = "running"
+        self.turn_outcome = None
+        self.last_turn_result = None
+        return True
+
+    def abandon_running(self, epoch: int) -> None:
+        """一次 ``enter_running`` 没把消息送到 CLI，``epoch`` 是进入前的计数。
+
+        计数不回退，否则之后的进入会与此前读出的 idle 重号。期间没有其他进入 running 的信号、
+        CLI 在这次进入之前或期间已报 idle 时，按当前计数补一次 idle 通知：此前读出的 idle 可能
+        已被当作过时忽略，此后也不会再有 idle 结算进行中的轮次。
+        """
+        if self._running_epoch != epoch + 1 or self._cli_idle_epoch not in (epoch, epoch + 1):
+            return
+        self._cli_idle_epoch = self._running_epoch
+        self._inbox.put_nowait(_CliIdleNotice(epoch=self._running_epoch))
 
     def _on_actor_message(self, msg: dict[str, Any]) -> None:
         """SessionActor 的 on_message 回调。同步，内存操作，不 await。
 
-        职责：add_message 进行 buffer + broadcast。
+        职责：向订阅者广播消息。
 
-        **状态转换不在此处做**——managed.status 由 _finalize_turn 在异步路径中
-        统一设置。若在此提前切换为 idle/completed，`send_message` 的并发保护
-        （拦截 status=="running"）会在 _finalize_turn 跑完前失效，下一轮消息
-        可能进入，随后上一轮 finalize 回写/清理会误伤新一轮。
+        **离开 running 不在此处做**——CLI 报 idle 后由 inbox 在本轮条目全部处理完
+        之后切换（见 SessionManager._settle_cli_idle），状态才不会先于末条条目到达。
 
         pending_questions 注册由 SessionManager._handle_special_message 处理。
         """
-        self.add_message(msg)
+        self.channel.broadcast(msg)
 
-    async def send_query(self, prompt: str | AsyncIterable[dict], sdk_session_id: str = "default") -> None:
-        """将 prompt 送入 SDK 后立即返回；整轮 receive_response 由 actor 后台 drain。
-
-        只等 `cmd.sent`（prompt 已进 SDK）而非 `cmd.done`（整轮结束），以保持
-        `/sessions/send` 原有的 "立即 accepted + SSE 异步消费" 语义。
-        """
-        self.status = "running"
-        cmd = SessionCommand(type="query", prompt=prompt, session_id=sdk_session_id)
+    async def send_query(self, message: dict[str, Any], sdk_session_id: str = "default") -> None:
+        """把用户消息帧交给 CLI 后立即返回：CLI 自行排队、并入当前轮或另开一轮，消息由 actor 在后台持续读取。"""
+        self.enter_running()
+        cmd = SessionCommand(type="query", message=message, session_id=sdk_session_id)
         await self.actor.enqueue(cmd)
-        await cmd.sent.wait()
+        await cmd.done.wait()
         if cmd.error is not None:
             self.status = "error"
             raise cmd.error
+
+    def find_queued_message(
+        self, *, cli_uuid: str | None = None, message_id: str | None = None
+    ) -> QueuedMessage | None:
+        for queued in self.queued_messages:
+            if queued.cli_uuid == cli_uuid or queued.id == message_id:
+                return queued
+        return None
+
+    def remove_queued_message(self, queued: QueuedMessage, **broadcast_fields: Any) -> None:
+        """移出排队列表并广播；已不在列表中时什么也不做。``broadcast_fields`` 随移出广播一同下发。"""
+        if queued not in self.queued_messages:
+            return
+        self.queued_messages.remove(queued)
+        self.channel.broadcast({"type": "queued_message", "op": "remove", "id": queued.id, **broadcast_fields})
+
+    def move_queued_message_first(self, queued: QueuedMessage) -> None:
+        """把一条排队消息移到最前并重播整份快照：立即发送后托盘顺序跟随 CLI 的处理顺序。已不在列表中时什么也不做。"""
+        if queued not in self.queued_messages or self.queued_messages[0] is queued:
+            return
+        self.queued_messages.remove(queued)
+        self.queued_messages.insert(0, queued)
+        self.channel.broadcast(
+            {
+                "type": "queued_message",
+                "op": "reorder",
+                "messages": [item.to_payload() for item in self.queued_messages],
+            }
+        )
+
+    def discard_queued_message(self, queued: QueuedMessage, **broadcast_fields: Any) -> None:
+        """排队消息未被接纳就离开：移出并释放幂等键，同键重试会重新送入。"""
+        self.remove_queued_message(queued, **broadcast_fields)
+        if queued.client_key is not None and self.sent_client_keys.get(queued.client_key) == queued.id:
+            del self.sent_client_keys[queued.client_key]
+
+    def withdraw_queued_message(self, queued: QueuedMessage) -> None:
+        """排队消息按用户撤回离开：移出广播带上撤回意图，编辑时附上内容，发起撤回的页面据此退回输入框。
+
+        撤回成功的答复与 CLI 的 cancelled 帧谁先处理都走这里，重复调用什么也不做。
+        """
+        if queued not in self.queued_messages:
+            return
+        assert queued.withdrawal is not None
+        queued.withdrawn = True
+        fields: dict[str, Any] = {"withdrawn": queued.withdrawal}
+        if queued.withdrawal == "edit":
+            fields["message"] = queued.to_payload()
+        self.discard_queued_message(queued, **fields)
+
+    def was_sent(self, message_id: str) -> bool:
+        """这条消息曾作为排队消息送入本会话的 CLI。"""
+        return message_id in self.sent_message_entries.values()
+
+    def drop_queued_messages(self, *, state: QueuedMessageState | None = None) -> None:
+        """排队消息不会再被处理：丢弃并广播。``state`` 只丢弃该状态的消息，缺省全部丢弃。"""
+        for queued in list(self.queued_messages):
+            if state is None or queued.state == state:
+                self.discard_queued_message(queued)
+
+    def mark_queued_messages_unsent(self) -> None:
+        """CLI 已退出：仍在排队的消息转为「未发送」并广播，留给用户决定发送、编辑或删除。"""
+        for queued in self.queued_messages:
+            if queued.state != "queued":
+                continue
+            queued.state = "unsent"
+            # 撤回意图只对 CLI 之后的 cancelled 有意义，CLI 已不在
+            queued.withdrawal = None
+            self.channel.broadcast({"type": "queued_message", "op": "upsert", "message": queued.to_payload()})
+
+    @property
+    def actor_exited(self) -> bool:
+        task = self.actor.task
+        return task is not None and task.done()
+
+    def detach_queued_messages(self) -> _DetachedQueue:
+        """取走排队消息与幂等记录，不广播：重建连接时交给新的会话对象，托盘保持原样。"""
+        detached = _DetachedQueue(
+            messages=self.queued_messages,
+            sent_message_entries=self.sent_message_entries,
+            sent_client_keys=self.sent_client_keys,
+        )
+        self.queued_messages = []
+        self.sent_message_entries = {}
+        self.sent_client_keys = {}
+        return detached
+
+    def adopt_queued_messages(self, detached: _DetachedQueue) -> None:
+        self.queued_messages[:0] = detached.messages
+        self.sent_message_entries = {**detached.sent_message_entries, **self.sent_message_entries}
+        self.sent_client_keys = {**detached.sent_client_keys, **self.sent_client_keys}
 
     async def send_interrupt(self) -> None:
         if self._interrupting:
@@ -157,95 +518,13 @@ class ManagedSession:
             self._interrupting = False
 
     async def send_disconnect(self) -> None:
-        cmd = SessionCommand(type="disconnect")
+        cmd = SessionCommand(type="disconnect", interrupt_first=self.status == "running")
         await self.actor.enqueue(cmd)
         await cmd.done.wait()
         await self.actor.wait()
-        self.status = "closed"
-
-    def _evict_oldest_buffer_entry(self) -> None:
-        """Evict one entry from buffer, preferring transient stream_events."""
-        for i, m in enumerate(self.message_buffer[:-1]):
-            if m.get("type") in self._TRANSIENT_BUFFER_TYPES:
-                self.message_buffer.pop(i)
-                return
-        self.message_buffer.pop(0)
-
-    def _broadcast_to_subscribers(self, message: dict[str, Any]) -> None:
-        """Push message to all subscriber queues, evicting non-critical on overflow."""
-        is_critical = message.get("type") in self._CRITICAL_MESSAGE_TYPES
-        stale_queues: list[asyncio.Queue] = []
-        for queue in self.subscribers:
-            if not self._try_enqueue(queue, message, is_critical):
-                stale_queues.append(queue)
-        for q in stale_queues:
-            # Drain the hopelessly full queue and inject a reconnect signal so
-            # the SSE consumer loop terminates instead of blocking forever.
-            self._drain_and_signal_reconnect(q)
-            self.subscribers.discard(q)
-
-    def _drain_and_signal_reconnect(self, queue: asyncio.Queue) -> None:
-        """Empty *queue* and push a reconnect signal so the SSE loop exits.
-
-        Uses a connection-level ``_queue_overflow`` type rather than
-        ``runtime_status`` so the SSE consumer can close the stream without
-        misrepresenting the session's actual status to the client.
-        """
-        while not queue.empty():
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        try:
-            queue.put_nowait(
-                {
-                    "type": "_queue_overflow",
-                    "session_id": self.session_id,
-                }
-            )
-        except asyncio.QueueFull:
-            pass  # should never happen after drain
-
-    def _try_enqueue(self, queue: asyncio.Queue, message: dict[str, Any], is_critical: bool) -> bool:
-        """Try to put *message* into *queue*. Returns False if the queue should be discarded."""
-        try:
-            queue.put_nowait(message)
-            return True
-        except asyncio.QueueFull:
-            if not is_critical:
-                return True  # non-critical drop is acceptable
-        # Critical message on a full queue — evict one non-critical to make room.
-        self._evict_non_critical(queue)
-        try:
-            queue.put_nowait(message)
-            return True
-        except asyncio.QueueFull:
-            return False
-
-    @staticmethod
-    def _evict_non_critical(queue: asyncio.Queue) -> bool:
-        """Try to remove one non-critical message from *queue* to make room."""
-        temp: list[dict[str, Any]] = []
-        evicted = False
-        while not queue.empty():
-            try:
-                msg = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if not evicted and msg.get("type") not in ManagedSession._CRITICAL_MESSAGE_TYPES:
-                evicted = True  # drop this one
-                continue
-            temp.append(msg)
-        for msg in temp:
-            try:
-                queue.put_nowait(msg)
-            except asyncio.QueueFull:
-                break
-        return evicted
-
-    def clear_buffer(self) -> None:
-        """Clear message buffer after session completes."""
-        self.message_buffer.clear()
+        # 断开时仍在 running 的会话保持原状，由会话层按最近一轮的结局收尾为终态
+        if self.status != "running":
+            self.status = "closed"
 
     def add_pending_question(self, payload: dict[str, Any]) -> PendingQuestion:
         """Register a pending AskUserQuestion payload."""
@@ -281,73 +560,131 @@ class ManagedSession:
         return [pending.payload for pending in self.pending_questions.values()]
 
 
+# result 中随会话状态一并下发的字段（entry 流的 status 事件据此标注错误原因）。
+_RESULT_STATUS_FIELDS = ("subtype", "stop_reason", "is_error", "api_error_status")
+
+
+def _cli_session_state(msg: dict[str, Any]) -> str | None:
+    """CLI 的 ``session_state_changed`` 帧报告的状态（idle / running / requires_action）；其他帧为 None。"""
+    if msg.get("type") != "system" or msg.get("subtype") != "session_state_changed":
+        return None
+    data = msg.get("data")
+    state = data.get("state") if isinstance(data, dict) else None
+    return state if isinstance(state, str) else None
+
+
 class SessionManager:
     """Manages all active ClaudeSDKClient instances."""
 
-    DEFAULT_ALLOWED_TOOLS = [
+    DEFAULT_ALLOWED_TOOLS: ClassVar[list[str]] = [
         "Skill",
         "Task",
+        # —— Bash 系列（sandbox 启用 + autoAllowBashIfSandboxed=True 协同放行）——
+        "Bash",
+        "BashOutput",
+        "KillBash",
+        # —— SDK 内置工具（仍走 PreToolUse hook 文件围栏 + settings.json deny）——
         "Read",
         "Write",
         "Edit",
         "Grep",
         "Glob",
+        "WebFetch",
         "AskUserQuestion",
     ]
-    DEFAULT_SETTING_SOURCES = ["project"]
-    _SDK_ID_TIMEOUT = 60.0
-
-    # Bash is NOT in DEFAULT_ALLOWED_TOOLS — it is controlled by declarative
-    # allow rules in settings.json (whitelist approach, default deny).
-    # File access control for Read/Write/Edit/Glob/Grep uses PreToolUse hooks.
-    _PATH_TOOLS: dict[str, str] = {
-        "Read": "file_path",
-        "Write": "file_path",
-        "Edit": "file_path",
-        "Glob": "path",
-        "Grep": "path",
-    }
-    _WRITE_TOOLS = {"Write", "Edit"}
-    _WRITABLE_EXTENSIONS = {".json", ".md", ".txt"}
-
-    # Sentinel used in pending_user_echoes for image-only messages (no text).
-    # The SDK parser drops image blocks, so the replayed UserMessage arrives
-    # with empty content; this sentinel lets _is_duplicate_user_echo match it.
-    _IMAGE_ONLY_SENTINEL = "__image_only__"
-
-    # SDK message class name to type mapping
-    _MESSAGE_TYPE_MAP = {
-        "UserMessage": "user",
-        "AssistantMessage": "assistant",
-        "ResultMessage": "result",
-        "SystemMessage": "system",
-        "StreamEvent": "stream_event",
-        "TaskStartedMessage": "system",
-        "TaskProgressMessage": "system",
-        "TaskNotificationMessage": "system",
-    }
-
-    # Typed task message subtypes for precise classification
-    _TASK_MESSAGE_SUBTYPES = {
-        "TaskStartedMessage": "task_started",
-        "TaskProgressMessage": "task_progress",
-        "TaskNotificationMessage": "task_notification",
-    }
+    DEFAULT_SETTING_SOURCES: ClassVar[list[SettingSource]] = ["project"]
 
     def __init__(
         self,
         project_root: Path,
-        data_dir: Path,
         meta_store: SessionMetaStore,
+        data_root: Path | None = None,
+        in_docker: bool = False,
+        sandbox_enabled: bool = True,
+        event_log_store: EventLogStore | None = None,
+        sdk_id_timeout: float = 60.0,
     ):
+        self.event_log_store = event_log_store or EventLogStore()
+        # 新会话等待 CLI init 上报 sdk_session_id 的上限；超时即判启动失败。
+        self._sdk_id_timeout = sdk_id_timeout
         self.project_root = Path(project_root)
-        self.data_dir = Path(data_dir)
+        # Tests construct SessionManager directly without going through
+        # AssistantService, so we fall back to the default data root
+        # ``project_root/projects``. Production passes the configured app_data_dir() explicitly.
+        # 两路都 resolve，避免符号链接场景下 _resolve_project_cwd 的 relative_to
+        # 校验失败（project_cwd 已经 resolve 过）。strict=False 容忍目录不存在。
+        self.data_root = (
+            Path(data_root).resolve(strict=False)
+            if data_root is not None
+            else (self.project_root / "projects").resolve()
+        )
+        self.layout = DataRootLayout(self.data_root)
         self.meta_store = meta_store
         self.sessions: dict[str, ManagedSession] = {}
-        self._disconnecting: set[str] = set()
-        self._session_actor_shutdown_timeout: float = 15.0  # total budget for send_disconnect + cancel fallback
+        # 会话订阅广播通道，按 sdk_session_id 登记。entry 流的生命周期跟随会话面板而非
+        # CLI 进程：会话被驱逐后通道随订阅者留下，复活的会话接着往同一个通道广播。
+        # 既无常驻会话、又无订阅者时摘除。
+        self._channels: dict[str, SseChannel] = {}
+        # CLI 自主开启新一轮、会话回到 running 时的通知出口（参数：项目名、会话 id），
+        # 见 _persist_cli_resumed。
+        self._autonomous_turn_listener: Callable[[str, str], None] | None = None
+        # 正在驱逐的会话 → 驱逐完成时置位的事件；连接在驱逐完成后才按冷会话重建，不与它交错。
+        self._disconnecting: dict[str, asyncio.Event] = {}
+        # 优雅 send_disconnect 的等待上限；超时后各调用点再走无界的 cancel 兜底。
+        self._session_actor_shutdown_timeout: float = 15.0
         self._connect_locks: dict[str, asyncio.Lock] = {}
+        # 实例不变量缓存：避免每次构建 access policy 都重做 path resolve。
+        self._project_root_resolved = self.project_root.resolve()
+        # agent_runtime_profile 实际位置：``ARCREEL_PROFILE_DIR`` env 覆盖 >
+        # ``self.project_root / "agent_runtime_profile"``（test-friendly：
+        # 不读 ``lib.infra.env_init.PROJECT_ROOT`` 全局）。
+        profile_override = os.getenv("ARCREEL_PROFILE_DIR", "").strip()
+        if profile_override:
+            self._agent_profile_root = Path(profile_override).expanduser().resolve(strict=False)
+        else:
+            self._agent_profile_root = (self._project_root_resolved / "agent_runtime_profile").resolve(strict=False)
+        # 访问规则真相源：env 解析（profile 目录）在此完成，policy 只消费
+        # resolve 后的进程级根路径（零 I/O 纯构造）。
+        self.access_policy = AgentAccessPolicy(
+            project_root=self._project_root_resolved,
+            data_root=self.data_root,
+            agent_profile_root=self._agent_profile_root,
+            sandbox_enabled=sandbox_enabled,
+            in_docker=in_docker,
+        )
         self._load_config()
+        self.ledger = Ledger(session_factory=getattr(meta_store, "_session_factory", None))
+        # Options 装配器：持依赖、允许 I/O，异步 build 产出 SDK options。access_policy /
+        # max_turns / session_factory / user_id 一律用 provider 回调现取——前两者
+        # configure_sandbox_runtime / refresh_config 换新后对后续会话立即生效；后两者
+        # 保持析出前惰性读 self 属性的时点，与用量记录侧 _finalize_turn 实时读 _user_id
+        # 同源，避免 store 与用量落到不同 per-user 命名空间。_resolve_project_cwd
+        # （项目名校验/作用域）留在会话管理侧，作为依赖注入。
+        self._options_assembler = OptionsAssembler(
+            data_root=self.data_root,
+            allowed_tools=self.DEFAULT_ALLOWED_TOOLS,
+            setting_sources=self.DEFAULT_SETTING_SOURCES,
+            access_policy_provider=lambda: self.access_policy,
+            max_turns_provider=lambda: self.max_turns,
+            resolve_project_cwd=self._resolve_project_cwd,
+            session_factory_provider=lambda: getattr(self, "_session_factory", None),
+            user_id_provider=lambda: getattr(self, "_user_id", DEFAULT_USER_ID),
+        )
+
+    def configure_sandbox_runtime(self, *, in_docker: bool, sandbox_enabled: bool) -> None:
+        """startup 期注入平台运行时事实（Docker 嵌套、内核沙箱可用性）。
+
+        ``in_docker`` 透传 SandboxSettings.enableWeakerNestedSandbox；
+        ``sandbox_enabled=False``（Windows 回退）关闭 SDK SandboxSettings 并把
+        Bash 工具调用切到代码白名单路径。AgentAccessPolicy 不可变，整体换新
+        而非戳改字段——hook / options 构建都在调用时读 ``self.access_policy``，
+        换新即对后续所有会话与工具调用生效。
+        """
+        self.access_policy = replace(
+            self.access_policy,
+            in_docker=bool(in_docker),
+            sandbox_enabled=bool(sandbox_enabled),
+        )
 
     def _load_config(self) -> None:
         """Load configuration from environment (sync fallback)."""
@@ -372,515 +709,53 @@ class SessionManager:
         # Fallback to env var
         self._load_config()
 
-    _PERSONA_PROMPT = """\
-## 身份
-
-你是 ArcReel 智能体，一个专业的 AI 视频内容创作助手。你的职责是将小说转化为可发布的短视频内容。
-
-## 行为准则
-
-- 主动引导用户完成视频创作工作流，而不仅仅被动回答问题
-- 遇到不确定的创作决策时，向用户提出选项并给出建议，而不是自行决定
-- 涉及多步骤任务时，使用 TodoWrite 跟踪进度并向用户汇报
-- 你不能创建或编辑代码文件（.py/.js/.sh 等），Write/Edit 仅限 .json/.md/.txt
-- 你是用户的视频制作搭档，专业、友善、高效"""
-
-    def _build_append_prompt(self, project_name: str, locale: str = "zh") -> str:
-        """Build the append portion for SystemPromptPreset.
-
-        Combines the ArcReel persona with project-specific context from
-        project.json.  The base CLAUDE.md is auto-loaded by the SDK via
-        setting_sources=["project"] and the CLAUDE.md symlink in the
-        project cwd.
-        """
-        parts = [self._PERSONA_PROMPT]
-
-        lang = LOCALE_LANGUAGE_MAP.get(locale, "中文")
-        parts.append(
-            f"\n## 语言规范\n\n"
-            f"- **回答用户必须使用{lang}**：所有回复、思考过程、任务清单及计划文件，均须使用{lang}\n"
-            f"- **视频内容语言**：所有生成的视频对话、旁白、字幕均使用{lang}\n"
-            f"- **文档使用{lang}**：所有的 Markdown 文件均使用{lang}编写\n"
-            f"- **Prompt 使用{lang}**：图片生成/视频生成使用的 prompt 应使用{lang}编写"
-        )
-
-        project_context = self._build_project_context(project_name)
-        if project_context:
-            parts.append(project_context)
-
-        return "\n".join(parts)
-
-    def _build_project_context(self, project_name: str) -> str:
-        """Build project-specific context from project.json metadata."""
-        try:
-            project_cwd = self._resolve_project_cwd(project_name)
-        except (ValueError, FileNotFoundError):
-            return ""
-
-        project_json = project_cwd / "project.json"
-        if not project_json.exists():
-            return ""
-
-        try:
-            config = json.loads(project_json.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to read project.json for %s: %s", project_name, exc)
-            return ""
-
-        if not isinstance(config, dict):
-            logger.warning("project.json for %s is not a JSON object", project_name)
-            return ""
-
-        parts = [
-            "## 当前项目上下文",
-            "",
-        ]
-
-        # TODO: 当前定位是自部署服务，这里直接拼接项目元数据以保持实现简单。
-        # TODO: 若后续演进为 SaaS / 多租户服务，需要把 title/style/overview 等用户输入
-        # TODO: 按“非指令上下文”做边界化或转义，降低 prompt injection 风险。
-        parts.append(f"- 项目标识：{project_name}")
-        if title := config.get("title"):
-            parts.append(f"- 项目标题：{title}")
-        if mode := config.get("content_mode"):
-            parts.append(f"- 内容模式：{mode}")
-        if style := config.get("style"):
-            parts.append(f"- 视觉风格：{style}")
-        if style_desc := config.get("style_description"):
-            parts.append(f"- 风格描述：{style_desc}")
-        parts.append(f"- 项目目录（即当前工作目录 cwd）：{project_cwd}")
-        parts.append(
-            "- Read/Edit/Write 等工具的 file_path 参数必须使用绝对路径，不要使用相对路径，也不要把项目标题当成目录名。"
-        )
-        parts.append(
-            "- Bash 调用 skill 脚本时必须使用相对路径（如 `python .claude/skills/.../script.py`），不要转换为绝对路径。"
-        )
-        parts.append("- Bash 命令必须写在单行，禁止使用 `\\` 换行，JSON 参数使用紧凑格式。")
-
-        self._append_overview_section(parts, config.get("overview", {}))
-
-        return "\n".join(parts)
-
-    @staticmethod
-    def _append_overview_section(parts: list[str], overview: Any) -> None:
-        """Append project overview fields to prompt parts."""
-        if not isinstance(overview, dict) or not overview:
-            return
-        parts.append("")
-        parts.append("### 项目概述")
-        if synopsis := overview.get("synopsis"):
-            parts.append(synopsis)
-        if genre := overview.get("genre"):
-            parts.append(f"- 题材：{genre}")
-        if theme := overview.get("theme"):
-            parts.append(f"- 主题：{theme}")
-        if world := overview.get("world_setting"):
-            parts.append(f"- 世界观：{world}")
-
-    def _build_options(
+    async def _build_options(
         self,
         project_name: str,
         resume_id: str | None = None,
         can_use_tool: Callable[[str, dict[str, Any], Any], Any] | None = None,
-        locale: str = "zh",
+        locale: str = DEFAULT_LOCALE,
+        stderr: Callable[[str], None] | None = None,
+        session_id: str | None = None,
     ) -> Any:
-        """Build ClaudeAgentOptions for a session."""
-        if not SDK_AVAILABLE or ClaudeAgentOptions is None:
-            raise RuntimeError("claude_agent_sdk is not installed")
-
-        transcripts_dir = self.data_dir / "transcripts"
-        transcripts_dir.mkdir(parents=True, exist_ok=True)
-        project_cwd = self._resolve_project_cwd(project_name)
-
-        # Build PreToolUse hooks — file access control MUST use hooks because
-        # Read/Glob/Grep are matched by allow rules (step 4 in the SDK
-        # permission chain) before reaching can_use_tool (step 5).  Hooks
-        # (step 1) fire for ALL tool calls and can override allow rules.
-        hooks = None
-        if HookMatcher is not None:
-            hook_callbacks: list[Any] = [
-                self._build_file_access_hook(project_cwd),
-            ]
-            if can_use_tool is not None:
-                # Official Python SDK guidance: keep stream open when using
-                # can_use_tool.
-                hook_callbacks.insert(0, self._keep_stream_open_hook)
-
-            # Shared dict: PreToolUse saves file backup, PostToolUse restores
-            # on corruption.  Keyed by tool_use_id.
-            json_backups: dict[str, tuple[Path, str]] = {}
-
-            hooks = {
-                "PreToolUse": [
-                    HookMatcher(matcher=None, hooks=hook_callbacks),
-                    HookMatcher(
-                        matcher="Write|Edit",
-                        hooks=[
-                            self._build_json_validation_hook(project_cwd, json_backups),
-                        ],
-                    ),
-                ],
-                "PostToolUse": [
-                    HookMatcher(
-                        matcher="Write|Edit",
-                        hooks=[
-                            self._build_json_post_validation_hook(project_cwd, json_backups),
-                        ],
-                    ),
-                ],
-            }
-
-        return ClaudeAgentOptions(
-            cwd=str(project_cwd),
-            setting_sources=self.DEFAULT_SETTING_SOURCES,
-            allowed_tools=self.DEFAULT_ALLOWED_TOOLS,
-            max_turns=self.max_turns,
-            system_prompt=SystemPromptPreset(
-                type="preset",
-                preset="claude_code",
-                append=self._build_append_prompt(project_name, locale=locale),
-            ),
-            include_partial_messages=True,
-            resume=resume_id,
+        """委派给 ``OptionsAssembler.build``——SessionManager 不再直接构建 options 与
+        hook，仅调用装配器；凭证注入、prompt 装配、hook 工厂均由装配器持有。"""
+        return await self._options_assembler.build(
+            project_name,
+            resume_id=resume_id,
             can_use_tool=can_use_tool,
-            hooks=hooks,
+            locale=locale,
+            stderr=stderr,
+            session_id=session_id,
         )
 
-    @staticmethod
-    async def _keep_stream_open_hook(
-        _input_data: dict[str, Any], _tool_use_id: str | None, _context: Any
-    ) -> dict[str, bool]:
-        """Required keep-alive hook for Python can_use_tool callback."""
-        return {"continue_": True}
-
-    def _build_file_access_hook(
-        self,
-        project_cwd: Path,
-    ) -> Callable[..., Any]:
-        """Build a PreToolUse hook callback that enforces file access control.
-
-        PreToolUse hooks are step 1 in the SDK permission chain and fire for
-        **every** tool call, including Read/Glob/Grep which would otherwise
-        be auto-approved by allow rules at step 4.
-        """
-
-        async def _file_access_hook(
-            input_data: dict[str, Any],
-            _tool_use_id: str | None,
-            _context: Any,
-        ) -> dict[str, Any]:
-            tool_name = input_data.get("tool_name", "")
-            if tool_name not in self._PATH_TOOLS:
-                return {"continue_": True}
-
-            tool_input = input_data.get("tool_input", {})
-            path_key = self._PATH_TOOLS[tool_name]
-            file_path = tool_input.get(path_key)
-
-            if file_path:
-                allowed, deny_reason = self._is_path_allowed(
-                    file_path,
-                    tool_name,
-                    project_cwd,
-                )
-                if not allowed:
-                    return {
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "deny",
-                            "permissionDecisionReason": deny_reason,
-                        },
-                    }
-
-            return {"continue_": True}
-
-        return _file_access_hook
-
-    def _build_json_validation_hook(
-        self,
-        project_cwd: Path,
-        json_backups: dict[str, tuple[Path, str]] | None = None,
-    ) -> Callable[..., Any]:
-        """Build a PreToolUse hook that blocks Write/Edit when the result would
-        produce invalid JSON.
-
-        For Edit: reads the current file, simulates the string replacement, and
-        validates the result with ``json.loads()``.
-        For Write: validates the ``content`` parameter directly.
-
-        When *json_backups* is provided, the hook saves the current file
-        content before the edit so the PostToolUse hook can restore it if
-        the actual result turns out to be invalid.
-
-        Returns ``permissionDecision: "deny"`` to block the operation before it
-        executes, giving the agent a chance to fix its input and retry.
-        """
-
-        async def _json_validation_hook(
-            input_data: dict[str, Any],
-            _tool_use_id: str | None,
-            _context: Any,
-        ) -> dict[str, Any]:
-            tool_name = input_data.get("tool_name", "")
-            tool_input = input_data.get("tool_input", {})
-
-            file_path = tool_input.get("file_path", "")
-            if not file_path or not file_path.endswith(".json"):
-                return {}
-
-            # --- Reject curly/smart quotes that would corrupt JSON ---
-            _CURLY_QUOTES = "\u201c\u201d\u201e\u201f"  # ""„‟
-
-            def _has_curly_quotes(text: str) -> bool:
-                """Return True if *text* contains Unicode curly/smart quotes."""
-                return any(ch in _CURLY_QUOTES for ch in text)
-
-            # --- Simulate the result without touching the file ---
-            simulated: str | None = None
-
-            if tool_name == "Write":
-                simulated = tool_input.get("content")
-                logger.info(
-                    "JSON 校验 hook: tool=Write file=%s content_len=%s",
-                    file_path,
-                    len(simulated) if simulated else 0,
-                )
-            elif tool_name == "Edit":
-                old_string = tool_input.get("old_string", "")
-                new_string = tool_input.get("new_string", "")
-                if not old_string:
-                    logger.info(
-                        "JSON 校验 hook: tool=Edit file=%s skip=old_string为空",
-                        file_path,
-                    )
-                    return {}
-
-                # Detect curly quotes early — Claude Code may normalise
-                # old_string internally (allowing the edit to succeed) while
-                # the hook's exact-match ``old_string not in current`` check
-                # below would skip validation, letting curly quotes slip into
-                # the file and corrupt JSON.
-                if _has_curly_quotes(new_string):
-                    curly_found = [f"U+{ord(ch):04X}" for ch in new_string if ch in _CURLY_QUOTES]
-                    logger.warning(
-                        "PreToolUse JSON 校验拦截(弯引号): file=%s curly=%s",
-                        file_path,
-                        curly_found[:5],
-                    )
-                    return {
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "deny",
-                            "permissionDecisionReason": (
-                                "操作被阻止：new_string 包含弯引号"
-                                "（\u201c 或 \u201d），"
-                                "这会破坏 JSON 格式。"
-                                "请将所有弯引号替换为标准 ASCII "
-                                "双引号 (U+0022) 后重试。"
-                            ),
-                        },
-                    }
-
-                p = Path(file_path)
-                resolved = (project_cwd / p).resolve() if not p.is_absolute() else p.resolve()
-                try:
-                    current = resolved.read_text(encoding="utf-8")
-                except OSError as read_err:
-                    logger.info(
-                        "JSON 校验 hook: tool=Edit file=%s skip=读取失败 error=%s",
-                        file_path,
-                        read_err,
-                    )
-                    return {}
-
-                # Save backup for PostToolUse restore on corruption
-                if json_backups is not None and _tool_use_id:
-                    json_backups[_tool_use_id] = (resolved, current)
-
-                if old_string not in current:
-                    # Edit tool will fail on its own; no need to intervene.
-                    logger.info(
-                        "JSON 校验 hook: tool=Edit file=%s skip=old_string未匹配 old_len=%d new_len=%d file_len=%d",
-                        file_path,
-                        len(old_string),
-                        len(new_string),
-                        len(current),
-                    )
-                    return {}
-
-                replace_all = tool_input.get("replace_all", False)
-                if replace_all:
-                    simulated = current.replace(old_string, new_string)
-                else:
-                    simulated = current.replace(old_string, new_string, 1)
-
-                logger.info(
-                    "JSON 校验 hook: tool=Edit file=%s matched=True "
-                    "old_len=%d new_len=%d simulated_len=%d replace_all=%s",
-                    file_path,
-                    len(old_string),
-                    len(new_string),
-                    len(simulated),
-                    replace_all,
-                )
-
-            if simulated is None:
-                return {}
-
-            try:
-                json.loads(simulated)
-                logger.info(
-                    "JSON 校验 hook: tool=%s file=%s result=valid",
-                    tool_name,
-                    file_path,
-                )
-                return {}
-            except json.JSONDecodeError as exc:
-                logger.warning(
-                    "PreToolUse JSON 校验拦截: file=%s tool=%s error=%s",
-                    file_path,
-                    tool_name,
-                    exc,
-                )
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": (
-                            f"操作被阻止：此次 {tool_name} 会导致 {file_path} "
-                            f"变成无效 JSON。错误：{exc}。"
-                            "请检查你的输入内容中是否包含未转义的双引号或其他"
-                            "JSON 语法问题，修正后重试。"
-                        ),
-                    },
-                }
-
-        return _json_validation_hook
-
-    def _build_json_post_validation_hook(
-        self,
-        project_cwd: Path,
-        json_backups: dict[str, tuple[Path, str]],
-    ) -> Callable[..., Any]:
-        """Build a PostToolUse hook that validates JSON files after Write/Edit.
-
-        This is a safety net for cases where the PreToolUse simulation fails
-        to catch invalid edits (e.g. due to old_string mismatch or escaping
-        differences between the hook simulation and the actual Edit tool).
-
-        If the file is invalid JSON after the edit, the hook:
-        1. Restores the file from the backup saved by the PreToolUse hook
-        2. Returns ``additionalContext`` telling the agent what went wrong
-        """
-
-        async def _json_post_validation_hook(
-            input_data: dict[str, Any],
-            tool_use_id: str | None,
-            _context: Any,
-        ) -> dict[str, Any]:
-            # Top-level guard: unhandled exceptions in hooks interrupt the
-            # agent (per SDK docs), so we catch everything and log.
-            try:
-                return await _json_post_validation_impl(
-                    input_data,
-                    tool_use_id,
-                )
-            except Exception:
-                logger.exception("PostToolUse JSON 校验 hook 异常")
-                return {}
-
-        async def _json_post_validation_impl(
-            input_data: dict[str, Any],
-            tool_use_id: str | None,
-        ) -> dict[str, Any]:
-            tool_name = input_data.get("tool_name", "")
-            tool_input = input_data.get("tool_input", {})
-
-            file_path = tool_input.get("file_path", "")
-            if not file_path or not file_path.endswith(".json"):
-                return {}
-
-            # Pop the backup regardless of outcome to avoid memory leaks
-            backup = json_backups.pop(tool_use_id, None) if tool_use_id else None
-
-            p = Path(file_path)
-            resolved = (project_cwd / p).resolve() if not p.is_absolute() else p.resolve()
-
-            try:
-                actual = resolved.read_text(encoding="utf-8")
-            except OSError:
-                return {}
-
-            try:
-                json.loads(actual)
-                logger.info(
-                    "PostToolUse JSON 校验: tool=%s file=%s result=valid",
-                    tool_name,
-                    file_path,
-                )
-                return {}
-            except json.JSONDecodeError as exc:
-                # File is corrupt — restore from backup if available
-                restored = False
-                if backup:
-                    backup_path, backup_content = backup
-                    try:
-                        backup_path.write_text(backup_content, encoding="utf-8")
-                        restored = True
-                        logger.warning(
-                            "PostToolUse JSON 校验拦截并恢复: file=%s tool=%s error=%s backup_restored=True",
-                            file_path,
-                            tool_name,
-                            exc,
-                        )
-                    except OSError as write_err:
-                        logger.error(
-                            "PostToolUse JSON 备份恢复失败: file=%s error=%s",
-                            file_path,
-                            write_err,
-                        )
-                else:
-                    logger.warning(
-                        "PostToolUse JSON 校验拦截(无备份): file=%s tool=%s error=%s",
-                        file_path,
-                        tool_name,
-                        exc,
-                    )
-
-                if restored:
-                    ctx = (
-                        f"⚠ JSON 损坏已检测并回滚：{tool_name} 导致 "
-                        f"{file_path} 变成无效 JSON（{exc}）。"
-                        "文件已恢复到编辑前状态，请修正后重试。"
-                    )
-                else:
-                    ctx = (
-                        f"⚠ JSON 损坏已检测但无法恢复：{tool_name} 导致 "
-                        f"{file_path} 变成无效 JSON（{exc}）。"
-                        "文件当前仍为损坏状态（无可用备份或恢复写入失败），"
-                        "请先读取文件确认内容，再手动修正为合法 JSON。"
-                    )
-
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PostToolUse",
-                        "additionalContext": ctx,
-                    },
-                }
-
-        return _json_post_validation_hook
+    def _build_session_store(self):
+        """委派给装配器的 session store 单例。AssistantService 经此拿到与 SDK options
+        同一份 store 实例（同一 per-user 命名空间），读写共享缓存。"""
+        return self._options_assembler.build_session_store()
 
     def _resolve_project_cwd(self, project_name: str) -> Path:
         """Resolve and validate per-session project working directory."""
-        projects_root = (self.project_root / "projects").resolve()
-        project_cwd = (projects_root / project_name).resolve()
         try:
-            project_cwd.relative_to(projects_root)
-        except ValueError as exc:
+            project_cwd = safe_join(self.layout.projects_dir, project_name)
+        except PathTraversalError as exc:
             raise ValueError("invalid project name") from exc
         if not project_cwd.exists() or not project_cwd.is_dir():
             raise FileNotFoundError(f"project not found: {project_name}")
         return project_cwd
+
+    def _build_entry_pipeline(self, managed: "ManagedSession") -> SessionEntryPipeline:
+        """构建会话的事件日志写入点管道。
+
+        session_id 用 provider 现取：新会话在 sdk_session_id 就绪前为 None，
+        管道自动跳过（该窗口内只有 init 系统消息，本就不入日志）。
+        """
+        return SessionEntryPipeline(
+            self.event_log_store,
+            session_id_provider=lambda: managed.resolved_sdk_id,
+            project_name_provider=lambda: managed.project_name,
+            broadcast=managed.channel.broadcast,
+        )
 
     def _make_actor_message_callback(
         self,
@@ -889,10 +764,10 @@ class SessionManager:
         """Sync on_message callback shared by send_new_session and get_or_connect.
 
         Runs inside the actor task. Order is load-bearing:
-        duplicate-echo detection skips buffer-add but still queues the message
+        CLI replays of user messages skip broadcast but still queue the message
         for async sdk_session_id capture; _handle_special_message must mutate
         result messages with `session_status` before subscribers see them via
-        add_message; _inbox hand-off last so async post-processing never
+        broadcast; _inbox hand-off last so async post-processing never
         observes a message that hasn't been broadcast yet.
         """
 
@@ -900,17 +775,53 @@ class SessionManager:
             managed = managed_ref[0]
             if managed is None:
                 return
-            msg_dict = self._message_to_dict(raw_msg)
-            if not isinstance(msg_dict, dict):
-                return
-            if self._is_duplicate_user_echo(managed, msg_dict):
+            msg_dict = message_to_dict(raw_msg)
+            entry_uuid = (
+                managed.sent_message_entries.get(str(msg_dict.get("uuid"))) if msg_dict.get("type") == "user" else None
+            )
+            if entry_uuid is not None:
+                # CLI 回放的用户消息：条目由接纳时刻（started）写入，回放只按 uuid 关联 transcript
+                # 身份，打标让写入点落映射后跳过；同一 uuid 重复回放同样跳过。
+                msg_dict[REPLAYED_USER_ECHO_KEY] = True
+                msg_dict[REPLAYED_USER_ECHO_ENTRY_UUID_KEY] = entry_uuid
                 managed._inbox.put_nowait(msg_dict)
                 return
             self._handle_special_message(managed, msg_dict)
             managed._on_actor_message(msg_dict)
             managed._inbox.put_nowait(msg_dict)
+            cli_state = _cli_session_state(msg_dict)
+            if cli_state == "idle":
+                managed._cli_idle_epoch = managed._running_epoch
+                managed._inbox.put_nowait(_CliIdleNotice(epoch=managed._running_epoch))
+            elif (
+                (cli_state in ("running", "requires_action") or is_main_turn_activity(msg_dict))
+                and not managed._inbox_stopped
+                and managed.enter_running()
+            ):
+                # CLI 报告开始工作，或未报 running 就产出主线程帧：读到即切入，不等 inbox——
+                # 闲置清理不能断开 CLI 自主开启的这一轮，在它之前读出的 idle 也随之过时。
+                managed._inbox.put_nowait(_CliBusyNotice())
 
         return _on_message
+
+    @staticmethod
+    def _make_command_lifecycle_callback(
+        managed_ref: list["ManagedSession | None"],
+    ) -> Callable[[CommandLifecycle], None]:
+        """CLI 报告排队消息的去向：交给 inbox，排在此前读出的输出之后处理。"""
+
+        def _on_command_lifecycle(lifecycle: CommandLifecycle) -> None:
+            managed = managed_ref[0]
+            if managed is None or lifecycle.state in ("queued", "completed"):
+                return
+            # 按帧序判断：被打断那一轮的 result 与 cancelled 都先于插队消息的 started 到达
+            preempted = bool(managed.now_messages_in_flight)
+            managed.now_messages_in_flight.discard(lifecycle.command_uuid)
+            if managed.find_queued_message(cli_uuid=lifecycle.command_uuid) is None:
+                return
+            managed._inbox.put_nowait(_QueuedMessageSettled(lifecycle, preempted=preempted))
+
+        return _on_command_lifecycle
 
     def _make_actor_done_callback(
         self,
@@ -925,63 +836,70 @@ class SessionManager:
         """
 
         def _on_done(task: asyncio.Task) -> None:
+            error: BaseException | None = None
+            if not task.cancelled():
+                error = task.exception()
+                if error is not None:
+                    logger.warning(
+                        "session actor 异常退出 session_id=%s: %s",
+                        managed.session_id,
+                        redact_diagnostic_text(error),
+                    )
             try:
-                managed._inbox.put_nowait(None)
+                managed._inbox.put_nowait(_ActorExitNotice(error=error))
             except Exception:
                 logger.debug("inbox sentinel push failed", exc_info=True)
-            if task.cancelled():
-                return
-            exc = task.exception()
-            if exc is None:
-                return
-            logger.warning(
-                "session actor 异常退出 session_id=%s: %s",
-                managed.session_id,
-                exc,
-            )
-            managed.status = "error"
-            try:
-                managed.add_message(self._build_runtime_status_message("error", managed.session_id))
-            except Exception:
-                logger.debug("broadcast runtime_status after actor failure failed", exc_info=True)
-            # Persist error state so DB doesn't stay at "running" after a crash.
-            asyncio.create_task(self._persist_actor_error_status(managed.session_id))
 
         return _on_done
-
-    async def _persist_actor_error_status(self, session_id: str) -> None:
-        try:
-            await self.meta_store.update_status(session_id, "error")
-        except Exception:
-            logger.exception("持久化 actor error 状态失败 session_id=%s", session_id)
 
     async def send_new_session(
         self,
         project_name: str,
-        prompt: str | AsyncIterable[dict],
+        content: str | list[dict[str, Any]],
         *,
-        echo_text: str | None = None,
-        echo_content: list[dict[str, Any]] | None = None,
-        locale: str = "zh",
+        locale: str = DEFAULT_LOCALE,
+        user_entry: dict[str, Any] | None = None,
+        client_key: str | None = None,
     ) -> str:
-        """Create a new session via send-first: start actor, send query, wait for sdk_session_id."""
-        if not SDK_AVAILABLE or ClaudeSDKClient is None:
-            raise RuntimeError("claude_agent_sdk is not installed")
+        """Create a new session via send-first: start actor, send query, wait for sdk_session_id.
+
+        ``user_entry`` 是本条用户消息的事件日志条目（写入点定型后的形态）；
+        sdk_session_id 就绪后由 inbox 任务先写日志（seq 0）再放行等待，权威
+        条目落在 ``managed.initial_user_log_entry`` 供受理响应回传。
+        """
+        if not SDK_AVAILABLE:
+            exc = RuntimeError("claude_agent_sdk is not installed")
+            raise _make_agent_startup_error(exc, project_name=project_name, session_id=None) from exc
 
         await self._ensure_capacity()
         temp_id = uuid4().hex
         managed_ref: list[ManagedSession | None] = [None]
 
-        options = self._build_options(
-            project_name,
-            resume_id=None,
-            can_use_tool=await self._build_can_use_tool_callback(temp_id, managed_ref),
-            locale=locale,
-        )
+        # 回调在整个会话中存活，但仅启动阶段收集；actor.start() 成功后立刻
+        # 停止并清空，既完整保留启动故障证据，也不让长会话 stderr 占用内存。
+        startup_stderr = _StartupStderrCollector()
 
+        try:
+            options = await self._build_options(
+                project_name,
+                resume_id=None,
+                can_use_tool=await self._build_can_use_tool_callback(temp_id, managed_ref),
+                locale=locale,
+                stderr=startup_stderr,
+            )
+        except Exception as exc:
+            sdk_stderr = startup_stderr.render()
+            startup_stderr.stop()
+            raise _make_agent_startup_error(
+                exc,
+                project_name=project_name,
+                session_id=None,
+                sdk_stderr=sdk_stderr,
+            ) from exc
         actor = SessionActor(
             client_factory=lambda: ClaudeSDKClient(options=options),
             on_message=self._make_actor_message_callback(managed_ref),
+            on_command_lifecycle=self._make_command_lifecycle_callback(managed_ref),
         )
 
         managed = ManagedSession(
@@ -989,21 +907,28 @@ class SessionManager:
             actor=actor,
             status="running",
             project_name=project_name,
+            agent_pricing=agent_pricing_of(options),
         )
+        if user_entry is not None:
+            managed.pending_initial_user_entry = {"entry": user_entry, "client_key": client_key}
+        managed.entry_pipeline = self._build_entry_pipeline(managed)
         managed_ref[0] = managed
         managed.last_activity = time.monotonic()
         self.sessions[temp_id] = managed
 
         try:
             await actor.start()
-        except Exception:
-            logger.exception("新会话 actor 启动失败 temp_id=%s", temp_id)
+        except Exception as exc:
+            sdk_stderr = startup_stderr.render()
+            startup_error = _make_agent_startup_error(
+                exc, project_name=project_name, session_id=None, sdk_stderr=sdk_stderr
+            )
             self.sessions.pop(temp_id, None)
-            raise
-
+            startup_stderr.stop()
+            raise startup_error from exc
         # Register done callback BEFORE spawning processor to avoid a race
-        # where the actor task completes before add_done_callback is attached,
-        # leaving the None sentinel un-pushed and _process_inbox hanging.
+        # where the actor task completes before add_done_callback is attached，
+        # leaving the completion notice un-pushed and _process_inbox hanging.
         actor.add_done_callback(self._make_actor_done_callback(managed))
 
         # Spawn inbox processor BEFORE sending query so we don't miss messages.
@@ -1017,46 +942,71 @@ class SessionManager:
 
             Runs send_disconnect first (which causes actor to exit and
             _on_actor_done to push the None sentinel, letting _process_inbox
-            finish naturally), then belt-and-suspenders cancels the processor
-            in case it is stuck elsewhere.
+            finish naturally), bounded by _session_actor_shutdown_timeout so an
+            SDK-side hang does not stall this error-only cleanup path on the
+            graceful wait — on timeout the actor is cancelled so it does not leak
+            with the failed session; then belt-and-suspenders cancels the
+            processor in case it is stuck elsewhere.
             """
             self.sessions.pop(temp_id, None)
+            # sdk_session_id 就绪后 key swap 已把会话挂到正式 id 下，两个键都清。
+            self.sessions.pop(managed.session_id, None)
+            self._release_channel(managed.session_id)
             try:
-                await managed.send_disconnect()
+                await asyncio.wait_for(managed.send_disconnect(), timeout=self._session_actor_shutdown_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "send_disconnect on error path 超时，走 cancel 兜底 session_id=%s",
+                    temp_id,
+                )
+                await managed.actor.cancel_and_wait()
             except Exception:
                 logger.exception(
                     "send_disconnect on error path failed session_id=%s",
                     temp_id,
                 )
+            # 断开后仍在 running（send_disconnect 不改写 running，失败或超时也停在这里），
+            # 而下面取消 _process_task 会让 _process_inbox 的 CancelledError
+            # 分支据此写 interrupted 终态。启动失败不是中断，先落 error 收口这条判断。
+            if managed.status == "running":
+                managed.status = "error"
             if managed._process_task is not None and not managed._process_task.done():
                 managed._process_task.cancel()
                 await asyncio.gather(managed._process_task, return_exceptions=True)
+            startup_stderr.stop()
 
-        # Echo user message
-        display_text = echo_text or (prompt if isinstance(prompt, str) else "")
-        dedup_key = display_text or (self._IMAGE_ONLY_SENTINEL if echo_content else "")
-        if dedup_key:
-            managed.pending_user_echoes.append(dedup_key)
-        managed.add_message(self._build_user_echo_message(display_text, echo_content))
+        # 首条消息不经排队列表：sdk_session_id 就绪后由 inbox 写入日志（seq 0）。
+        # 登记 uuid 让 CLI 的回放认出自己，只关联 transcript 身份、不二次落库。
+        cli_uuid = str(uuid4())
+        if user_entry is not None:
+            managed.sent_message_entries[cli_uuid] = str(user_entry["uuid"])
+        managed.last_user_prompt = _content_text(content)
+        managed.turn_usage_recorded = False
 
         try:
-            await managed.send_query(prompt)
-        except Exception:
-            logger.exception("新会话消息发送失败")
+            await managed.send_query(_user_message_frame(content, cli_uuid))
+        except Exception as exc:
+            sdk_stderr = startup_stderr.render()
+            startup_error = _make_agent_startup_error(
+                exc, project_name=project_name, session_id=None, sdk_stderr=sdk_stderr
+            )
             await _cleanup_on_error()
-            raise
+            raise startup_error from exc
 
-        # Wait for sdk_session_id with timeout; also monitor actor task so we
-        # fail fast if the background task crashes before the event fires.
+        # Wait for sdk_session_id with timeout. Monitor the inbox processor rather
+        # than the actor task: actor may exit immediately after enqueueing init,
+        # while the processor still has to persist that already-observed session id.
+        # The done callback appends a completion notice after all actor messages, so processor
+        # completion is the safe proof that no queued init remains to be consumed.
         event_task = asyncio.create_task(managed.sdk_id_event.wait())
-        watch_tasks: set[asyncio.Task] = {event_task}
+        processor_task = managed._process_task
+        assert processor_task is not None
+        watch_tasks: set[asyncio.Task] = {event_task, processor_task}
         actor_task = actor.task
-        if actor_task is not None:
-            watch_tasks.add(actor_task)
         try:
             await asyncio.wait(
                 watch_tasks,
-                timeout=self._SDK_ID_TIMEOUT,
+                timeout=self._sdk_id_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
@@ -1064,37 +1014,102 @@ class SessionManager:
                 event_task.cancel()
 
         if not managed.sdk_id_event.is_set():
+            startup_exception = None
+            if processor_task.done() and not processor_task.cancelled():
+                try:
+                    startup_exception = processor_task.result()
+                except Exception as exc:
+                    # _process_inbox 正常完成时以返回值传递 actor 启动异常；它自身
+                    # 意外崩溃时 Task.result() 会重新抛出。两者都属于启动失败证据，
+                    # 必须先走下方统一清理，再包装为结构化 AgentStartupError。
+                    startup_exception = exc
             if actor_task is not None and actor_task.done():
                 logger.error("session actor 提前退出，未获得 sdk_session_id temp_id=%s", temp_id)
             else:
                 logger.error("等待 sdk_session_id 超时 temp_id=%s", temp_id)
             managed.cancel_pending_questions("session creation timed out")
+            sdk_stderr = startup_stderr.render()
             await _cleanup_on_error()
+            if startup_exception is not None:
+                raise _make_agent_startup_error(
+                    startup_exception,
+                    project_name=project_name,
+                    session_id=None,
+                    sdk_stderr=sdk_stderr,
+                ) from startup_exception
             raise TimeoutError("SDK 会话创建超时")
+
+        startup_stderr.stop()
 
         sdk_id = managed.resolved_sdk_id
         assert sdk_id is not None
         # Key swap already done in _on_sdk_session_id_received
         assert managed.session_id == sdk_id
 
+        if managed.initial_user_entry_error is not None:
+            # 首条用户消息落库失败即受理失败：事件日志是时间线唯一读源，
+            # seq 0 缺失的会话开头永远无法呈现。与常规受理路径同语义——
+            # 失败显式回报（调用方收到异常）、状态回写 error、会话不再后台
+            # 续跑。先清理再回写状态：inbox 处理 CLI 的 idle 时会写终态，
+            # 清理完成后写入的 error 才不会被并发覆盖。
+            managed.cancel_pending_questions("initial user entry persist failed")
+            # 提前置内存态为 error：_cleanup_on_error 取消 _process_task 时，
+            # _process_inbox 的 CancelledError 分支会依据 status == "running"
+            # 判断是否需要走 interrupted 终态；提前置位避免多写一次 interrupted
+            # 并广播一次多余的状态跳变，DB 落库仍留到 cleanup 完成之后。
+            managed.status = "error"
+            await _cleanup_on_error()
+            try:
+                await self.meta_store.update_status(sdk_id, "error")
+            except Exception:
+                logger.exception("持久化 error 状态失败 session_id=%s", sdk_id)
+            raise RuntimeError("新会话首条用户消息写入事件日志失败") from managed.initial_user_entry_error
+
         return sdk_id
 
-    async def _process_inbox(self, managed: ManagedSession) -> None:
+    async def _process_inbox(self, managed: ManagedSession) -> BaseException | None:
         """Drain ManagedSession._inbox and run async post-processing.
 
         Replaces the async tail of _consume_messages. The synchronous bits
         (state machine, buffer add, broadcast, _handle_special_message,
-        duplicate-echo dedup) already ran inside the actor's on_message
+        replay tagging) already ran inside the actor's on_message
         callback, so this coroutine only handles:
         - sdk_session_id capture (DB create, tag, key swap, event set)
+        - writing a queued message to the log once the CLI starts it
         - _finalize_turn on result messages
+        - leaving running when the CLI reports idle or the actor exits
         - terminal status on cancel/error
         """
         try:
             while True:
                 msg_dict = await managed._inbox.get()
+                if isinstance(msg_dict, _ActorExitNotice):
+                    # CLI 已退出，仍在排队的消息不会再被处理：转为「未发送」留在托盘，不自动重发
+                    managed.mark_queued_messages_unsent()
+                    if msg_dict.error is not None:
+                        if managed.resolved_sdk_id is not None:
+                            await self._mark_session_terminal(managed, "error", "session actor failed")
+                        else:
+                            managed.status = "error"
+                    elif managed.status == "running" and managed.resolved_sdk_id is not None:
+                        # CLI 退出时没报 idle：这一轮若已收尾取其结局，否则记为中断。
+                        await self._mark_session_terminal(
+                            managed, managed.turn_outcome or "interrupted", "session actor exited"
+                        )
+                    return msg_dict.error
+                if isinstance(msg_dict, _CliIdleNotice):
+                    # 首条用户消息落库失败时同 result 分支短路，终态由 send_new_session 写 error
+                    if managed.initial_user_entry_error is None:
+                        await self._settle_cli_idle(managed, msg_dict.epoch)
+                    continue
+                if isinstance(msg_dict, _CliBusyNotice):
+                    await self._persist_cli_resumed(managed)
+                    continue
+                if isinstance(msg_dict, _QueuedMessageSettled):
+                    await self._settle_queued_message(managed, msg_dict.lifecycle, preempted=msg_dict.preempted)
+                    continue
                 if msg_dict is None:
-                    return
+                    return None
                 depth = managed._inbox.qsize()
                 if not managed._inbox_warned and depth >= _INBOX_BACKLOG_WARN_THRESHOLD:
                     managed._inbox_warned = True
@@ -1116,7 +1131,20 @@ class SessionManager:
                             "sdk_session_id 处理失败 session_id=%s",
                             managed.session_id,
                         )
+                if is_main_turn_activity(msg_dict):
+                    # 主线程产出意味着新一轮已开始，上一轮的结局作废
+                    managed.turn_outcome = None
+                # 事件日志写入点：sdk_session_id 就绪后逐条定型入日志。
+                # handle_message 内部吞异常，不会打断会话消费。
+                if managed.entry_pipeline is not None and managed.resolved_sdk_id is not None:
+                    await managed.entry_pipeline.handle_message(msg_dict)
+                managed.usage_meter.observe(msg_dict)
                 if msg_dict.get("type") == "result":
+                    if managed.initial_user_entry_error is not None:
+                        # 首条用户消息落库已失败，send_new_session 的错误清理路径
+                        # 即将取消本任务；此处短路不再 finalize，避免先广播/落库
+                        # 非 error 终态（如 completed），随后又被改写为 error。
+                        continue
                     try:
                         await self._finalize_turn(managed, msg_dict)
                     except Exception:
@@ -1126,16 +1154,20 @@ class SessionManager:
                             "_finalize_turn 失败，走 error 终态兜底 session_id=%s",
                             managed.session_id,
                         )
+                        # inbox 就此停止，之后的帧不再处理
+                        managed._inbox_stopped = True
                         with contextlib.suppress(Exception):
                             await self._mark_session_terminal(managed, "error", "finalize failed")
-                        return
+                        return None
         except asyncio.CancelledError:
             # Only mark interrupted if session was actually running. Cancel can
             # also happen during failed send_new_session cleanup or normal
             # shutdown, where the status is already terminal / error.
             if managed.status == "running":
                 try:
-                    await self._mark_session_terminal(managed, "interrupted", "session interrupted")
+                    await self._mark_session_terminal(
+                        managed, managed.turn_outcome or "interrupted", "session interrupted"
+                    )
                 except Exception:
                     logger.exception(
                         "_mark_session_terminal 在 cancel 路径失败 session_id=%s",
@@ -1144,133 +1176,520 @@ class SessionManager:
             raise
         except Exception:
             logger.exception("_process_inbox 异常 session_id=%s", managed.session_id)
+            managed._inbox_stopped = True
             try:
                 await self._mark_session_terminal(managed, "error", "session error")
             except Exception:
                 logger.debug("_mark_session_terminal cleanup failed", exc_info=True)
             raise
 
-    async def get_or_connect(self, session_id: str, *, meta: Optional["SessionMeta"] = None) -> ManagedSession:
-        """Get existing managed session or spin up an actor for resumed session."""
-        if session_id in self.sessions and session_id not in self._disconnecting:
-            return self.sessions[session_id]
+    async def get_or_connect(
+        self,
+        session_id: str,
+        *,
+        meta: SessionMeta | None = None,
+        locale: str = DEFAULT_LOCALE,
+        resumable: bool = True,
+    ) -> ManagedSession:
+        """Get existing managed session or spin up an actor for resumed session.
 
-        # Per-session lock prevents concurrent connect() for the same session_id.
-        if session_id not in self._connect_locks:
-            self._connect_locks[session_id] = asyncio.Lock()
-        lock = self._connect_locks[session_id]
+        ``locale`` only shapes the system prompt of a session's first turn: the
+        system prompt is snapshotted into the session on its first request
+        (``SystemPromptPreset.snapshot``), so a resumed session keeps the language
+        regulation it started with and an already-resident session returns from
+        cache. Here it matters for ``resumable=False`` sessions, which start fresh.
 
-        async with lock:
-            # Re-check after acquiring lock
-            if session_id in self.sessions and session_id not in self._disconnecting:
-                return self.sessions[session_id]
+        ``resumable=False`` 用于元数据行已建、transcript 却是空的会话（改写第一条
+        消息分叉出的分支）：这类会话没有历史可 resume，改以 ``session_id=`` 预指定
+        身份开一个全新会话。首轮跑完 transcript 即存在，之后照常按 resume 复活。
+        """
+        cached = self.sessions.get(session_id)
+        if cached is not None and session_id not in self._disconnecting and not cached.actor_exited:
+            return cached
 
+        while True:
+            # Per-session lock prevents concurrent connect() for the same session_id.
+            lock = self._connect_locks.setdefault(session_id, asyncio.Lock())
+            async with lock:
+                if self._connect_locks.get(session_id) is not lock:
+                    # 等锁期间驱逐摘掉了这把锁：改到当前的锁上排队，不与新锁的持有者并发连接
+                    continue
+                cached, detached = await self._retire_exited_session(session_id)
+                if cached is not None:
+                    return cached
+                try:
+                    managed = await self._connect_resumed_session(
+                        session_id, meta=meta, locale=locale, resumable=resumable
+                    )
+                except BaseException:
+                    channel = self._channels.get(session_id)
+                    if detached is not None and channel is not None:
+                        # 旧会话已驱逐、新连接没建起来：同驱逐一样丢弃排队消息，仍在的订阅者随之移出托盘
+                        for queued in detached.messages:
+                            channel.broadcast({"type": "queued_message", "op": "remove", "id": queued.id})
+                    raise
+                if detached is not None:
+                    managed.adopt_queued_messages(detached)
+                return managed
+
+    async def _retire_exited_session(self, session_id: str) -> tuple[ManagedSession | None, _DetachedQueue | None]:
+        """连接锁内调用：返回仍可用的常驻会话，或在没有可用会话时返回需要转入新连接的排队消息。
+
+        正在驱逐的会话等驱逐完成，此后按冷会话重建。actor 已退出（CLI 退出、会话尚未被清理）的会话
+        先等 inbox 处理完退出通知，再取走排队消息（不广播，「未发送」消息留在托盘、不自动重发）并驱逐它。
+        """
+        detached: _DetachedQueue | None = None
+        while (cached := self.sessions.get(session_id)) is not None:
+            eviction = self._disconnecting.get(session_id)
+            if eviction is not None:
+                await eviction.wait()
+                continue
+            if not cached.actor_exited:
+                return cached, None
+            if cached._process_task is not None and not cached._process_task.done():
+                # 退出通知把排队消息转为「未发送」、把会话落为终态，取走排队消息要排在它之后
+                await asyncio.wait({cached._process_task})
+                continue
+            # inbox 先于 actor 停止时没处理退出通知，CLI 同样已不在
+            cached.mark_queued_messages_unsent()
+            detached = cached.detach_queued_messages()
+            await self._evict_one(cached)
+        return None, detached
+
+    async def _connect_resumed_session(
+        self, session_id: str, *, meta: SessionMeta | None, locale: str, resumable: bool
+    ) -> ManagedSession:
+        """按冷会话路径启动 actor 并登记会话，调用方持有连接锁。"""
+        if meta is None:
+            meta = await self.meta_store.get(session_id)
             if meta is None:
-                meta = await self.meta_store.get(session_id)
-                if meta is None:
-                    raise FileNotFoundError(f"session not found: {session_id}")
+                raise FileNotFoundError(f"session not found: {session_id}")
 
-            if not SDK_AVAILABLE or ClaudeSDKClient is None:
-                raise RuntimeError("claude_agent_sdk is not installed")
+        if not SDK_AVAILABLE:
+            exc = RuntimeError("claude_agent_sdk is not installed")
+            raise _make_agent_startup_error(exc, project_name=meta.project_name, session_id=session_id) from exc
 
-            await self._ensure_capacity()
-            managed_ref: list[ManagedSession | None] = [None]
-            options = self._build_options(
+        await self._ensure_capacity()
+        managed_ref: list[ManagedSession | None] = [None]
+
+        # 见 send_new_session 同名注释：只在启动阶段无损收集，成功后释放。
+        startup_stderr = _StartupStderrCollector()
+
+        try:
+            options = await self._build_options(
                 meta.project_name,
-                meta.id,  # SessionMeta.id 就是 sdk_session_id
+                meta.id if resumable else None,  # SessionMeta.id 就是 sdk_session_id
                 can_use_tool=await self._build_can_use_tool_callback(session_id, managed_ref),
+                locale=locale,
+                stderr=startup_stderr,
+                session_id=None if resumable else meta.id,
             )
-
-            actor = SessionActor(
-                client_factory=lambda: ClaudeSDKClient(options=options),
-                on_message=self._make_actor_message_callback(managed_ref),
-            )
-
-            resumed_status: SessionStatus = (
-                meta.status if meta.status in ("idle", "running", "interrupted", "error", "closed") else "idle"
-            )
-            managed = ManagedSession(
-                session_id=meta.id,  # 现在就是 sdk_session_id
-                actor=actor,
-                status=resumed_status,
+        except Exception as exc:
+            sdk_stderr = startup_stderr.render()
+            startup_stderr.stop()
+            raise _make_agent_startup_error(
+                exc,
                 project_name=meta.project_name,
-                resolved_sdk_id=meta.id,  # 标记为已注册，防止重复创建 DB 记录
+                session_id=session_id,
+                sdk_stderr=sdk_stderr,
+            ) from exc
+        actor = SessionActor(
+            client_factory=lambda: ClaudeSDKClient(options=options),
+            on_message=self._make_actor_message_callback(managed_ref),
+            on_command_lifecycle=self._make_command_lifecycle_callback(managed_ref),
+        )
+
+        resumed_status: SessionStatus = (
+            meta.status if meta.status in ("idle", "running", "interrupted", "error", "closed") else "idle"
+        )
+        managed = ManagedSession(
+            session_id=meta.id,  # 现在就是 sdk_session_id
+            actor=actor,
+            status=resumed_status,
+            project_name=meta.project_name,
+            agent_pricing=agent_pricing_of(options),
+            # 恢复会话的 CLI 带着此前的累计用量，差分以恢复后第一条结果为起点
+            usage_meter=TurnUsageMeter(resumed=resumable),
+            resolved_sdk_id=meta.id,  # 标记为已注册，防止重复创建 DB 记录
+            channel=self._session_channel(meta.id),
+        )
+        managed.sdk_id_event.set()  # 已有会话不需要等待 sdk_id
+        managed.entry_pipeline = self._build_entry_pipeline(managed)
+        managed_ref[0] = managed
+        managed.last_activity = time.monotonic()
+        self.sessions[session_id] = managed
+
+        try:
+            await actor.start()
+        except Exception as exc:
+            sdk_stderr = startup_stderr.render()
+            startup_error = _make_agent_startup_error(
+                exc,
+                project_name=meta.project_name,
+                session_id=session_id,
+                sdk_stderr=sdk_stderr,
             )
-            managed.sdk_id_event.set()  # 已有会话不需要等待 sdk_id
-            managed_ref[0] = managed
-            managed.last_activity = time.monotonic()
-            self.sessions[session_id] = managed
+            self.sessions.pop(session_id, None)
+            self._release_channel(session_id)
+            raise startup_error from exc
+        finally:
+            startup_stderr.stop()
 
-            try:
-                await actor.start()
-            except Exception:
-                logger.exception("恢复会话 actor 启动失败 session_id=%s", session_id)
-                self.sessions.pop(session_id, None)
-                raise
+        # done_callback BEFORE processor spawn (avoids race where actor
+        # completes before the callback attaches and the None sentinel
+        # is never pushed).
+        actor.add_done_callback(self._make_actor_done_callback(managed))
 
-            # done_callback BEFORE processor spawn (avoids race where actor
-            # completes before the callback attaches and the None sentinel
-            # is never pushed).
-            actor.add_done_callback(self._make_actor_done_callback(managed))
-
-            managed._process_task = asyncio.create_task(
-                self._process_inbox(managed),
-                name=f"inbox-{session_id}",
-            )
-            return managed
+        managed._process_task = asyncio.create_task(
+            self._process_inbox(managed),
+            name=f"inbox-{session_id}",
+        )
+        return managed
 
     async def send_message(
         self,
         session_id: str,
-        prompt: str | AsyncIterable[dict],
+        content: str | list[dict[str, Any]],
         *,
-        echo_text: str | None = None,
-        echo_content: list[dict[str, Any]] | None = None,
-        meta: Optional["SessionMeta"] = None,
-    ) -> None:
-        """Send a message via the session actor."""
-        managed = await self.get_or_connect(session_id, meta=meta)
+        meta: SessionMeta | None = None,
+        locale: str = DEFAULT_LOCALE,
+        user_entry: dict[str, Any] | None = None,
+        client_key: str | None = None,
+        resumable: bool = True,
+    ) -> dict[str, Any]:
+        """把一条用户消息立即交给会话的 CLI，有轮次在跑时同样送入，由 CLI 排队或并入当前轮。
+
+        消息先成为排队消息，返回 ``{"queued_message": ...}``；CLI 开始处理它（``command_lifecycle``
+        的 started）时才写入事件日志、分配 seq（见 ``_settle_queued_message``）。``user_entry`` 是被
+        接纳时写入的用户条目，缺省时按 ``content`` 构造。同一 ``client_key`` 的重试不再送 CLI：仍在
+        排队时返回同一条排队消息，已入日志时返回权威条目 ``{"entry": ...}``。
+
+        ``locale`` is forwarded to ``get_or_connect``; it shapes the system
+        prompt only when the revival starts a fresh session (see there).
+        ``resumable`` 透传给 ``get_or_connect``，见其文档。
+        """
+        exited = self.sessions.get(session_id)
+        if client_key is not None and exited is not None and exited.actor_exited:
+            # CLI 已退出：已受理过的重试（如「未发送」消息）原样返回，不为查重复活会话
+            async with exited.send_lock:
+                accepted = await self._find_sent_message(exited, session_id, client_key)
+            if accepted is not None:
+                return accepted
+
+        managed = await self.get_or_connect(session_id, meta=meta, locale=locale, resumable=resumable)
         managed.last_activity = time.monotonic()
-        # 取消待执行的 cleanup（会话恢复活跃）
-        if managed._cleanup_task and not managed._cleanup_task.done():
-            managed._cleanup_task.cancel()
-            managed._cleanup_task = None
 
-        if managed.status == "running":
-            raise ValueError("会话正在处理中，请等待当前回复完成后再发送新消息")
+        # 查重、登记、投递与失败回滚共用一个临界区；重试只认领已完成投递的消息。
+        async with managed.send_lock:
+            if client_key is not None:
+                accepted = await self._find_sent_message(managed, session_id, client_key)
+                if accepted is not None:
+                    return accepted
 
-        self._prune_transient_buffer(managed)
+            if user_entry is None:
+                user_entry = build_user_entry(
+                    [{"type": "text", "text": content}] if isinstance(content, str) else content
+                )
+            queued = QueuedMessage(entry=user_entry, cli_uuid=str(uuid4()), content=content, client_key=client_key)
+            managed.queued_messages.append(queued)
+            if client_key is not None:
+                managed.sent_client_keys[client_key] = queued.id
+            # 投递失败即受理失败：撤下排队消息并释放幂等键，同键重试会重新送入
+            await self._deliver_queued_message(managed, queued, on_failure=managed.discard_queued_message)
+            return {"queued_message": queued.to_payload()}
 
-        # Determine the display text for echo dedup (pending_user_echoes).
-        # For image-only messages display_text is empty; use a sentinel so the
-        # SDK-replayed empty-content user message can still be deduplicated.
-        display_text = echo_text or (prompt if isinstance(prompt, str) else "")
-        dedup_key = display_text or (self._IMAGE_ONLY_SENTINEL if echo_content else "")
+    async def _deliver_queued_message(
+        self,
+        managed: ManagedSession,
+        queued: QueuedMessage,
+        *,
+        on_failure: Callable[[QueuedMessage], None],
+        priority: Literal["now"] | None = None,
+    ) -> None:
+        """把已登记在排队列表里的消息交给 CLI；投递失败时先调 ``on_failure`` 撤回登记，再抛出。
+        ``priority="now"`` 让 CLI 打断当前轮先处理它（立即发送）。
 
-        # Echo user input immediately so live SSE shows it even when the SDK
-        # stream doesn't replay user messages in real time. Don't set status to
-        # "running" manually — send_query does it inside the actor.
-        if dedup_key:
-            managed.pending_user_echoes.append(dedup_key)
-            if len(managed.pending_user_echoes) > 20:
-                managed.pending_user_echoes.pop(0)
-        managed.add_message(self._build_user_echo_message(display_text, echo_content))
+        调用方持有 ``managed.send_lock``。
+        """
+        session_id = managed.session_id
+        cli_uuid = queued.cli_uuid
+        managed.sent_message_entries[cli_uuid] = queued.id
+        # 先广播再送入：CLI 报告 started 后移出的广播不能早于加入的广播
+        managed.channel.broadcast({"type": "queued_message", "op": "upsert", "message": queued.to_payload()})
+        # 登记即进入 running：闲置清理与驱逐不在送入之前断开会话
+        epoch = managed._running_epoch
+        turn_in_progress = not managed.enter_running()
 
-        # Persist status asynchronously — don't block the echo broadcast
-        await self.meta_store.update_status(session_id, "running")
-
-        # Send the query via the actor. send_query flips status to error on
-        # cmd.error and re-raises; we ensure meta store reflects that too.
+        delivering = False
         try:
-            await managed.send_query(prompt, sdk_session_id=session_id)
-        except Exception:
-            logger.exception("会话消息处理失败")
-            managed.pending_user_echoes.clear()
+            await self.meta_store.update_status(session_id, "running")
+            live = self.sessions.get(session_id)
+            if live is not managed:
+                # 落库期间会话已被驱逐完：这次 running 落在驱逐写的终态之后，按当前真相补写——同一 id 已有
+                # 新会话就写新会话的状态，否则写回驱逐的终态；之后按失败收尾
+                await self.meta_store.update_status(session_id, managed.status if live is None else live.status)
+                raise RuntimeError("session evicted while the message was being delivered")
+            delivering = True
+            await managed.send_query(
+                _user_message_frame(queued.content, cli_uuid, priority=priority), sdk_session_id=session_id
+            )
+        except Exception as exc:
+            logger.error("会话消息处理失败: %s", redact_diagnostic_text(exc))
+            on_failure(queued)
+            if turn_in_progress:
+                # meta 写入失败时消息没送入 CLI，进行中的轮次照常由 CLI 的 idle 结算；
+                # 写入 CLI 失败说明管道已断，actor 随之退出，由 send_query 与 actor 退出路径落 error
+                if not delivering:
+                    managed.abandon_running(epoch)
+                raise
+            if session_id in self._disconnecting or self.sessions.get(session_id) is not managed:
+                # 会话正在被驱逐，或等 meta 写库期间已被驱逐完：终态由驱逐收尾写入，这里不抢写 error
+                raise
+            managed.status = "error"
             try:
                 await self.meta_store.update_status(session_id, "error")
             except Exception:
                 logger.exception("持久化 error 状态失败 session_id=%s", session_id)
+            # 订阅者可能已随排队消息切到 running，没有轮次会再报 idle，终态须显式广播
+            managed.channel.broadcast({"type": "runtime_status", "status": "error", "reason": "send failed"})
             raise
+
+    async def _find_sent_message(
+        self, managed: ManagedSession, session_id: str, client_key: str
+    ) -> dict[str, Any] | None:
+        """按幂等键找已受理的消息：仍在排队时返回排队消息，已入日志时返回权威条目；未受理过返回 None。
+
+        已被接纳但日志写入失败时抛 ``UnrecordedMessageError``，不把同一消息再送一次。
+
+        调用方持有 send_lock 直到投递或失败回滚完成，排队表只包含此前已完成投递的消息。
+        """
+        entry_uuid = managed.sent_client_keys.get(client_key)
+        if entry_uuid is not None:
+            queued = managed.find_queued_message(message_id=entry_uuid)
+            if queued is not None:
+                return {"queued_message": queued.to_payload()}
+        entry = await self.event_log_store.find_by_client_key(session_id, client_key)
+        if entry is not None:
+            return {"entry": entry}
+        if entry_uuid is not None:
+            # 幂等键只在消息未被接纳就离开排队时释放：键还在却不在日志里，是接纳后日志写入失败
+            raise UnrecordedMessageError(f"message {entry_uuid} was accepted but not recorded")
+        return None
+
+    async def _settle_queued_message(
+        self, managed: ManagedSession, lifecycle: CommandLifecycle, *, preempted: bool = False
+    ) -> None:
+        """CLI 报告排队消息的去向：started 即被接纳，写入事件日志后移出排队列表。
+
+        在 inbox 序上执行，条目排在此前已产生的输出之后；先广播条目、再广播移出，
+        客户端看到它从托盘消失时，时间线上已经有它。已写入日志的消息不在排队列表里，
+        之后的 cancelled（被打断那一轮的首条消息也会收到）不再处理。
+        """
+        queued = managed.find_queued_message(cli_uuid=lifecycle.command_uuid)
+        if queued is None:
+            return
+        if lifecycle.state == "started":
+            # 用量按轮次记账：送入时它可能还排在进行中的轮次之后，被接纳时才计入本轮的 prompt
+            text = _content_text(queued.entry.get("content", []))
+            managed.last_user_prompt = text if managed.turn_usage_recorded else f"{managed.last_user_prompt}\n{text}"
+            managed.turn_usage_recorded = False
+            if managed.entry_pipeline is not None:
+                await managed.entry_pipeline.append_user_entry(queued.entry, client_key=queued.client_key)
+            managed.remove_queued_message(queued)
+            return
+        if queued.withdrawal == "send_now":
+            # 立即发送的撤回答复之前或之后，CLI 都没处理它：以 now 优先级重新送入
+            await self._redeliver_in_inbox(managed, queued, lifecycle.command_uuid, priority="now")
+            return
+        if queued.withdrawal is not None:
+            # 撤回答复失败（CLI 已从队列取走它）之后 CLI 仍没处理它：按用户当初的意图收尾
+            managed.withdraw_queued_message(queued)
+            return
+        if preempted and lifecycle.state == "cancelled":
+            # 被立即发送打断的那一轮丢掉了它，它还没进入对话：排到插队消息之后重新送入
+            await self._redeliver_in_inbox(managed, queued, lifecycle.command_uuid)
+            return
+        logger.warning(
+            "排队消息未被 CLI 处理 session_id=%s state=%s message_id=%s",
+            managed.session_id,
+            lifecycle.state,
+            queued.id,
+        )
+        managed.discard_queued_message(queued)
+
+    async def withdraw_queued_message(
+        self, session_id: str, message_id: str, intent: WithdrawalIntent
+    ) -> tuple[WithdrawalOutcome, QueuedMessage | None]:
+        """按用户的编辑 / 删除撤回一条排队消息：经 actor 向 CLI 撤回，撤回成功才移出排队。
+
+        返回 ``("withdrawn", 消息)``：已从 CLI 队列撤回并移出排队，同时释放幂等键。返回
+        ``("accepted", None)``：CLI 已取走这条消息，它照常进入对话；之后 CLI 若仍报 cancelled，
+        按记下的 ``intent`` 收尾（见 ``_settle_queued_message``）。不是本会话排队过的消息时抛
+        ``QueuedMessageNotFoundError``；同一条消息的撤回仍在等待 CLI 答复时抛
+        ``QueuedMessageWithdrawalPendingError``。
+        """
+        located = self._locate_queued_message(session_id, message_id)
+        if located is None:
+            return "accepted", None
+        managed, queued = located
+        if queued.state == "unsent":
+            # CLI 已不在，没有可撤回的对象：直接按意图移出
+            queued.withdrawal = intent
+            managed.withdraw_queued_message(queued)
+            return "withdrawn", queued
+        if await self._cancel_in_cli(managed, queued, intent):
+            managed.withdraw_queued_message(queued)
+        if queued.withdrawn:
+            return "withdrawn", queued
+        return "accepted", None
+
+    async def send_queued_message_now(self, session_id: str, message_id: str) -> SendNowOutcome:
+        """立即发送一条排队消息：先向 CLI 撤回，撤回成功以新的 uuid、``now`` 优先级重新送入。
+
+        CLI 打断当前轮先处理它；它仍是同一条排队消息（id、幂等键不变），被接纳时照常写入日志。
+        返回 ``"sent"``：已重新送入。返回 ``"accepted"``：CLI 已取走这条消息，不再重发，它照常
+        进入对话；之后 CLI 若仍报 cancelled，以 ``now`` 优先级重新送入。异常同 ``withdraw_queued_message``。
+        """
+        located = self._locate_queued_message(session_id, message_id)
+        if located is None:
+            return "accepted"
+        managed, queued = located
+        if queued.state == "unsent":
+            # CLI 已退出、没有轮次可打断：按「未发送」消息重新发送
+            await self.resend_queued_message(session_id, message_id)
+            return "sent"
+        cancelled_uuid = queued.cli_uuid
+        if await self._cancel_in_cli(managed, queued, "send_now"):
+            await self._redeliver_after_cancel(managed, queued, cancelled_uuid, priority="now")
+        # CLI 的 cancelled 帧先于撤回答复到达时，inbox 已经重新送入、换掉了 uuid
+        return "sent" if queued.cli_uuid != cancelled_uuid else "accepted"
+
+    def _locate_queued_message(self, session_id: str, message_id: str) -> tuple[ManagedSession, QueuedMessage] | None:
+        """找到用户要撤回或立即发送的排队消息；已离开排队、进入对话时返回 None。"""
+        managed = self.sessions.get(session_id)
+        queued = managed.find_queued_message(message_id=message_id) if managed is not None else None
+        if managed is None or queued is None:
+            if managed is not None and managed.was_sent(message_id):
+                # 已离开排队：在托盘移除送达之前点的操作，消息已进入对话
+                return None
+            raise QueuedMessageNotFoundError(f"queued message {message_id} not found in session {session_id}")
+        if queued.withdrawing:
+            raise QueuedMessageWithdrawalPendingError(f"queued message {message_id} is being withdrawn")
+        return managed, queued
+
+    @staticmethod
+    async def _cancel_in_cli(
+        managed: ManagedSession, queued: QueuedMessage, intent: WithdrawalIntent | Literal["send_now"]
+    ) -> bool:
+        """记下撤回意图并经 actor 向 CLI 撤回，返回 CLI 是否把它移出了队列。
+
+        此前的撤回已被 CLI 答复失败时不再问 CLI，只换成最新的意图并返回 False。
+        """
+        previous_intent = queued.withdrawal
+        queued.withdrawal = intent
+        if previous_intent is not None:
+            return False
+
+        queued.withdrawing = True
+        try:
+            # 在发送锁内入队：撤回排在此前所有消息的投递之后，CLI 收到撤回时已经有这条消息
+            async with managed.send_lock:
+                cmd = SessionCommand(type="cancel", message_uuid=queued.cli_uuid)
+                await managed.actor.enqueue(cmd)
+            await cmd.done.wait()
+        finally:
+            queued.withdrawing = False
+        if cmd.error is not None:
+            queued.withdrawal = None
+            raise cmd.error
+        return bool(cmd.cancelled)
+
+    async def _redeliver_in_inbox(
+        self,
+        managed: ManagedSession,
+        queued: QueuedMessage,
+        cancelled_uuid: str,
+        *,
+        priority: Literal["now"] | None = None,
+    ) -> None:
+        """inbox 上的重新送入：送入失败时消息已转为「未发送」，不让 inbox 随之退出。"""
+        with contextlib.suppress(Exception):
+            await self._redeliver_after_cancel(managed, queued, cancelled_uuid, priority=priority)
+
+    async def _redeliver_after_cancel(
+        self,
+        managed: ManagedSession,
+        queued: QueuedMessage,
+        cancelled_uuid: str,
+        *,
+        priority: Literal["now"] | None = None,
+    ) -> None:
+        """CLI 把排队消息移出了队列、它还没进入对话：换一个 uuid 原样再送入，仍是同一条排队消息。
+
+        ``cancelled_uuid`` 是被移出的那次送入所带的 uuid。撤回答复与 CLI 的 cancelled 帧都会触发
+        重送，先到的一方同步换掉 uuid，另一方随之什么也不做。送入失败时消息转为「未发送」。
+        """
+        if queued.cli_uuid != cancelled_uuid or queued not in managed.queued_messages:
+            return
+        queued.cli_uuid = str(uuid4())
+        queued.withdrawal = None
+
+        def _not_delivered(failed: QueuedMessage) -> None:
+            # 它已不在 CLI 队列里：转为「未发送」，由用户决定重新发送、编辑或删除
+            managed.now_messages_in_flight.discard(failed.cli_uuid)
+            failed.state = "unsent"
+            managed.channel.broadcast({"type": "queued_message", "op": "upsert", "message": failed.to_payload()})
+
+        # 与发送共用发送锁：之后的撤回排在这次送入之后
+        async with managed.send_lock:
+            if queued not in managed.queued_messages:
+                return
+            # 确定送入才登记：等锁期间它可能已离开排队，登记残留会让之后的 aborted_* 轮次都被当成插队打断
+            if priority == "now":
+                managed.now_messages_in_flight.add(queued.cli_uuid)
+                # CLI 先处理它：托盘也把它排到最前
+                managed.move_queued_message_first(queued)
+            await self._deliver_queued_message(managed, queued, on_failure=_not_delivered, priority=priority)
+
+    async def resend_queued_message(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        meta: SessionMeta | None = None,
+        locale: str = DEFAULT_LOCALE,
+    ) -> QueuedMessage:
+        """把一条「未发送」消息重新交给 CLI：仍是同一条排队消息（``id``、幂等键不变），换新的 ``cli_uuid``。
+
+        CLI 已退出时先断开旧连接、复活会话，未发送的消息随之转入新连接，托盘保持原样。消息已重新
+        交给 CLI（状态为 ``queued``）时不再送一次，原样返回。投递失败时消息回到「未发送」。不是本会话
+        的排队消息时抛 ``QueuedMessageNotFoundError``。
+        """
+        managed = self.sessions.get(session_id)
+        queued = managed.find_queued_message(message_id=message_id) if managed is not None else None
+        if managed is None or queued is None:
+            raise QueuedMessageNotFoundError(f"queued message {message_id} not found in session {session_id}")
+        if queued.state != "unsent":
+            return queued
+        if managed.actor_exited:
+            # 复活会话，未发送的消息随之转入新连接（见 get_or_connect）
+            managed = await self.get_or_connect(session_id, meta=meta, locale=locale)
+            if managed.find_queued_message(message_id=message_id) is not queued or queued.state != "unsent":
+                raise QueuedMessageNotFoundError(f"queued message {message_id} not found in session {session_id}")
+
+        def _back_to_unsent(failed: QueuedMessage) -> None:
+            failed.state = "unsent"
+            managed.channel.broadcast({"type": "queued_message", "op": "upsert", "message": failed.to_payload()})
+
+        async with managed.send_lock:
+            if queued not in managed.queued_messages:
+                raise QueuedMessageNotFoundError(f"queued message {message_id} not found in session {session_id}")
+            if queued.state != "unsent":
+                return queued
+            queued.state = "queued"
+            queued.cli_uuid = str(uuid4())
+            await self._deliver_queued_message(managed, queued, on_failure=_back_to_unsent)
+        return queued
 
     async def interrupt_session(self, session_id: str) -> SessionStatus:
         """Interrupt a running session via the actor."""
@@ -1288,7 +1707,7 @@ class SessionManager:
         if managed.status != "running":
             return managed.status
 
-        managed.pending_user_echoes.clear()
+        # 普通中断只停当前轮，CLI 队列里的排队消息保留，之后照常开始下一轮
         managed.interrupt_requested = True
         managed.cancel_pending_questions("session interrupted by user")
 
@@ -1300,70 +1719,206 @@ class SessionManager:
             return managed.status
 
         managed.last_activity = time.monotonic()
-        # status 由 _on_actor_message 在收到 ResultMessage(error_during_execution) 时推导为 "interrupted"
+        # 这一轮的 result 记下中断结局，CLI 报 idle 后会话落到 "interrupted"
         return managed.status
 
     def _handle_special_message(self, managed: ManagedSession, msg_dict: dict[str, Any]) -> None:
-        """Handle compact_boundary and result messages before broadcast."""
-        if msg_dict.get("type") == "system" and msg_dict.get("subtype") == "compact_boundary":
-            self._prune_transient_buffer(managed)
-
+        """Handle result messages before broadcast."""
         if msg_dict.get("type") == "result":
             msg_dict["session_status"] = self._resolve_result_status(
                 msg_dict,
                 interrupt_requested=managed.interrupt_requested,
+                preempted=bool(managed.now_messages_in_flight),
             )
+            # 中断只作用于它之后的第一个 result，在帧到达时就消费：排队消息开启的下一轮
+            # 可能在本轮收尾之前就结束，不能沿用这个标记
+            managed.interrupt_requested = False
+        elif msg_dict.get("type") == "system" and msg_dict.get("subtype") == "init":
+            self._check_auto_memory_path(managed, msg_dict)
+
+    def _check_auto_memory_path(self, managed: ManagedSession, init_msg: dict[str, Any]) -> None:
+        """核对 init 上报的 auto memory 目录与装配时重定向的项目记忆目录是否一致。
+
+        不符只记 error、会话照开：重定向没生效的后果是笔记落回原生派生目录，
+        创作照常进行，把会话拦下来的代价远大于记错地方。围栏也不追随上报路径——
+        放行范围按预期路径编译，跟着实际值走等于让子进程的自述扩大可写范围。
+
+        ``memory_paths`` 是 CLI init 消息的 @internal 字段，缺失（旧 CLI、
+        auto memory 被关）时不判定，只有明确上报了一个不同的目录才算不符。
+        """
+        raw = init_msg.get("data")
+        data = raw if isinstance(raw, dict) else init_msg
+        memory_paths = data.get("memory_paths")
+        if not isinstance(memory_paths, dict):
+            return
+        reported = memory_paths.get("auto")
+        if not reported:
+            return
+        try:
+            expected = project_memory_dir(self._resolve_project_cwd(managed.project_name))
+        except (ValueError, FileNotFoundError):
+            return
+        if Path(str(reported)).resolve(strict=False) == expected.resolve(strict=False):
+            return
+        logger.error(
+            "auto memory 目录与装配预期不符，项目记忆笔记将落到别处",
+            extra={
+                "session_id": managed.session_id,
+                "project_name": managed.project_name,
+                "expected_auto_memory_dir": str(expected),
+                "reported_auto_memory_dir": str(reported),
+            },
+        )
+
+    def set_autonomous_turn_listener(self, listener: Callable[[str, str], None] | None) -> None:
+        """注册会话因 CLI 自主开启新一轮而回到 running 时的通知（参数：项目名、会话 id）。"""
+        self._autonomous_turn_listener = listener
+
+    async def _persist_cli_resumed(self, managed: ManagedSession) -> None:
+        """会话未经发送回到 running（CLI 报告开始工作或开启了新一轮）：持久化并通知。
+
+        典型来源是后台任务完成后 CLI 自主开启的一轮。打开着的会话面板经常驻的 entry 流
+        收到这一轮；通知供会话列表等其他视图得知会话回到 running。
+        """
+        try:
+            await self.meta_store.update_status(managed.session_id, "running")
+        except Exception:
+            # 运行在 inbox 里：异常会让 inbox 退出、actor 却还活着，会话再也没人收尾。
+            # 内存状态已切换，持久化由离开 running 时写入终态补上。
+            logger.exception("持久化自主轮次 running 状态失败 session_id=%s", managed.session_id)
+        # 常驻的 entry 流据此立即推 running：这一轮可见输出之前，面板不停在旧终态
+        managed.channel.broadcast({"type": "runtime_status", "status": "running", "reason": "cli resumed"})
+        listener = self._autonomous_turn_listener
+        if listener is None:
+            return
+        try:
+            listener(managed.project_name, managed.session_id)
+        except Exception:
+            logger.exception("自主轮次通知失败 session_id=%s", managed.session_id)
 
     async def _finalize_turn(self, managed: ManagedSession, result_msg: dict[str, Any]) -> None:
-        """Settle session state after a result message completes a turn."""
-        managed.pending_user_echoes.clear()
+        """一轮的 result 收尾：记下这一轮的结局与用量，不切换会话状态。
+
+        result 只代表一轮结束，CLI 可能紧接着开启下一轮；会话离开 running 以 CLI 报 idle 为准
+        （见 _settle_cli_idle）。
+        """
         managed.cancel_pending_questions("session completed")
         explicit = str(result_msg.get("session_status") or "").strip()
-        final_status: SessionStatus = (
-            explicit  # type: ignore[assignment]
-            if explicit in {"idle", "running", "completed", "error", "interrupted"}
+        outcome: SessionStatus = (
+            explicit
+            if explicit in ("completed", "error", "interrupted")
             else self._resolve_result_status(
                 result_msg,
                 interrupt_requested=managed.interrupt_requested,
             )
         )
-        managed.status = final_status
+        managed.turn_outcome = outcome
+        managed.last_turn_result = result_msg
         managed.last_activity = time.monotonic()
-        await self.meta_store.update_status(managed.session_id, final_status)
+        if outcome == "error":
+            logger.warning(
+                "assistant session result error",
+                extra={
+                    "session_id": managed.session_id,
+                    "subtype": result_msg.get("subtype"),
+                    "is_error": result_msg.get("is_error"),
+                    "api_error_status": result_msg.get("api_error_status"),  # SDK 0.1.76+
+                    "stop_reason": result_msg.get("stop_reason"),
+                },
+            )
+        try:
+            await self._record_assistant_usage(managed, result_msg, outcome)
+        except Exception:
+            logger.exception("记录 assistant usage 失败 session_id=%s", managed.session_id)
+        managed.turn_usage_recorded = True
         managed.interrupt_requested = False
-        self._prune_transient_buffer(managed)
-        if final_status != "running":
-            self._schedule_cleanup(managed.session_id)
+
+    async def _settle_cli_idle(self, managed: ManagedSession, epoch: int) -> None:
+        """CLI 报 idle：会话离开 running，状态取最近一轮的结局。
+
+        在 inbox 序上执行，本轮条目都已处理完。读到 idle 之后又有消息送达、或 CLI 又报告
+        开始工作时，这个 idle 已过时，会话保持 running 等下一个 idle。
+        """
+        if managed.status != "running" or epoch != managed._running_epoch:
+            return
+        status: SessionStatus = managed.turn_outcome or "completed"
+        managed.status = status
+        managed.last_activity = time.monotonic()
+        # result 之后才到的中断没有轮次可收尾，留到下一轮会把它的失败记成中断
+        managed.interrupt_requested = False
+        await self.meta_store.update_status(managed.session_id, status)
+        if epoch != managed._running_epoch:
+            # 落库期间会话又回到 running（CLI 开始工作或新消息送达）：切回一方写入的 running
+            # 可能先于这次终态落库，补写一次让 running 最后落库；过时的终态不广播，也不调度清理
+            if managed.status == "running":
+                await self.meta_store.update_status(managed.session_id, "running")
+            return
+        result = managed.last_turn_result or {}
+        managed.channel.broadcast(
+            {
+                "type": "runtime_status",
+                "status": status,
+                "reason": "cli idle",
+                **{key: result[key] for key in _RESULT_STATUS_FIELDS if key in result},
+            }
+        )
+        self._schedule_cleanup(managed.session_id)
+
+    async def _record_assistant_usage(
+        self,
+        managed: ManagedSession,
+        result_msg: dict[str, Any],
+        final_status: SessionStatus,
+    ) -> None:
+        """一轮的用量：每个有用量的模型写一条供应商调用记录，按会话连接时注入的 Agent 凭证及其当时的倍率与绑定计价。"""
+        usages = managed.usage_meter.close_turn(result_msg.get("model_usage"))
+        if not usages:
+            return
+
+        # 用户中断的一轮记 cancelled 而非 failed，不污染失败率；费用照常计入——
+        # 中断前已完成的请求是真实花费，与记账括号里「结果未到、费用未知」的零费用取消不同。
+        if final_status == "completed":
+            status = CallStatus.SUCCESS
+        elif final_status == "interrupted":
+            status = CallStatus.CANCELLED
+        else:
+            status = CallStatus.FAILED
+
+        pricing = managed.agent_pricing
+        credential_id = pricing.credential_id
+        await self.ledger.record_agent_turn(
+            project_name=managed.project_name,
+            session_id=managed.session_id,
+            prompt=managed.last_user_prompt,
+            user_id=getattr(self, "_user_id", DEFAULT_USER_ID),
+            provider=agent_provider_id(credential_id) if credential_id is not None else PROVIDER_ANTHROPIC,
+            pricing=pricing,
+            status=status,
+            calls=[_agent_model_call(usage) for usage in usages],
+        )
 
     async def _mark_session_terminal(self, managed: ManagedSession, status: SessionStatus, reason: str) -> None:
         """Set terminal status on abnormal consumer exit."""
-        managed.pending_user_echoes.clear()
+        # CLI 退出的路径已先把排队消息转为「未发送」；其余路径 CLI 可能仍持有它们，但已无人收尾
+        managed.drop_queued_messages(state="queued")
         managed.cancel_pending_questions(reason)
         managed.status = status
         managed.last_activity = time.monotonic()
         await self.meta_store.update_status(managed.session_id, status)
         managed.interrupt_requested = False
-        self._prune_transient_buffer(managed)
 
-        # For interrupted sessions, broadcast a synthetic interrupt echo so the
-        # SSE projector generates an interrupt_notice turn.  This keeps the live
-        # path consistent with the historical path where the SDK transcript
-        # contains the CLI-injected interrupt echo that the turn_grouper converts.
-        # The consumer task is already cancelled at this point so the SDK's own
-        # echo will never arrive through the normal message pipeline.
-        if status == "interrupted":
-            managed._broadcast_to_subscribers(
-                {
-                    "type": "user",
-                    "content": "[Request interrupted by user]",
-                    "uuid": f"interrupt-echo-{uuid4().hex}",
-                    "timestamp": _utc_now_iso(),
-                }
-            )
+        # 事件日志侧补写 typed 中断条目：此路径下 inbox 处理已终止，
+        # SDK 自己的回显不会再经写入点入日志。尾检去重保证与已入日志的
+        # 回显（竞态双写）只留一条。
+        if status == "interrupted" and managed.entry_pipeline is not None:
+            try:
+                await managed.entry_pipeline.append_interrupt()
+            except Exception:
+                logger.exception("中断条目写入事件日志失败 session_id=%s", managed.resolved_sdk_id)
 
         # Broadcast terminal status so SSE subscribers unblock immediately
         # instead of waiting for the heartbeat timeout.
-        managed._broadcast_to_subscribers(
+        managed.channel.broadcast(
             {
                 "type": "runtime_status",
                 "status": status,
@@ -1375,7 +1930,7 @@ class SessionManager:
     def _schedule_cleanup(self, session_id: str) -> None:
         """Schedule delayed cleanup for a non-running session."""
         managed = self.sessions.get(session_id)
-        if managed is None:
+        if managed is None or session_id in self._disconnecting:
             return
         if managed._cleanup_task is not None and not managed._cleanup_task.done():
             managed._cleanup_task.cancel()
@@ -1389,6 +1944,9 @@ class SessionManager:
             return
         managed = self.sessions.get(session_id)
         if managed is None:
+            return
+        if managed.status == "running":
+            # 断开 CLI 会中止在途轮次、连带杀掉后台子智能体。CLI 报 idle 时重新计时。
             return
         if managed.status in ("idle", "interrupted", "error", "completed"):
             # Clear our own reference first so _evict_one's cleanup-task cancel doesn't self-cancel
@@ -1408,7 +1966,7 @@ class SessionManager:
         session_id = managed.session_id
         if session_id in self._disconnecting:
             return
-        self._disconnecting.add(session_id)
+        self._disconnecting[session_id] = asyncio.Event()
         try:
             # Cancel any pending cleanup timer first
             if managed._cleanup_task is not None and not managed._cleanup_task.done():
@@ -1426,18 +1984,15 @@ class SessionManager:
                     "actor disconnect 超时，走 cancel 兜底 session_id=%s",
                     session_id,
                 )
-                if managed.actor is not None:
-                    await managed.actor.cancel_and_wait()
+                await managed.actor.cancel_and_wait()
                 managed.status = "interrupted"
             except Exception:
                 logger.exception("actor 关停异常 session_id=%s", session_id)
                 managed.status = "error"
 
             # Drain the inbox processor
-            try:
+            with contextlib.suppress(Exception):
                 managed._inbox.put_nowait(None)
-            except Exception:
-                pass
             if managed._process_task is not None and not managed._process_task.done():
                 try:
                     await asyncio.wait_for(managed._process_task, timeout=5.0)
@@ -1452,18 +2007,24 @@ class SessionManager:
                     )
 
             # 若会话关闭时仍被标记为 running，持久化为终态以防进程重启后卡死：
-            # send_message 已把 DB 写成 running；缺少此步 get_or_connect 恢复
-            # 后会拒绝新消息（SessionStatus == "running"）。
+            # send_message 已把 DB 写成 running；缺少此步，get_or_connect 复活后
+            # 会话沿用 running，等不到 CLI 的 idle。
+            # CLI 已断开，排队消息不会再被处理；通道跨驱逐存活，移出要广播给仍在的订阅者
+            managed.drop_queued_messages()
             if managed.resolved_sdk_id is not None:
                 if managed.status == "running":
-                    managed.status = "interrupted"
-                if managed.status in ("interrupted", "error"):
+                    managed.status = managed.turn_outcome or "interrupted"
+                if managed.status in ("completed", "interrupted", "error"):
                     with contextlib.suppress(BaseException):
                         await self.meta_store.update_status(managed.resolved_sdk_id, managed.status)
         finally:
             self.sessions.pop(session_id, None)
-            self._connect_locks.pop(session_id, None)
-            self._disconnecting.discard(session_id)
+            self._release_channel(session_id)
+            # 连接锁被持有时不摘：持有者正在等这次驱逐完成后重建连接，摘掉会让后来者另起一把锁并发连接
+            lock = self._connect_locks.get(session_id)
+            if lock is not None and not lock.locked():
+                del self._connect_locks[session_id]
+            self._disconnecting.pop(session_id).set()
 
     async def _get_cleanup_delay(self) -> int:
         """返回会话清理延迟秒数，默认 300（5 分钟）。"""
@@ -1490,12 +2051,13 @@ class SessionManager:
     async def _ensure_capacity(self) -> None:
         """确保有空余并发槽位，必要时淘汰最久未活跃的非 running 会话。"""
         max_concurrent = await self._get_max_concurrent()
-        active = [s for s in self.sessions.values() if s.actor is not None and s.session_id not in self._disconnecting]
+        active = [s for s in self.sessions.values() if s.session_id not in self._disconnecting]
 
         if len(active) < max_concurrent:
             return
 
-        # 可淘汰的会话：非 running 状态（idle / completed / error / interrupted）
+        # 可淘汰的会话：不在 running。CLI 报 idle 前（在途轮次、后台子智能体）都算进行中，
+        # 宁可拒绝新会话也不断开它。
         evictable = sorted(
             [s for s in active if s.status != "running"],
             key=lambda s: s.last_activity or 0,
@@ -1562,96 +2124,10 @@ class SessionManager:
     def _resolve_result_status(
         result_message: dict[str, Any],
         interrupt_requested: bool = False,
+        preempted: bool = False,
     ) -> SessionStatus:
         """Map SDK result subtype/is_error to runtime session status."""
-        subtype = str(result_message.get("subtype") or "").strip().lower()
-        is_error = bool(result_message.get("is_error"))
-        if interrupt_requested:
-            if subtype in {"interrupted", "interrupt"}:
-                return "interrupted"
-            if is_error or subtype.startswith("error"):
-                return "interrupted"
-        if is_error or subtype.startswith("error"):
-            return "error"
-        return "completed"
-
-    # Base directory where the SDK stores per-project session data.
-    _CLAUDE_PROJECTS_DIR: Path = Path.home() / ".claude" / "projects"
-
-    @staticmethod
-    def _encode_sdk_project_path(project_cwd: Path) -> str:
-        """Encode a project cwd the same way the SDK does for session storage.
-
-        Uses the same scheme as transcript_reader.py and the SDK itself:
-        replace ``/`` and ``.`` with ``-``.
-        """
-        return project_cwd.as_posix().replace("/", "-").replace(".", "-")
-
-    def _is_path_allowed(
-        self,
-        file_path: str,
-        tool_name: str,
-        project_cwd: Path,
-    ) -> tuple[bool, str | None]:
-        """Check if file_path is allowed for the given tool.
-
-        Returns (allowed, deny_reason).  deny_reason is a human-readable
-        message when allowed is False, None otherwise.
-
-        Write tools: only project_cwd, restricted to _WRITABLE_EXTENSIONS.
-        Read tools: project_cwd + project_root + SDK session dir for
-        this project (sensitive files protected by settings.json deny rules).
-        """
-        try:
-            p = Path(file_path)
-            resolved = (project_cwd / p).resolve() if not p.is_absolute() else p.resolve()
-        except (ValueError, OSError):
-            return False, "访问被拒绝：无效的文件路径"
-
-        # 1. Within project directory
-        if resolved.is_relative_to(project_cwd):
-            if tool_name in self._WRITE_TOOLS:
-                ext = resolved.suffix.lower()
-                if ext not in self._WRITABLE_EXTENSIONS:
-                    return False, (
-                        f"不允许创建/编辑 {ext} 类型的文件。"
-                        "Write/Edit 仅限 .json、.md、.txt 文件。"
-                        "如果你需要执行数据处理，请使用现有的 skill 脚本。"
-                    )
-            return True, None
-
-        # 2. Write tools: only project directory allowed
-        if tool_name in self._WRITE_TOOLS:
-            return False, "访问被拒绝：不允许访问当前项目目录之外的路径"
-
-        # 3. Read tools: allow entire project_root for shared resources
-        #    Sensitive files protected by settings.json deny rules
-        if resolved.is_relative_to(self.project_root):
-            return True, None
-
-        # 4. Read tools: allow SDK tool-results for THIS project only.
-        #    When tool output exceeds the inline limit, the SDK saves the
-        #    full result to ~/.claude/projects/{encoded-cwd}/{session}/
-        #    tool-results/{id}.txt and instructs the agent to Read it.
-        #    Only tool-results/ subdirectories are allowed — other SDK
-        #    session data (transcripts, etc.) remains inaccessible.
-        encoded = self._encode_sdk_project_path(project_cwd)
-        sdk_project_dir = self._CLAUDE_PROJECTS_DIR / encoded
-        if resolved.is_relative_to(sdk_project_dir) and "tool-results" in resolved.parts:
-            return True, None
-
-        # 5. Read tools: allow SDK task output files.
-        #    Background tasks (Agent/Bash run_in_background) write their
-        #    output to /tmp/claude-{N}/{encoded-cwd}/tasks/{id}.output.
-        #    The SDK instructs the agent to Read the file after the task
-        #    completes.  Only the tasks/ subdirectory is allowed.
-        #    macOS: /tmp → /private/tmp symlink, so check both prefixes.
-        _SDK_TMP_PREFIXES = ("/tmp/claude-", "/private/tmp/claude-")
-        resolved_str = str(resolved)
-        if resolved_str.startswith(_SDK_TMP_PREFIXES) and "tasks" in resolved.parts:
-            return True, None
-
-        return False, "访问被拒绝：不允许访问当前项目和公共目录之外的路径"
+        return resolve_result_status(result_message, interrupt_requested=interrupt_requested, preempted=preempted)
 
     async def _handle_ask_user_question(
         self,
@@ -1670,20 +2146,18 @@ class SessionManager:
             "question_id": f"aq_{uuid4().hex}",
             "tool_name": tool_name,
             "questions": questions,
-            "timestamp": _utc_now_iso(),
+            "timestamp": utc_now_iso(),
         }
         pending = managed.add_pending_question(payload)
-        managed.add_message(payload)
+        managed.channel.broadcast(payload)
 
         try:
             answers = await pending.answer_future
         except Exception as exc:
-            if PermissionResultDeny is not None:
-                return PermissionResultDeny(
-                    message=str(exc) or "session interrupted by user",
-                    interrupt=True,
-                )
-            raise
+            return PermissionResultDeny(
+                message=str(exc) or "session interrupted by user",
+                interrupt=True,
+            )
         merged_input = dict(input_data or {})
         merged_input["answers"] = answers
         return PermissionResultAllow(updated_input=merged_input)
@@ -1719,9 +2193,6 @@ class SessionManager:
             input_data: dict[str, Any],
             _context: Any,
         ) -> Any:
-            if PermissionResultAllow is None:
-                raise RuntimeError("claude_agent_sdk is not installed")
-
             normalized_tool = str(tool_name or "").strip().lower()
 
             if normalized_tool == "askuserquestion":
@@ -1732,130 +2203,33 @@ class SessionManager:
                     input_data,
                 )
 
+            # Windows 回退：sandbox 关闭时 Bash 系列不在 allowed_tools，
+            # 落到这里走 AgentAccessPolicy 的前缀白名单。
+            if not self.access_policy.sandbox_enabled and tool_name == "Bash":
+                cmd = str((input_data or {}).get("command") or "").strip()
+                if self.access_policy.is_bash_command_whitelisted(cmd):
+                    return PermissionResultAllow(updated_input=input_data)
+                return PermissionResultDeny(
+                    message=self.access_policy.format_bash_whitelist_deny_message(cmd),
+                )
+            # BashOutput / KillBash 是 Bash 管理类工具，回退模式直接放行。
+            if not self.access_policy.sandbox_enabled and tool_name in ("BashOutput", "KillBash"):
+                return PermissionResultAllow(updated_input=input_data)
+
             # Whitelist fallback: deny any tool that was not pre-approved
             # by allowed_tools or settings.json allow rules.
-            if PermissionResultDeny is not None:
-                hint = (
-                    f"未授权的工具调用: {tool_name}"
-                    f"({json.dumps(input_data, ensure_ascii=False)[:200]})\n"
-                    "当前 Bash 白名单仅允许以下命令:\n"
-                    "  - python .claude/skills/<skill>/scripts/<script>.py <args>（必须用相对路径）\n"
-                    "  - ffmpeg / ffprobe\n"
-                    "其他 Bash 命令均不可用。"
-                    "请检查命令格式是否匹配白名单规则。"
-                )
-                return PermissionResultDeny(message=hint)
-            return PermissionResultAllow(updated_input=input_data)
+            reason = getattr(_context, "decision_reason", None)  # SDK 0.1.74+
+            reason_line = f"上游决策原因: {reason}\n" if reason else ""
+            hint = (
+                f"未授权的工具调用: {tool_name}"
+                f"({json.dumps(input_data, ensure_ascii=False)[:200]})\n"
+                f"{reason_line}"
+                "请检查工具名是否正确，以及 file_path / 命令是否触发了 "
+                "settings.json 的 deny 规则或 PreToolUse hook（跨项目/cwd 外写/代码扩展名）。"
+            )
+            return PermissionResultDeny(message=hint)
 
         return _can_use_tool
-
-    def _message_to_dict(self, message: Any) -> dict[str, Any]:
-        """Convert SDK message to dict for JSON serialization."""
-        msg_dict = self._serialize_value(message)
-
-        # Infer and add message type if not present
-        if isinstance(msg_dict, dict) and "type" not in msg_dict:
-            msg_type = self._infer_message_type(message)
-            if msg_type:
-                msg_dict["type"] = msg_type
-
-        # Inject precise subtype for typed task messages
-        if isinstance(msg_dict, dict):
-            class_name = type(message).__name__
-            subtype = self._TASK_MESSAGE_SUBTYPES.get(class_name)
-            if subtype:
-                msg_dict["subtype"] = subtype
-
-        return msg_dict
-
-    @staticmethod
-    def _build_user_echo_message(
-        text: str,
-        content_blocks: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        """Build a synthetic user message for real-time UI echo.
-
-        When content_blocks is provided (e.g. image + text blocks), the echo
-        content is a list of blocks so the UI can render image thumbnails in
-        the bubble.  If no blocks are provided, content is the plain text string.
-        """
-        content: Any = content_blocks if content_blocks is not None else text
-        return {
-            "type": "user",
-            "content": content,
-            "uuid": f"local-user-{uuid4().hex}",
-            "timestamp": _utc_now_iso(),
-            "local_echo": True,
-        }
-
-    @staticmethod
-    def _prune_transient_buffer(managed: ManagedSession) -> None:
-        """Drop stale messages that should not leak into next round snapshots.
-
-        Removes:
-        - stream_event / runtime_status: transient streaming artifacts
-        - user / assistant / result: already persisted in SDK transcript;
-          keeping them causes duplicate turns because buffer messages lack
-          the uuid that transcript messages carry, so _merge_raw_messages
-          cannot deduplicate them.
-        """
-        if not managed.message_buffer:
-            return
-        managed.message_buffer = [
-            message
-            for message in managed.message_buffer
-            if message.get("type")
-            not in {
-                "stream_event",
-                "runtime_status",
-                "user",
-                "assistant",
-                "result",
-            }
-        ]
-
-    @staticmethod
-    def _build_runtime_status_message(
-        status: SessionStatus,
-        session_id: str,
-    ) -> dict[str, Any]:
-        """Build runtime-only status message for SSE wake-up."""
-        return {
-            "type": "runtime_status",
-            "status": status,
-            "subtype": status,
-            "stop_reason": None,
-            "is_error": status == "error",
-            "session_id": session_id,
-            "uuid": f"runtime-status-{uuid4().hex}",
-            "timestamp": _utc_now_iso(),
-        }
-
-    _extract_plain_user_content = staticmethod(extract_plain_user_content)
-
-    def _is_duplicate_user_echo(
-        self,
-        managed: ManagedSession,
-        message: dict[str, Any],
-    ) -> bool:
-        """Skip SDK-replayed user message if it matches local echo queue."""
-        if not managed.pending_user_echoes:
-            return False
-        incoming = self._extract_plain_user_content(message)
-        expected = managed.pending_user_echoes[0].strip()
-
-        # Image-only sentinel: the SDK parser drops image blocks, so the
-        # replayed UserMessage arrives with empty content (incoming is None).
-        if not incoming:
-            if message.get("type") != "user" or expected != self._IMAGE_ONLY_SENTINEL:
-                return False
-            managed.pending_user_echoes.pop(0)
-            return True
-
-        if incoming != expected:
-            return False
-        managed.pending_user_echoes.pop(0)
-        return True
 
     async def _on_sdk_session_id_received(
         self,
@@ -1874,22 +2248,37 @@ class SessionManager:
 
         # Only create DB record for new sessions (no existing meta)
         if not managed.sdk_id_event.is_set():
-            # Run DB create and SDK tag in parallel (tag is independent file I/O)
-            tag_coro = None
-            if tag_session is not None:
-
-                async def _tag() -> None:
-                    try:
-                        await asyncio.to_thread(tag_session, sdk_id, f"project:{managed.project_name}")
-                    except Exception:
-                        logger.warning("tag_session failed for %s", sdk_id, exc_info=True)
-
-                tag_coro = _tag()
-            await asyncio.gather(
-                self.meta_store.create(managed.project_name, sdk_id),
-                *([] if tag_coro is None else [tag_coro]),
-            )
+            # 会话与项目的归属只记在 meta_store。元数据落库即可被列出、打开 entry 流，
+            # 通道先按 sdk_id 登记，此后的订阅挂在会话实际广播的通道上；已离开常驻集合的会话不登记。
+            registered = managed.session_id in self.sessions
+            if registered:
+                self._channels[sdk_id] = managed.channel
+            try:
+                await self.meta_store.create(managed.project_name, sdk_id)
+            except BaseException:
+                if registered and self._channels.get(sdk_id) is managed.channel:
+                    del self._channels[sdk_id]
+                raise
             await self.meta_store.update_status(sdk_id, "running")
+            # 新会话首条用户消息先写日志分配身份（seq 0）：本方法在 inbox 任务
+            # 内串行执行于任何 assistant 条目定型之前，保证时间线顺序；写入
+            # 完成后才 set sdk_id_event，send_new_session 醒来即可拿到权威条目。
+            pending_user = managed.pending_initial_user_entry
+            if pending_user is not None:
+                managed.pending_initial_user_entry = None
+                try:
+                    authoritative, _created = await self.event_log_store.append_user_entry(
+                        sdk_id,
+                        pending_user["entry"],
+                        client_key=pending_user.get("client_key"),
+                    )
+                    managed.initial_user_log_entry = authoritative
+                    managed.channel.broadcast({"type": "log_entry", "session_id": sdk_id, "entry": authoritative})
+                except Exception as exc:
+                    # 不静默吞掉：记录异常供 send_new_session 醒来后显式回报
+                    # 失败（清理会话 + 状态回写 error + 向调用方抛出）。
+                    managed.initial_user_entry_error = exc
+                    logger.exception("新会话用户条目写入事件日志失败 session_id=%s", sdk_id)
             # Key swap: replace temp_id with real sdk_id in sessions dict
             # BEFORE signaling the event. This prevents _finalize_turn from
             # using the stale temp_id if it runs before send_new_session
@@ -1903,58 +2292,52 @@ class SessionManager:
 
     @staticmethod
     def _extract_sdk_session_id(message: Any, msg_dict: dict[str, Any]) -> str | None:
-        """Extract SDK session id from either serialized payload or raw object."""
-        sdk_id = None
-        if isinstance(msg_dict, dict):
-            sdk_id = msg_dict.get("session_id") or msg_dict.get("sessionId")
+        """Extract SDK session id from either serialized payload or raw object.
+
+        CLI 的 system 消息（init / status / api_retry）把 ``session_id`` 放在
+        ``data`` 里而非顶层。首轮 API 请求失败（凭证无效触发 CLI 退避重试）时
+        流里只有这类消息，id 必须能从 init 解析出来，否则新会话只能等超时。
+        """
+        sdk_id = msg_dict.get("session_id") or msg_dict.get("sessionId")
         if sdk_id:
             return str(sdk_id)
+        data = msg_dict.get("data")
+        if isinstance(data, dict):
+            nested = data.get("session_id") or data.get("sessionId")
+            if nested:
+                return str(nested)
         raw_sdk_id = getattr(message, "session_id", None) or getattr(message, "sessionId", None)
         if raw_sdk_id:
             return str(raw_sdk_id)
         return None
 
-    def _infer_message_type(self, message: Any) -> str | None:
-        """Infer message type from SDK message class name."""
-        class_name = type(message).__name__
-        return self._MESSAGE_TYPE_MAP.get(class_name)
+    def get_draft_state(self, session_id: str) -> dict[str, Any]:
+        """流式预览态（draft）重连首帧快照：当前累积态 + rev 过滤门槛。
 
-    def _serialize_value(self, value: Any) -> Any:
-        """Recursively serialize a value to JSON-safe types."""
-        if value is None or isinstance(value, (bool, int, float, str)):
-            return value
-
-        if isinstance(value, dict):
-            return {k: self._serialize_value(v) for k, v in value.items()}
-
-        if isinstance(value, (list, tuple)):
-            return [self._serialize_value(item) for item in value]
-
-        # Pydantic models
-        if hasattr(value, "model_dump"):
-            dumped = value.model_dump()
-            return self._serialize_value(dumped)
-
-        # Dataclasses or objects with __dict__
-        if hasattr(value, "__dict__"):
-            return {k: self._serialize_value(v) for k, v in value.__dict__.items() if not k.startswith("_")}
-
-        # Fallback: convert to string
-        return str(value)
-
-    async def get_message_buffer_snapshot(self, session_id: str) -> list[dict[str, Any]]:
-        """Get current message buffer without creating a new SDK connection."""
+        ``rev`` 在无活跃 draft 时也返回：订阅与快照之间已入队的旧 delta
+        （rev <= 门槛）由客户端按 rev 丢弃，不做内容比对。
+        """
         managed = self.sessions.get(session_id)
-        if not managed:
-            return []
-        return list(managed.message_buffer)
+        if managed is None or managed.entry_pipeline is None:
+            return {"draft": None, "rev": 0}
+        draft = managed.entry_pipeline.draft
+        return {"draft": draft.snapshot(), "rev": draft.rev}
 
-    def get_buffered_messages(self, session_id: str) -> list[dict[str, Any]]:
-        """Sync helper for consumers that only need in-memory buffer state."""
+    def find_queued_message_by_client_key(self, session_id: str, client_key: str) -> dict[str, Any] | None:
+        """幂等键对应的消息仍在排队时返回 ``{"queued_message": ...}``，否则 None。"""
         managed = self.sessions.get(session_id)
-        if not managed:
+        if managed is None:
+            return None
+        entry_uuid = managed.sent_client_keys.get(client_key)
+        queued = managed.find_queued_message(message_id=entry_uuid) if entry_uuid is not None else None
+        return {"queued_message": queued.to_payload()} if queued is not None else None
+
+    def get_queued_messages_snapshot(self, session_id: str) -> list[dict[str, Any]]:
+        """排队消息快照（按发送顺序），entry 流开场下发；会话不常驻时为空。"""
+        managed = self.sessions.get(session_id)
+        if managed is None:
             return []
-        return list(managed.message_buffer)
+        return [queued.to_payload() for queued in managed.queued_messages]
 
     async def get_pending_questions_snapshot(self, session_id: str) -> list[dict[str, Any]]:
         """Get unresolved AskUserQuestion payloads for reconnect."""
@@ -1973,31 +2356,85 @@ class SessionManager:
         managed = self.sessions.get(session_id)
         if managed is None:
             raise ValueError("会话未运行或无待回答问题")
-        if managed.status != "running":
+        # 提问经 SDK 的控制请求到达，可能先于 actor 读到 CLI 报告 running 的那一帧
+        if managed.status != "running" and question_id not in managed.pending_questions:
             raise ValueError("会话未运行或无待回答问题")
         if not managed.resolve_pending_question(question_id, answers):
             raise ValueError("未找到待回答的问题")
 
-    async def subscribe(self, session_id: str, replay_buffer: bool = True) -> asyncio.Queue:
-        """Subscribe to session messages. Returns queue for SSE."""
-        managed = await self.get_or_connect(session_id)
-        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+    def _session_channel(self, session_id: str) -> SseChannel:
+        """取会话的广播通道，没有就登记一个新的。"""
+        channel = self._channels.get(session_id)
+        if channel is None:
+            channel = _make_session_channel()
+            self._channels[session_id] = channel
+        return channel
 
-        if replay_buffer:
-            # Replay buffered messages
-            for msg in managed.message_buffer:
-                try:
-                    queue.put_nowait(msg)
-                except asyncio.QueueFull:
-                    break
+    def _release_channel(self, session_id: str) -> None:
+        """会话离开常驻集合或订阅者离开后调用：两者都没有了才摘除通道。"""
+        channel = self._channels.get(session_id)
+        if channel is None or channel.has_subscribers or session_id in self.sessions:
+            return
+        del self._channels[session_id]
 
-        managed.subscribers.add(queue)
-        return queue
+    def _subscribe(self, session_id: str) -> tuple[SseChannel, asyncio.Queue]:
+        """Register a live-message queue for a session.
 
-    async def unsubscribe(self, session_id: str, queue: asyncio.Queue) -> None:
-        """Unsubscribe from session messages."""
-        if session_id in self.sessions:
-            self.sessions[session_id].subscribers.discard(queue)
+        不复活冷会话：面板开着不该占用 CLI 并发名额。订阅挂在会话的通道上，
+        会话之后由发送复活时沿用同一个通道，订阅者照常收到广播。
+
+        Private: the only consumer is :meth:`stream_messages`, which owns the
+        deterministic unsubscribe via its context-manager ``__aexit__``.
+        """
+        managed = self.sessions.get(session_id)
+        channel = managed.channel if managed is not None else self._session_channel(session_id)
+        return channel, channel.subscribe()
+
+    async def _unsubscribe(self, channel: SseChannel, session_id: str, queue: asyncio.Queue) -> None:
+        """Remove a queue from a session's subscriber channel."""
+        await channel.unsubscribe(queue)
+        self._release_channel(session_id)
+
+    @contextlib.asynccontextmanager
+    async def stream_messages(
+        self, session_id: str, *, idle_timeout: float = 20.0
+    ) -> AsyncGenerator[AsyncIterator[SessionStreamEvent]]:
+        """Subscribe to a session's messages as a self-cleaning async iterator.
+
+        Yields an async iterator producing semantic events, in order:
+
+        - a :class:`SubscriptionReady` barrier (always the first event) marking
+          that the subscription is established — broadcasts after it are gap-free,
+        - a :class:`LiveMessage` per broadcast message,
+        - a :class:`Heartbeat` whenever *idle_timeout* elapses with no message
+          (consumers run liveness / disconnect self-checks on it).
+
+        The subscription outlives the session's residency: it survives eviction
+        and keeps receiving once the session is revived. The stream ends only
+        when the subscriber queue is dropped under backpressure — stream end is
+        the reconnect signal; no overflow event reaches consumers (the overflow
+        sentinel is internal to :class:`SseChannel`).
+
+        Subscription, queue draining and unsubscribe all live behind this seam;
+        cleanup is carried deterministically by ``__aexit__`` (see ADR-0005).
+        Consume as ``async with stream_messages(...) as stream: async for event
+        in stream``.
+        """
+        channel, queue = self._subscribe(session_id)
+
+        async def _iter() -> AsyncIterator[SessionStreamEvent]:
+            # NOTE: intentionally NO ``finally: _unsubscribe`` here. Cleanup is owned
+            # by the enclosing context manager's __aexit__ (ADR-0005): a bare async
+            # generator's finally only runs at GC on break/disconnect, which is the
+            # exact leak this design avoids. Do not add a finally to this inner gen.
+            yield SubscriptionReady()
+            async for item in channel.iterate(queue, idle_timeout=idle_timeout):
+                yield Heartbeat() if item is IDLE else LiveMessage(message=item)
+
+        try:
+            yield _iter()
+        finally:
+            await self._unsubscribe(channel, session_id, queue)
 
     async def get_status(self, session_id: str) -> SessionStatus | None:
         """Get session status."""
@@ -2006,7 +2443,7 @@ class SessionManager:
         meta = await self.meta_store.get(session_id)
         return meta.status if meta else None
 
-    async def shutdown_gracefully(self, timeout: float = 30.0) -> None:
+    async def shutdown_gracefully(self) -> None:
         """Gracefully shutdown all sessions using the actor teardown path."""
         patrol = getattr(self, "_patrol_task", None)
         if patrol is not None and not patrol.done():

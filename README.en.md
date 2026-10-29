@@ -1,16 +1,20 @@
 <h1 align="center">
   <br>
   <picture>
-    <source media="(prefers-color-scheme: light)" srcset="frontend/public/android-chrome-maskable-512x512.png">
-    <source media="(prefers-color-scheme: dark)" srcset="frontend/public/android-chrome-512x512.png">
-    <img src="frontend/public/android-chrome-maskable-512x512.png" alt="ArcReel Logo" width="128" style="border-radius: 16px;">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/logo-animated-light.svg">
+    <source media="(prefers-color-scheme: dark)" srcset="frontend/public/logo-animated.svg">
+    <img src="docs/assets/logo-animated-light.svg" alt="ArcReel Logo" width="128">
   </picture>
   <br>
   ArcReel
   <br>
 </h1>
 
-<h4 align="center">Open-source AI Video Generation Workspace — Novel to Short Video, Powered by AI Agents</h4>
+<p align="center">
+  <strong>An open-source, self-hosted AI video production workspace</strong>
+  <br>
+  Turn novels, finished screenplays, or product assets into character-consistent, controllable, cost-trackable short videos that remain editable.
+</p>
 
 <p align="center">
   <a href="README.md"><img src="https://img.shields.io/badge/lang-中文-red?style=flat-square" alt="中文"></a>
@@ -18,289 +22,198 @@
 </p>
 
 <p align="center">
-  <a href="#quick-start"><img src="https://img.shields.io/badge/Quick_Start-blue?style=for-the-badge" alt="Quick Start"></a>
-  <a href="https://github.com/ArcReel/ArcReel/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-green?style=for-the-badge" alt="License"></a>
-  <a href="https://github.com/ArcReel/ArcReel"><img src="https://img.shields.io/github/stars/ArcReel/ArcReel?style=for-the-badge" alt="Stars"></a>
-  <a href="https://github.com/ArcReel/ArcReel/pkgs/container/arcreel"><img src="https://img.shields.io/badge/Docker-ghcr.io-blue?style=for-the-badge&logo=docker" alt="Docker"></a>
-  <a href="https://github.com/ArcReel/ArcReel/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/ArcReel/ArcReel/test.yml?style=for-the-badge&label=Tests" alt="Tests"></a>
+  <a href="https://github.com/ArcReel/ArcReel/releases/latest"><img src="https://img.shields.io/github/v/release/ArcReel/ArcReel?style=flat-square&label=release" alt="Release"></a>
+  <a href="https://github.com/ArcReel/ArcReel/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/ArcReel/ArcReel/test.yml?style=flat-square&label=tests" alt="Tests"></a>
+  <a href="https://codecov.io/gh/ArcReel/ArcReel"><img src="https://img.shields.io/codecov/c/github/ArcReel/ArcReel?style=flat-square&label=coverage" alt="Coverage"></a>
+  <a href="https://hub.docker.com/r/arcreel/arcreel"><img src="https://img.shields.io/docker/pulls/arcreel/arcreel?style=flat-square&logo=docker&logoColor=white&label=docker%20pulls" alt="Docker"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-2ea44f?style=flat-square" alt="License"></a>
+  <a href="https://github.com/ArcReel/ArcReel"><img src="https://img.shields.io/github/stars/ArcReel/ArcReel?style=flat-square" alt="Stars"></a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black" alt="React">
-  <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI">
-  <img src="https://img.shields.io/badge/Claude_Agent_SDK-Anthropic-191919?logo=anthropic&logoColor=white" alt="Claude Agent SDK">
-  <img src="https://img.shields.io/badge/Gemini-Image_&_Video_&_Text-886FBF?logo=googlegemini&logoColor=white" alt="Gemini">
-  <img src="https://img.shields.io/badge/Volcengine_Ark-Image_&_Video_&_Text-FF6A00?logo=bytedance&logoColor=white" alt="Volcengine Ark">
-  <img src="https://img.shields.io/badge/Grok-Image_&_Video_&_Text-000000?logo=x&logoColor=white" alt="Grok">
-  <img src="https://img.shields.io/badge/OpenAI-Image_&_Video_&_Text-74AA9C?logo=openai&logoColor=white" alt="OpenAI">
+  <a href="#quick-start"><strong>Quick Start</strong></a>
+  ·
+  <a href="https://docs.arc-reel.com/en/guide/getting-started">Getting Started</a>
+  ·
+  <a href="https://docs.arc-reel.com/en/">Documentation</a>
+  ·
+  <a href="#community">Community</a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/hero-screenshot.png" alt="ArcReel Workspace" width="800">
+  <img src="docs/assets/screenshots/hero.webp" alt="ArcReel Workspace" width="900">
 </p>
 
----
+## Sponsors
 
-## Core Features
+> [Want to appear here?](mailto:support@arc-reel.com)
 
 <table>
-<tr>
-<td width="20%" align="center">
-<h3>🤖 AI Agent Workflow</h3>
-Built on the <strong>Claude Agent SDK</strong>, orchestrating Skills + focused Subagents for multi-agent collaboration, automating the full pipeline from screenplay to video synthesis
-</td>
-<td width="20%" align="center">
-<h3>🎨 Multi-Provider Image Generation</h3>
-<strong>Gemini</strong>, <strong>Volcengine Ark</strong>, <strong>Grok</strong>, <strong>OpenAI</strong>, and custom providers. Character design sheets ensure consistency; clue tracking maintains prop/scene continuity across shots
-</td>
-<td width="20%" align="center">
-<h3>🎬 Multi-Provider Video Generation</h3>
-<strong>Veo 3.1</strong>, <strong>Seedance</strong>, <strong>Grok</strong>, <strong>Sora 2</strong>, and custom providers, switchable at global or project level
-</td>
-<td width="20%" align="center">
-<h3>⚡ Async Task Queue</h3>
-RPM rate limiting + independent Image/Video concurrency channels, lease-based scheduling with checkpoint resume
-</td>
-<td width="20%" align="center">
-<h3>🖥️ Visual Workspace</h3>
-Web UI for project management, asset preview, version rollback, real-time SSE task tracking, and built-in AI assistant
-</td>
-</tr>
+  <tr>
+    <td width="200" align="center" valign="top">
+      <a href="https://metaso.cn/minimax-h3/?s=arc"><img src="docs/assets/sponsors/metaso.png" alt="Metaso" width="180"></a>
+    </td>
+    <td valign="top">
+      <strong>MiniMax H3 Video Generation API | Metaso</strong><br>
+      Metaso offers cost-effective MiniMax H3 video generation: <strong>CNY 0.09/sec at 768P, CNY 0.15/sec at 2K</strong>. Native 2K, synchronized audio and video, an API compatible with the <strong>OpenAI protocol</strong>, and <strong>ComfyUI</strong> support — no GPU deployment required.<br>
+      🎁 <a href="https://metaso.cn/minimax-h3/?s=arc">Sign up via ArcReel's exclusive link</a> to claim bonus credits and an exclusive discount.
+    </td>
+  </tr>
+  <tr>
+    <td width="200" align="center" valign="top">
+      <a href="https://ofox.ai/?utm_source=github&utm_medium=sponsorship&utm_content=arcreel"><img src="docs/assets/sponsors/ofox-ai.svg" alt="OfoxAI" width="180"></a>
+    </td>
+    <td valign="top">
+      <strong>OfoxAI: Model APIs for scripts, images, and video</strong><br>
+      Access text, image, and video models through OfoxAI. Choose capabilities for refining scripts, creating character and scene references, and generating video assets. Consult the API documentation for each model’s input requirements, supported parameters, and request format.<br>
+      <a href="https://ofox.ai/?utm_source=github&utm_medium=sponsorship&utm_content=arcreel">Explore OfoxAI models and APIs →</a>
+    </td>
+  </tr>
+  <tr>
+    <td width="200" align="center" valign="top">
+      <a href="https://go.apimart.ai/tw-arcreel"><img src="docs/assets/sponsors/apimart.webp" alt="APIMart" width="180"></a>
+    </td>
+    <td valign="top">
+      <strong>APIMart: Low-cost API for AI image & video generation</strong><br>
+      Thanks to APIMart for sponsoring this project! APIMart is a low-cost API platform for AI image & video generation — <strong>GPT-Image-2 from $0.006/image, 160+ images per dollar</strong>. One async API covers both image and video: submit a task, get an ID, fetch results via polling or callback. Batch tens of thousands of images without timeouts, switch models without changing code. Pay-as-you-go with no monthly fee — <a href="https://go.apimart.ai/tw-arcreel">sign up here</a> to get started.
+    </td>
+  </tr>
 </table>
 
-## Workflow
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/assets/screenshots/video-units.webp" alt="Video units"></td>
+    <td width="50%"><img src="docs/assets/screenshots/props.webp" alt="Props library"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/assets/screenshots/scenes.webp" alt="Scenes library"></td>
+    <td width="50%"><img src="docs/assets/screenshots/ad-mode.webp" alt="Ad / product mode"></td>
+  </tr>
+</table>
+
+## Showcase
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/fcc4ceb2-64dd-44a0-a32c-e0c00b2f9796" width="100%" controls></video>
+</div>
+
+> 《入职地府后投诉鬼都是我老客户》Episode 1
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/d6bfe589-a5c0-4961-8bfe-b7b59be3bb8a" width="100%" controls></video>
+</div>
+
+> 《入职地府后投诉鬼都是我老客户》Episode 2
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/1e580769-80f7-4d14-b46d-68569b6e7e4c" width="100%" controls></video>
+</div>
+
+> 《入职地府后投诉鬼都是我老客户》Episode 3
+
+## What ArcReel is
+
+ArcReel is an open-source, self-hosted workspace for AI drama and novel adaptation, narrated short videos, ads, and product shorts. It organizes content analysis, asset management, storyboards, media generation, cost tracking, and export into an inspectable and resumable production pipeline.
+
+- **One production workflow**: turn novels, finished screenplays, or product assets into characters, scenes, props, storyboards, video clips, and final videos step by step.
+- **Visual continuity with human control**: reuse reference assets across shots, review key stages, regenerate individual assets, and roll back to earlier versions.
+- **Manageable models and costs**: configure text, image, video, and TTS capabilities in one place, then review estimated costs and actual usage.
+- **Editable delivery**: render final videos directly or export Jianying drafts to refine subtitles, voice-over, pacing, and transitions. Exports target the mainland-China edition of Jianying; CapCut compatibility has not been verified.
+
+## From source to final video
 
 ```mermaid
-graph TD
-    A["📖 Upload Novel"] --> B["🔍 Global Character/Clue Extraction"]
-    B --> C["✂️ Episode Planning & Splitting"]
-    C --> D["📝 Script Preprocessing & JSON Generation"]
-    D --> E["👤 Generate Character Designs"]
-    D --> F["🔑 Generate Clue Designs"]
-    E --> G["🖼️ Generate Storyboard / Grid Images"]
-    F --> G
-    G --> H["🎬 Generate Video Clips"]
-    H --> I["🎞️ FFmpeg Final Composition"]
-    H --> J["📦 Export CapCut Draft"]
+flowchart LR
+    A["Novel / Screenplay / Product Assets"] --> B["Content Analysis & Project Planning"]
+    B --> C["Character / Scene / Prop Assets"]
+    C --> D["Episode Plan & Structured Script"]
+    D --> E["Storyboard Image / Grid Storyboard"]
+    E --> F["Video Clips / Voice-over Tracks"]
+    F --> G["Final Composition"]
+    F --> H["Jianying Draft Export"]
 ```
+
+Every stage can be orchestrated by the Agent, or reviewed, adjusted, and regenerated by the user in the workspace. See [Workflows and Modes](https://docs.arc-reel.com/en/guide/workflows) for guidance on choosing a mode.
 
 ## Quick Start
 
-> ⚠️ **OS**: Linux / MacOS / Windows WSL2 (the Claude Agent SDK and several dependencies are POSIX-only; native Windows is not supported — use Docker Desktop or WSL2)
-
-### Default Deployment (SQLite)
+Install Docker and Docker Compose, then run:
 
 ```bash
 git clone https://github.com/ArcReel/ArcReel.git
 cd ArcReel/deploy
+
 cp .env.example .env
 docker compose up -d
-# Visit http://localhost:1241
 ```
 
-### Production Deployment (PostgreSQL)
+Open <http://localhost:1241>. The default username is `admin`. If `AUTH_PASSWORD` is empty, ArcReel generates a password on first startup and writes it back to `deploy/.env`.
 
-```bash
-cd ArcReel/deploy/production
-cp .env.example .env    # Set POSTGRES_PASSWORD
-docker compose up -d
-```
+> Default Compose publishes port `1241` on all host interfaces. Do not expose ArcReel directly to the public Internet; before enabling remote access, configure authentication and use HTTPS, a VPN, or a secure tunnel. See [Reverse Proxy and HTTPS](https://docs.arc-reel.com/en/ops/deployment#reverse-proxy-and-https).
 
-After first launch, log in with the default account (username `admin`, password set via `AUTH_PASSWORD` in `.env`; if not set, it will be auto-generated and written back to `.env` on first startup). Then go to **Settings** (`/settings`) to complete configuration:
+After signing in, open **Settings**, configure the ArcReel Agent and the text, image, video, and other generation capabilities, then create a project.
 
-1. **ArcReel Agent** — Configure Anthropic API Key (powers the AI assistant), with support for custom Base URL and model
-2. **AI Image/Video Generation** — Configure at least one provider's API Key (Gemini / Volcengine Ark / Grok / OpenAI), or add a custom provider
-
-> 📖 For detailed steps, see the [Getting Started Guide](docs/getting-started.md)
-
-## Feature Highlights
-
-- **Complete Production Pipeline** — Novel → Screenplay → Character Design → Storyboard Images → Video Clips → Final Cut, one-click orchestration
-- **Multi-Agent Architecture** — Orchestration Skill detects project state and auto-dispatches focused Subagents; each Subagent completes one task and returns a summary
-- **Multi-Provider Support** — Image/Video/Text generation all support Gemini, Volcengine Ark, Grok, and OpenAI as built-in providers, switchable at global or project level
-- **Custom Providers** — Connect any OpenAI-compatible or Google-compatible API (e.g., Ollama, vLLM, third-party proxies); auto-discovers available models and assigns media types, with full feature parity with built-in providers
-- **Two Content Modes** — Narration mode splits by reading rhythm; Drama mode organizes by scene/dialogue structure
-- **Progressive Episode Planning** — Human-AI collaborative splitting of long novels: peek probe → Agent suggests breakpoints → user confirms → physical split, produce on demand
-- **Style Reference Images** — Upload style references; AI auto-analyzes and applies uniformly to all image generation for visual consistency
-- **Character Consistency** — AI generates character design sheets first; all subsequent storyboards and videos reference these designs
-- **Clue Tracking** — Key props and scene elements marked as "clues" maintain visual continuity across shots
-- **Version History** — Every regeneration auto-saves a version; one-click rollback supported
-- **Multi-Provider Cost Tracking** — Image/Video/Text costs all tracked, with per-provider billing strategies and separate currency accounting
-- **Cost Estimation** — Pre-generation cost estimates at project/episode/shot level, with three-level drill-down comparing estimated vs. actual costs
-- **CapCut Draft Export** — Export CapCut-compatible draft ZIP per episode, supporting CapCut 5.x / 6+ ([Guide](docs/jianying-export-guide.md))
-- **Grid Mode** — Compose multiple storyboards into grid images (grid_4/grid_6/grid_9) with auto grid-size selection; split cells serve as first/last frames for video generation
-- **Multi API Key Management** — Configure multiple API Keys per provider with active key switching; supports Google Vertex AI credential upload
-- **Bilingual UI (i18n)** — Full internationalization for frontend and backend, supporting Chinese/English interface switching
-- **Project Import/Export** — Archive entire projects for backup and migration
-
-## Provider Support
-
-ArcReel supports multiple built-in and custom providers through unified `ImageBackend` / `VideoBackend` / `TextBackend` protocols, switchable at global or project level:
-
-### Image Providers
-
-| Provider | Available Models | Capabilities | Billing |
-|----------|-----------------|--------------|---------|
-| **Gemini** (Google) | Nano Banana 2, Nano Banana Pro | Text-to-image, Image-to-image (multi-reference) | Per-resolution lookup (USD) |
-| **Volcengine Ark** | Seedream 5.0, Seedream 5.0 Lite, Seedream 4.5, Seedream 4.0 | Text-to-image, Image-to-image | Per-image (CNY) |
-| **Grok** (xAI) | Grok Imagine Image, Grok Imagine Image Pro | Text-to-image, Image-to-image | Per-image (USD) |
-| **OpenAI** | GPT Image 1.5, GPT Image 1 Mini | Text-to-image, Image-to-image (multi-reference) | Per-image (USD) |
-
-### Video Providers
-
-| Provider | Available Models | Capabilities | Billing |
-|----------|-----------------|--------------|---------|
-| **Gemini** (Google) | Veo 3.1, Veo 3.1 Fast, Veo 3.1 Lite | Text-to-video, Image-to-video, Video extension, Negative prompts | Per-resolution × duration lookup (USD) |
-| **Volcengine Ark** | Seedance 2.0, Seedance 2.0 Fast, Seedance 1.5 Pro | Text-to-video, Image-to-video, Video extension, Audio generation, Seed control, Offline inference | Per-token usage (CNY) |
-| **Grok** (xAI) | Grok Imagine Video | Text-to-video, Image-to-video | Per-second (USD) |
-| **OpenAI** | Sora 2, Sora 2 Pro | Text-to-video, Image-to-video | Per-second (USD) |
-
-### Text Providers
-
-| Provider | Available Models | Capabilities | Billing |
-|----------|-----------------|--------------|---------|
-| **Gemini** (Google) | Gemini 3.1 Flash, Gemini 3.1 Flash Lite, Gemini 3 Pro | Text generation, Structured output, Visual understanding | Per-token usage (USD) |
-| **Volcengine Ark** | Doubao Seed series | Text generation, Structured output, Visual understanding | Per-token usage (CNY) |
-| **Grok** (xAI) | Grok 4.20, Grok 4.1 Fast series | Text generation, Structured output, Visual understanding | Per-token usage (USD) |
-| **OpenAI** | GPT-5.4, GPT-5.4 Mini, GPT-5.4 Nano | Text generation, Structured output, Visual understanding | Per-token usage (USD) |
-
-### Custom Providers
-
-In addition to built-in providers, you can connect any **OpenAI-compatible** or **Google-compatible** API:
-
-- Add a custom provider in the Settings page with Base URL and API Key
-- Auto-discovers available models via `/v1/models`, infers media types (image/video/text) by model name
-- Full feature parity with built-in providers: global/project-level switching, cost tracking, version management
-
-Provider selection priority: Project-level settings > Global defaults. When switching providers, common settings (resolution, aspect ratio, audio, etc.) carry over; provider-specific parameters are preserved.
-
-## AI Assistant Architecture
-
-ArcReel's AI assistant is built on the Claude Agent SDK, using an **Orchestration Skill + Focused Subagent** multi-agent architecture:
-
-```mermaid
-flowchart TD
-    User["User Conversation"] --> Main["Main Agent"]
-    Main --> MW["manga-workflow<br/>Orchestration Skill"]
-    MW -->|"State Detection"| PJ["Read project.json<br/>+ File System"]
-    MW -->|"dispatch"| SA1["analyze-characters-clues<br/>Global Character/Clue Extraction"]
-    MW -->|"dispatch"| SA2["split-narration-segments<br/>Narration Mode Segmentation"]
-    MW -->|"dispatch"| SA3["normalize-drama-script<br/>Drama Script Normalization"]
-    MW -->|"dispatch"| SA4["create-episode-script<br/>JSON Script Generation"]
-    MW -->|"dispatch"| SA5["Asset Generation Subagent<br/>Characters/Clues/Storyboards/Videos"]
-    SA1 -->|"Summary"| Main
-    SA4 -->|"Summary"| Main
-    Main -->|"Show Results<br/>Await Confirmation"| User
-```
-
-**Core Design Principles**:
-
-- **Orchestration Skill (manga-workflow)** — Has state detection capability, automatically determines the current project phase (character design / episode planning / preprocessing / script generation / asset generation), dispatches the corresponding Subagent, supports entry from any phase and interrupt recovery
-- **Focused Subagents** — Each Subagent completes a single task before returning; large context like novel text stays within the Subagent, while the Main Agent only receives concise summaries, protecting context space
-- **Skill vs Subagent Boundary** — Skills handle deterministic script execution (API calls, file generation); Subagents handle tasks requiring reasoning and analysis (character extraction, script normalization)
-- **Inter-Phase Confirmation** — After each Subagent returns, the Main Agent shows the user a result summary and waits for confirmation before proceeding to the next phase
-
-## OpenClaw Integration
-
-ArcReel supports invocation through external AI Agent platforms like [OpenClaw](https://openclaw.ai), enabling natural language-driven video creation:
-
-1. Generate an API Key in ArcReel's Settings page (`arc-` prefix)
-2. Load ArcReel's Skill definition in OpenClaw (access `http://your-domain/skill.md` to auto-fetch)
-3. Create projects, generate scripts, and produce videos through OpenClaw conversations
-
-Technical implementation: API Key authentication (Bearer Token) + synchronous Agent chat endpoint (`POST /api/v1/agent/chat`), internally connects to SSE streaming assistant and collects complete responses.
-
-## Technical Architecture
-
-```mermaid
-flowchart TB
-    subgraph UI["Web UI — React 19"]
-        U1["Project Management"] ~~~ U2["Asset Preview"] ~~~ U3["AI Assistant"] ~~~ U4["Task Monitor"]
-    end
-
-    subgraph Server["FastAPI Server"]
-        S1["REST API<br/>Route Dispatch"] ~~~ S2["Agent Runtime<br/>Claude Agent SDK"]
-        S3["SSE Stream<br/>Real-time Status"] ~~~ S4["Auth<br/>JWT + API Key"]
-    end
-
-    subgraph Core["Core Library"]
-        C1["VideoBackend Abstraction<br/>Gemini · Volcengine Ark · Grok · OpenAI · Custom"] ~~~ C2["ImageBackend Abstraction<br/>Gemini · Volcengine Ark · Grok · OpenAI · Custom"]
-        C5["TextBackend Abstraction<br/>Gemini · Volcengine Ark · Grok · OpenAI · Custom"] ~~~ C3["GenerationQueue<br/>RPM Limiting · Image/Video Channels"]
-        C4["ProjectManager<br/>File System + Version Management"]
-    end
-
-    subgraph Data["Data Layer"]
-        D1["SQLAlchemy 2.0 Async ORM"] ~~~ D2["SQLite / PostgreSQL"]
-        D3["Alembic Migrations"] ~~~ D4["UsageTracker<br/>Multi-Provider Cost Tracking"]
-    end
-
-    UI --> Server --> Core --> Data
-```
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| **Frontend** | React 19, TypeScript, Tailwind CSS 4, wouter, zustand, Framer Motion, Vite |
-| **Backend** | FastAPI, Python 3.12+, uvicorn, Pydantic 2 |
-| **AI Agents** | Claude Agent SDK (Skill + Subagent multi-agent architecture) |
-| **Image Generation** | Gemini (`google-genai`), Volcengine Ark (`volcengine-python-sdk[ark]`), Grok (`xai-sdk`), OpenAI (`openai`) |
-| **Video Generation** | Gemini Veo 3.1 (`google-genai`), Volcengine Ark Seedance 2.0/1.5 (`volcengine-python-sdk[ark]`), Grok (`xai-sdk`), OpenAI Sora 2 (`openai`) |
-| **Text Generation** | Gemini (`google-genai`), Volcengine Ark (`volcengine-python-sdk[ark]`), Grok (`xai-sdk`), OpenAI (`openai`), Instructor (structured output fallback) |
-| **Media Processing** | FFmpeg, Pillow |
-| **ORM & Database** | SQLAlchemy 2.0 (async), Alembic, aiosqlite, asyncpg — SQLite (default) / PostgreSQL (production) |
-| **Authentication** | JWT (`pyjwt`), API Key (SHA-256 hash), Argon2 password hashing (`pwdlib`) |
-| **Deployment** | Docker, Docker Compose (`deploy/` default, `deploy/production/` with PostgreSQL) |
+For the complete first-run workflow, see [Getting Started](https://docs.arc-reel.com/en/guide/getting-started). For production deployment, upgrades, backups, and reverse proxies, see [Deployment and Operations](https://docs.arc-reel.com/en/ops/deployment).
 
 ## Documentation
 
-- 📖 [Getting Started Guide](docs/getting-started.md) — Step-by-step setup tutorial
-- 📦 [CapCut Draft Export Guide](docs/jianying-export-guide.md) — Import video clips into CapCut desktop for further editing
-- 💰 [Google GenAI Pricing](docs/google-genai-docs/Google视频&图片生成费用参考.md) — Gemini image / Veo video generation pricing reference
-- 💰 [Volcengine Ark Pricing](docs/ark-docs/火山方舟费用参考.md) — Volcengine Ark video / image / text model pricing reference
+| Page | Purpose |
+|---|---|
+| [Documentation Home](https://docs.arc-reel.com/en/) | Entry points for users, operators, and developers |
+| [Getting Started](https://docs.arc-reel.com/en/guide/getting-started) | From first deployment to the first generated video |
+| [Workflows and Modes](https://docs.arc-reel.com/en/guide/workflows) | Novels, scripts, and creative ideas; three creation types and two generation modes |
+| [Provider Configuration](https://docs.arc-reel.com/en/guide/providers) | Selection and configuration of Agent, text, image, video, and TTS providers |
+| [Jianying Draft Export](https://docs.arc-reel.com/en/guide/jianying-export) | Continue editing ArcReel output in Jianying |
+| [FAQ](https://docs.arc-reel.com/en/guide/faq) | Deployment, cost, model, data, and licensing questions |
+| [Deployment and Operations](https://docs.arc-reel.com/en/ops/deployment) | SQLite, PostgreSQL, upgrades, backups, and reverse proxies |
+| [Migrate from SQLite to PostgreSQL](https://docs.arc-reel.com/en/ops/migrate-to-postgres) | Data migration, verification, and rollback |
+| [Architecture](https://docs.arc-reel.com/en/dev/architecture) | Agent Runtime, task queue, provider abstraction, and data layer |
+| [Contributing](https://docs.arc-reel.com/en/dev/contributing) | Local development, tests, conventions, and pull requests |
+
+## Community
+
+Scan the QR code to join the ArcReel Feishu community for help, release updates, and workflow discussions:
+
+<p align="center">
+  <img src="docs/assets/feishu-qr.png" alt="ArcReel Feishu Community QR Code" width="280">
+</p>
+
+Reproducible bugs and focused feature requests are welcome in [GitHub Issues](https://github.com/ArcReel/ArcReel/issues).
 
 ## Contributing
 
-Contributions, bug reports, and feature suggestions are welcome!
+Contributions to code, documentation, tests, provider adapters, and reproducible bug reports are welcome.
 
-### Local Development
-
-```bash
-# Prerequisites: Python 3.12+, Node.js 20+, uv, pnpm, ffmpeg
-
-# Install dependencies
-uv sync
-cd frontend && pnpm install && cd ..
-
-# Initialize database
-uv run alembic upgrade head
-
-# Start backend (Terminal 1)
-uv run uvicorn server.app:app --reload --port 1241
-
-# Start frontend (Terminal 2)
-cd frontend && pnpm dev
-
-# Visit http://localhost:5173
-```
-
-### Running Tests
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before starting. After cloning the repository, install the pre-commit hooks:
 
 ```bash
-# Backend tests
-python -m pytest
-
-# Frontend type check + tests
-cd frontend && pnpm check
+uv run pre-commit install
 ```
 
-## License
+## Star History
 
-[AGPL-3.0](LICENSE)
+<a href="https://www.star-history.com/?repos=arcreel%2Farcreel&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=arcreel/arcreel&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=arcreel/arcreel&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=arcreel/arcreel&type=date&legend=top-left" />
+ </picture>
+</a>
+
+## License and commercial use
+
+ArcReel is licensed under the [GNU Affero General Public License v3.0](LICENSE). Additional terms are available in [NOTICE](NOTICE).
+
+For organizations that cannot use AGPL-3.0, or need commercial deployment, white-labeling, or redistribution without AGPL obligations, contact:
+
+**support@arc-reel.com**
+
+Copyright © 2026 Pollo3470 and ArcReel contributors
 
 ---
 
 <p align="center">
-  If you find this project useful, please give it a ⭐ Star!
+  If ArcReel helps your work, consider giving the project a ⭐ Star.
 </p>

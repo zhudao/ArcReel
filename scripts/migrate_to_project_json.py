@@ -10,14 +10,14 @@
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
-# 添加 lib 目录到 Python 路径
-lib_path = Path(__file__).parent.parent / "lib"
-sys.path.insert(0, str(lib_path))
+# 添加仓库根目录到 Python 路径
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from project_manager import ProjectManager
+from lib.infra.data_root_layout import PROJECT_NAME_PATTERN, DataRootLayout
+from lib.project.project_manager import ProjectManager
 
 
 def migrate_project(pm: ProjectManager, project_name: str, dry_run: bool = False) -> bool:
@@ -71,10 +71,10 @@ def migrate_project(pm: ProjectManager, project_name: str, dry_run: bool = False
                 all_characters[name] = char_data.copy()
                 print(f"      👤 发现角色: {name}")
             else:
-                # 合并数据（优先保留有设计图的版本）
+                # 合并数据（优先保留有资产图的版本）
                 if char_data.get("character_sheet") and not all_characters[name].get("character_sheet"):
                     all_characters[name] = char_data.copy()
-                    print(f"      👤 更新角色: {name} (有设计图)")
+                    print(f"      👤 更新角色: {name} (有资产图)")
 
         # 提取剧集信息
         novel_info = script.get("novel", {})
@@ -94,7 +94,7 @@ def migrate_project(pm: ProjectManager, project_name: str, dry_run: bool = False
                 episode_num = i
                 break
 
-        # 添加剧集信息（不包含统计字段，由 StatusCalculator 读时计算）
+        # 添加剧集信息（不包含统计字段，由项目摘要读时计算）
         episodes.append(
             {
                 "episode": episode_num,
@@ -118,7 +118,7 @@ def migrate_project(pm: ProjectManager, project_name: str, dry_run: bool = False
             first_script = json.load(f)
             project_title = first_script.get("novel", {}).get("title", project_name)
 
-    # 构建 project.json（不包含 status 字段，由 StatusCalculator 读时计算）
+    # 构建 project.json（不包含 status 字段，由项目摘要读时计算）
     project_data = {
         "title": project_title,
         "style": "",
@@ -126,15 +126,15 @@ def migrate_project(pm: ProjectManager, project_name: str, dry_run: bool = False
         "characters": all_characters,
         "clues": {},
         "metadata": {
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
             "migrated_from": "script_based_characters",
         },
     }
 
-    # 统计已完成的角色设计图（仅用于日志输出）
+    # 统计已完成的角色资产图（仅用于日志输出）
     completed_chars = 0
-    for name, char_data in all_characters.items():
+    for char_data in all_characters.values():
         sheet = char_data.get("character_sheet")
         if sheet:
             sheet_path = project_dir / sheet
@@ -149,7 +149,7 @@ def migrate_project(pm: ProjectManager, project_name: str, dry_run: bool = False
         print("\n  📁 创建目录: clues/")
 
     print("\n  📊 迁移摘要:")
-    print(f"      - 角色: {len(all_characters)} 个 ({completed_chars} 个有设计图)")
+    print(f"      - 角色: {len(all_characters)} 个 ({completed_chars} 个有资产图)")
     print(f"      - 剧集: {len(episodes)} 个")
     print("      - 线索: 0 个 (待添加)")
 
@@ -175,7 +175,9 @@ def main():
     parser.add_argument("project", nargs="?", help="项目名称，或使用 --all 迁移所有项目")
     parser.add_argument("--all", action="store_true", help="迁移所有项目")
     parser.add_argument("--dry-run", action="store_true", help="预览模式，不实际执行")
-    parser.add_argument("--projects-root", default=None, help="项目根目录")
+    parser.add_argument(
+        "--projects-root", "--data-root", dest="data_root", default=None, help="数据根（默认按当前配置解析）"
+    )
 
     args = parser.parse_args()
 
@@ -185,10 +187,10 @@ def main():
         sys.exit(1)
 
     # 初始化 ProjectManager
-    pm = ProjectManager(projects_root=args.projects_root)
+    pm = ProjectManager(args.data_root or DataRootLayout.current().root)
 
     print("🚀 开始迁移...")
-    print(f"   项目根目录: {pm.projects_root}")
+    print(f"   项目目录: {pm.projects_dir}")
 
     if args.dry_run:
         print("   📋 预览模式已启用")
@@ -197,7 +199,18 @@ def main():
     fail_count = 0
 
     if args.all:
-        projects = pm.list_projects()
+        # 待迁移的旧项目还没有 project.json，不在 list_projects() 里；按项目名规则与剧本文件识别旧项目
+        projects = (
+            sorted(
+                entry.name
+                for entry in pm.projects_dir.iterdir()
+                if entry.is_dir()
+                and PROJECT_NAME_PATTERN.fullmatch(entry.name)
+                and any((entry / "scripts").glob("*.json"))
+            )
+            if pm.projects_dir.is_dir()
+            else []
+        )
         print(f"   发现 {len(projects)} 个项目")
 
         for project_name in projects:

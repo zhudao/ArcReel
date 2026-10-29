@@ -1,521 +1,306 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
-import { Sparkles, Loader2 } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { SegmentCard } from "./SegmentCard";
-import { GridSegmentGroup } from "./GridSegmentGroup";
-import { PreprocessingView } from "./PreprocessingView";
-import { useScrollTarget } from "@/hooks/useScrollTarget";
-import { useAppStore } from "@/stores/app-store";
-import { useCostStore } from "@/stores/cost-store";
-import { formatCost, totalBreakdown } from "@/utils/cost-format";
-import { API } from "@/api";
-import type { GridGeneration } from "@/types/grid";
+import { ScriptReviewGate } from "./ScriptReviewGate";
+import { PromptAuthoringButton } from "@/components/canvas/shared/PromptAuthoringButton";
+import { RetainedEditUnit } from "@/components/shared/edit-unit/RetainedEditUnit";
+import { ShotSplitView } from "./ShotSplitView";
+import { StoryboardBatchDialog } from "./StoryboardBatchDialog";
+import { EmptyScriptState } from "./EmptyScriptState";
+import type { InsertShotHandler } from "./ShotStructureActions";
+import { AdScriptButton, AdScriptProgress } from "@/components/canvas/shared/AdScriptDialog";
+import { NoScriptBlankState } from "@/components/canvas/shared/StartBlankScriptButton";
+import { BatchFillButton, useBatchGap } from "@/components/canvas/episode-page/BatchFillButton";
+import { EpisodeHeaderActions } from "@/components/canvas/episode-page/EpisodeHeaderActions";
+import type { EpisodeCanvasContext } from "@/components/canvas/episode-page/EpisodePage";
+import { useActiveResourceIds } from "@/stores/tasks-store";
+import { getScriptItemId } from "@/utils/script-shape";
+import { previewAspect } from "@/utils/preview-aspect";
+import { ONBOARDING_ANCHORS } from "@/onboarding/anchors";
+import { useDemoWorkbench } from "@/onboarding/use-demo-workbench";
+import type { DurationOutOfRangeReason } from "@/hooks/useModelCapabilities";
 import type {
   EpisodeScript,
   NarrationEpisodeScript,
   DramaEpisodeScript,
+  AdEpisodeScript,
   NarrationSegment,
   DramaScene,
+  AdShot,
   ProjectData,
+  StoryboardBatchKind,
 } from "@/types";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+type Segment = NarrationSegment | DramaScene | AdShot;
 
-type Segment = NarrationSegment | DramaScene;
-
-function getSegmentId(segment: Segment, mode: "narration" | "drama"): string {
-  return mode === "narration"
-    ? (segment as NarrationSegment).segment_id
-    : (segment as DramaScene).scene_id;
-}
-
-/** Group segments by segment_break into contiguous groups. */
-function groupBySegmentBreak(segments: Segment[]): Segment[][] {
-  const groups: Segment[][] = [];
-  let current: Segment[] = [];
-  for (const seg of segments) {
-    if (seg.segment_break && current.length > 0) {
-      groups.push(current);
-      current = [];
-    }
-    current.push(seg);
-  }
-  if (current.length > 0) groups.push(current);
-  return groups;
-}
-
-/** Compute grid size for a group based on scene count and aspect ratio.
- *  Mirrors backend calculate_grid_layout + chunking logic in grids.py. */
-function computeGridSize(
-  count: number,
-  aspectRatio: string = "9:16",
-): { gridSize: string | null; rows: number; cols: number; cellCount: number; batchCount: number } {
-  if (count < 1) return { gridSize: null, rows: 0, cols: 0, cellCount: 0, batchCount: 0 };
-  const [w, h] = aspectRatio.split(":").map(Number);
-  const isHorizontal = w > h;
-  const effective = Math.min(count, 9);
-
-  let gridSize: string;
-  let cellCount: number;
-  let rows: number;
-  let cols: number;
-
-  if (effective <= 4) {
-    gridSize = "grid_4";
-    cellCount = 4;
-    rows = 2;
-    cols = 2;
-  } else if (effective <= 6) {
-    gridSize = "grid_6";
-    cellCount = 6;
-    rows = isHorizontal ? 3 : 2;
-    cols = isHorizontal ? 2 : 3;
-  } else {
-    gridSize = "grid_9";
-    cellCount = 9;
-    rows = 3;
-    cols = 3;
-  }
-
-  const batchCount = count > cellCount ? Math.ceil(count / cellCount) : 1;
-
-  return { gridSize, rows, cols, cellCount, batchCount };
-}
-
-// ---------------------------------------------------------------------------
-// Props
-// ---------------------------------------------------------------------------
-
-interface TimelineCanvasProps {
+interface TimelineCanvasProps extends EpisodeCanvasContext {
   projectName: string;
   episode: number;
-  episodeTitle?: string;
   hasDraft?: boolean;
   episodeScript: EpisodeScript | null;
   scriptFile?: string;
   projectData: ProjectData | null;
-  onUpdatePrompt?: (segmentId: string, field: string, value: unknown, scriptFile?: string) => void;
+  /** 保存分镜字段：失败时抛错；resolve 为本地剧本是否已刷新到保存后的内容。 */
+  onUpdatePrompt?: (segmentId: string, patch: Record<string, unknown>, scriptFile?: string) => Promise<boolean>;
+  /** 分镜改序：移到 afterId 之后，null 移到最前；resolve 为是否移动成功 */
+  onMoveShot?: (shotId: string, afterId: string | null, scriptFile?: string) => Promise<boolean>;
+  /** 新增分镜（旁白带正文）：afterId 为 null 时追加到末尾；resolve 为是否成功 */
+  onInsertShot?: (afterId: string | null, novelText: string | undefined, scriptFile?: string) => Promise<boolean>;
+  /** 移除分镜，resolve 为是否成功 */
+  onRemoveShot?: (itemId: string, scriptFile?: string) => Promise<boolean>;
   onGenerateStoryboard?: (segmentId: string, scriptFile?: string) => void;
-  onGenerateVideo?: (segmentId: string, scriptFile?: string) => void;
-  onGenerateGrid?: (episode: number, scriptFile: string, sceneIds?: string[]) => void;
+  onGenerateVideo?: (segmentId: string, scriptFile?: string) => void | Promise<void>;
+  onGenerateNarration?: (segmentId: string, scriptFile?: string) => void;
+  onGenerateEpisodeNarration?: (scriptFile?: string) => void;
   durationOptions?: number[];
-  onRestoreStoryboard?: () => Promise<void> | void;
-  onRestoreVideo?: () => Promise<void> | void;
+  /** 内容确认页的剧本规划档位；时长由端点固定时与 `durationOptions` 不同。 */
+  planDurationOptions?: number[];
+  /** 档位为空是因为这一维由端点固定（workflow 自己定片长），不是型号没登记时长。 */
+  durationEndpointFixed?: boolean;
+  videoModelUnresolved?: boolean;
+  lastFrame?: boolean | null;
+  capabilitiesLoading?: boolean;
+  /** 已保存时长越界的成因判定；缺省时 ShotDetail 退回不区分成因的通用警告文案。 */
+  durationWarningReason?: (seconds: number) => DurationOutOfRangeReason | null;
+  onRestoreStoryboard?: () => Promise<unknown> | void;
+  onRestoreVideo?: () => Promise<unknown> | void;
 }
 
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
-
 /**
- * Main canvas container that renders a vertical list of SegmentCards for
- * the currently selected episode.
- *
- * Shows episode header (title, segment count, duration), followed by the
- * full timeline of segment cards with spacing.
+ * 演示态作废的入参。分镜卡自身的写入口（生成 / 上传 / 编辑 / 版本恢复）由 `MediaCard`
+ * 直读同一判定关闭，这里只列本画布额外承载的写能力，两处不重复兜同一个入口。
  */
-export function TimelineCanvas({
-  projectName,
-  episode,
-  episodeTitle,
-  hasDraft,
-  episodeScript,
-  scriptFile,
-  projectData,
-  durationOptions,
-  onUpdatePrompt,
-  onGenerateStoryboard,
-  onGenerateVideo,
-  onGenerateGrid,
-  onRestoreStoryboard,
-  onRestoreVideo,
-}: TimelineCanvasProps) {
+const DEMO_READ_ONLY_PROPS = {
+  onUpdatePrompt: undefined,
+  onMoveShot: undefined,
+  onInsertShot: undefined,
+  onRemoveShot: undefined,
+  onGenerateNarration: undefined,
+  onGenerateEpisodeNarration: undefined,
+} as const satisfies Partial<TimelineCanvasProps>;
+
+export function TimelineCanvas(props: TimelineCanvasProps) {
+  // 演示态只读判定直读单一来源，不经父级逐个回调透传——漏接一个回调就是漏一个写入口
+  const demoReadOnly = useDemoWorkbench();
+  const {
+    projectName,
+    episode,
+    view,
+    onViewChange,
+    hasDraft,
+    episodeScript,
+    scriptFile,
+    projectData,
+    durationOptions,
+    planDurationOptions,
+    durationEndpointFixed,
+    videoModelUnresolved,
+    lastFrame,
+    capabilitiesLoading,
+    durationWarningReason,
+    onUpdatePrompt,
+    onMoveShot,
+    onInsertShot,
+    onRemoveShot,
+    onGenerateStoryboard,
+    onGenerateVideo,
+    onGenerateNarration,
+    onGenerateEpisodeNarration,
+    onRestoreStoryboard,
+    onRestoreVideo,
+  } = demoReadOnly ? { ...props, ...DEMO_READ_ONLY_PROPS } : props;
+
   const { t } = useTranslation("dashboard");
-  const scrollRef = useRef<HTMLDivElement>(null);
   const contentMode = projectData?.content_mode ?? "narration";
+  // 分镜编辑子视图按剧本形状显式分派：narration（segments）/ drama（scenes）/ ad（shots）。
+  // 未知/脏 content_mode 沿用历史兜底落 drama 视图。
+  const editorContentMode: "narration" | "drama" | "ad" =
+    contentMode === "narration" ? "narration" : contentMode === "ad" ? "ad" : "drama";
 
   const hasScript = Boolean(episodeScript);
-  const showTabs = Boolean(hasDraft);
-  const defaultTab = hasScript ? "timeline" : "preprocessing";
-  const [activeTab, setActiveTab] = useState<"preprocessing" | "timeline">(defaultTab);
+  const [batchKind, setBatchKind] = useState<StoryboardBatchKind | null>(null);
+  const storyboardGap = useBatchGap(projectName, episode, "storyboards", "storyboard");
+  const videoGap = useBatchGap(projectName, episode, "videos", "video");
+  const narrationGap = useBatchGap(projectName, episode, "narration", "tts");
 
-  // Auto-switch to timeline when script becomes available
-  useEffect(() => {
-    if (hasScript) setActiveTab("timeline");
-  }, [hasScript]);
+  const aspectRatio = previewAspect(projectData);
 
-  const episodeCost = useCostStore((s) =>
-    episodeScript ? s.getEpisodeCost(episodeScript.episode) : undefined,
-  );
-  const debouncedFetch = useCostStore((s) => s.debouncedFetch);
-
-  useEffect(() => {
-    if (!projectName) return;
-    debouncedFetch(projectName);
-  }, [projectName, episodeScript?.episode, debouncedFetch]);
-
-  // Determine aspect ratio — use project config if available, otherwise defaults
-  const aspectRatio =
-    typeof projectData?.aspect_ratio === "string"
-      ? projectData.aspect_ratio
-      : projectData?.aspect_ratio?.storyboard ??
-        (contentMode === "narration" ? "9:16" : "16:9");
-
-  // Pick the correct array (segments for narration, scenes for drama)
+  // 仅三种已注册模式显式取数；未知/脏 content_mode 返回空列表（不渲染可编辑视图）——
+  // 否则会以 drama 形状渲染、保存却按真实 content_mode 分派到错误端点。
   const segments = useMemo<Segment[]>(
     () =>
       !episodeScript || !projectData
         ? []
         : contentMode === "narration"
           ? ((episodeScript as NarrationEpisodeScript).segments ?? [])
-          : ((episodeScript as DramaEpisodeScript).scenes ?? []),
+          : contentMode === "ad"
+            ? ((episodeScript as AdEpisodeScript).shots ?? [])
+            : contentMode === "drama"
+              ? ((episodeScript as DramaEpisodeScript).scenes ?? [])
+              : [],
     [contentMode, episodeScript, projectData],
   );
-  const segmentIndexMap = useMemo(
-    () =>
-      new Map(
-        segments.map((segment, index) => [getSegmentId(segment, contentMode), index]),
-      ),
-    [contentMode, segments],
+
+  // 任务派生 loading：活跃 + 最新行胜出下沉到 store selector（各 task_type 一组活跃 resource）
+  const storyboardBusyIds = useActiveResourceIds("storyboard", projectName);
+  const videoBusyIds = useActiveResourceIds("video", projectName);
+  const ttsBusyIds = useActiveResourceIds("tts", projectName);
+  const generatingStoryboard = useCallback(
+    (segId: string) => storyboardBusyIds.has(segId),
+    [storyboardBusyIds],
+  );
+  const generatingVideo = useCallback(
+    (segId: string) => videoBusyIds.has(segId),
+    [videoBusyIds],
+  );
+  const generatingNarration = useCallback(
+    (segId: string) => ttsBusyIds.has(segId),
+    [ttsBusyIds],
+  );
+  // 批量旁白进行中：当前分集还有未完结的 tts 任务时禁用批量按钮，避免重复入队；
+  // 按本集 segment 范围判定，不影响其他分集的批量入口
+  const currentSegmentIds = useMemo(
+    () => new Set(segments.map((s) => getScriptItemId(s, editorContentMode))),
+    [segments, editorContentMode],
+  );
+  const narrationBatchBusy = useMemo(
+    () => [...currentSegmentIds].some((id) => ttsBusyIds.has(id)),
+    [ttsBusyIds, currentSegmentIds],
   );
 
-  // Grid mode state
-  const gridsRevision = useAppStore((s) => s.gridsRevision);
-  const isGridMode = projectData?.generation_mode === "grid";
-  const segmentGroups = useMemo(
-    () => (isGridMode ? groupBySegmentBreak(segments) : []),
-    [isGridMode, segments],
-  );
-  const [generatingGridGroups, setGeneratingGridGroups] = useState<Set<number>>(new Set());
-  const [generatingAllGrids, setGeneratingAllGrids] = useState(false);
-  const [grids, setGrids] = useState<GridGeneration[]>([]);
-  const [gridsVersion, setGridsVersion] = useState(0);
-
-  const refreshGrids = useCallback(() => {
-    if (!isGridMode || !projectName) return;
-    API.listGrids(projectName).then((data) => {
-      setGrids(data);
-      setGridsVersion((v) => v + 1);
-    }).catch(() => {/* silently ignore */});
-  }, [isGridMode, projectName]);
-
-  // Fetch grids list for the current episode when in grid mode
-  // Also re-fetch when gridsRevision changes (triggered by grid_ready SSE events)
-  useEffect(() => {
-    refreshGrids();
-  }, [refreshGrids, episodeScript, gridsRevision]);
-
-  /**
-   * Find all grid IDs whose scene_ids are a subset of the given group.
-   * Handles batched grids: a group with 32 scenes may have 4 grids of ~9 each.
-   * Deduplicates by scene_ids key — keeps only the newest grid per unique batch.
-   */
-  function getGridIdsForGroup(groupScenes: Segment[]): string[] {
-    const groupIdSet = new Set(groupScenes.map((s) => getSegmentId(s, contentMode)));
-    const matched = grids.filter((g) =>
-      g.episode === episode &&
-      g.scene_ids.length > 0 &&
-      g.scene_ids.every((id) => groupIdSet.has(id)),
-    );
-    // Deduplicate: for grids with identical scene_ids, keep the newest one
-    const byKey = new Map<string, typeof matched[number]>();
-    for (const g of matched) {
-      const key = [...g.scene_ids].sort().join(",");
-      const existing = byKey.get(key);
-      if (!existing || g.created_at > existing.created_at) {
-        byKey.set(key, g);
-      }
-    }
-    return Array.from(byKey.values())
-      .sort((a, b) => a.created_at.localeCompare(b.created_at))
-      .map((g) => g.id);
+  // 广告/短片没有脚本规划：没有正式脚本时直接从空白开始。
+  if (projectData && !episodeScript && !hasDraft && editorContentMode === "ad" && !demoReadOnly) {
+    return <NoScriptBlankState projectName={projectName} episode={episode} className="h-full text-sm" />;
   }
 
-  const handleGenerateGroupGrid = useCallback(
-    (groupIndex: number, groupScenes: Segment[]) => {
-      if (!onGenerateGrid || !scriptFile) return;
-      const sceneIds = groupScenes.map((s) => getSegmentId(s, contentMode));
-      setGeneratingGridGroups((prev) => new Set(prev).add(groupIndex));
-      // Fire and let the toast/task system handle the result
-      onGenerateGrid(episode, scriptFile, sceneIds);
-      // Clear loading after a short delay (actual progress tracked via task queue)
-      setTimeout(() => {
-        setGeneratingGridGroups((prev) => {
-          const next = new Set(prev);
-          next.delete(groupIndex);
-          return next;
-        });
-        refreshGrids();
-      }, 3000);
-    },
-    [onGenerateGrid, scriptFile, contentMode, episode, refreshGrids],
-  );
-
-  const handleGenerateAllGrids = useCallback(() => {
-    if (!onGenerateGrid || !scriptFile) return;
-    setGeneratingAllGrids(true);
-    onGenerateGrid(episode, scriptFile);
-    setTimeout(() => {
-      setGeneratingAllGrids(false);
-      refreshGrids();
-    }, 3000);
-  }, [onGenerateGrid, scriptFile, episode, refreshGrids]);
-
-  // eslint-disable-next-line react-hooks/incompatible-library -- TanStack Virtual 的 useVirtualizer 返回非 memoizable 函数，与 React Compiler 不兼容，属已知第三方库限制
-  const virtualizer = useVirtualizer({
-    count: segments.length,
-    getScrollElement: () => scrollRef.current,
-    estimateSize: () => 200,
-    overscan: 5,
-    measureElement: (element) => element?.getBoundingClientRect().height ?? 200,
-  });
-  const prepareScrollTarget = useCallback(
-    (target: { id: string }) => {
-      const index = segmentIndexMap.get(target.id);
-      if (index == null) {
-        return false;
-      }
-      virtualizer.scrollToIndex(index, { align: "center" });
-      return true;
-    },
-    [segmentIndexMap, virtualizer],
-  );
-
-  // Respond to agent-triggered scroll targets for segments
-  useScrollTarget("segment", { prepareTarget: prepareScrollTarget });
-
-  // Empty state — no episode selected or no content at all
   if (!projectData || (!episodeScript && !hasDraft)) {
     return (
-      <div className="flex h-full items-center justify-center text-gray-500">
+      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
         {t("select_episode_hint")}
       </div>
     );
   }
 
-  // Compute total duration from actual segments if available
-  const totalDuration =
-    episodeScript?.duration_seconds ??
-    segments.reduce((sum, s) => sum + s.duration_seconds, 0);
-
-  const virtualItems = virtualizer.getVirtualItems();
+  const handleUpdatePrompt = onUpdatePrompt
+    ? (segId: string, patch: Record<string, unknown>) => onUpdatePrompt(segId, patch, scriptFile)
+    : undefined;
+  const handleMoveShot = onMoveShot
+    ? (shotId: string, afterId: string | null) => onMoveShot(shotId, afterId, scriptFile)
+    : undefined;
+  const handleInsertShot: InsertShotHandler | undefined = onInsertShot
+    ? (afterId, novelText) => onInsertShot(afterId, novelText, scriptFile)
+    : undefined;
+  const handleRemoveShot = onRemoveShot
+    ? (itemId: string) => onRemoveShot(itemId, scriptFile)
+    : undefined;
+  // 生成回调保持可选透传：未提供时编辑器隐藏对应生成入口，
+  // 而非渲染一个点了没反应的按钮。
+  const handleGenSb = onGenerateStoryboard
+    ? (segId: string) => onGenerateStoryboard(segId, scriptFile)
+    : undefined;
+  const handleGenVid = onGenerateVideo
+    ? (segId: string) => onGenerateVideo(segId, scriptFile)
+    : undefined;
+  const handleGenNarration = onGenerateNarration
+    ? (segId: string) => onGenerateNarration(segId, scriptFile)
+    : undefined;
 
   return (
-    <div ref={scrollRef} className="h-full overflow-y-auto">
-      <div className="p-4">
-        {/* ---- Episode header ---- */}
-        <div className="mb-4">
-          <h2 className="text-lg font-semibold text-gray-100">
-            {episodeScript
-              ? `E${episodeScript.episode}: ${episodeScript.title}`
-              : `E${episode}${episodeTitle ? `: ${episodeTitle}` : ""}`}
-          </h2>
-          {episodeScript && (
-            <p className="text-xs text-gray-500">
-              {contentMode === "narration"
-                ? t("segment_count", { count: segments.length })
-                : t("scene_count_label", { count: segments.length })} · ~{totalDuration}s
-            </p>
+    <div className="flex h-full min-h-0 flex-col">
+      {view === "board" && hasScript && (
+        <EpisodeHeaderActions>
+          {editorContentMode === "ad" && !demoReadOnly && (
+            <AdScriptButton projectName={projectName} episode={episode} regenerate />
           )}
-          {episodeCost && (
-            <div className="mt-2 flex items-center gap-4 rounded-lg bg-gray-900 border border-gray-800 px-3 py-2 text-xs tabular-nums">
-              <span className="text-gray-600">{t("cost_estimate_short")}</span>
-              <span className="text-gray-500">{t("cost_storyboard_short")} <span className="text-gray-300">{formatCost(episodeCost.totals.estimate.image)}</span></span>
-              <span className="text-gray-500">{t("cost_video_short")} <span className="text-gray-300">{formatCost(episodeCost.totals.estimate.video)}</span></span>
-              <span className="text-gray-500">{t("cost_total_short")} <span className="font-medium text-amber-400">{formatCost(totalBreakdown(episodeCost.totals.estimate))}</span></span>
-              <span className="text-gray-700">|</span>
-              <span className="text-gray-600">{t("cost_actual_short")}</span>
-              <span className="text-gray-500">{t("cost_storyboard_short")} <span className="text-gray-300">{formatCost(episodeCost.totals.actual.image)}</span></span>
-              <span className="text-gray-500">{t("cost_video_short")} <span className="text-gray-300">{formatCost(episodeCost.totals.actual.video)}</span></span>
-              <span className="text-gray-500">{t("cost_total_short")} <span className="font-medium text-emerald-400">{formatCost(totalBreakdown(episodeCost.totals.actual))}</span></span>
-            </div>
+          <PromptAuthoringButton projectName={projectName} episode={episode} scope="pending" />
+          <BatchFillButton
+            kind="storyboards"
+            count={storyboardGap}
+            disabled={demoReadOnly}
+            onClick={() => setBatchKind("storyboards")}
+          />
+          <BatchFillButton
+            kind="videos"
+            count={videoGap}
+            disabled={demoReadOnly}
+            onClick={() => setBatchKind("videos")}
+          />
+          {contentMode === "narration" && onGenerateEpisodeNarration && (
+            <BatchFillButton
+              kind="narration"
+              count={narrationGap}
+              disabled={narrationBatchBusy}
+              onClick={() => onGenerateEpisodeNarration(scriptFile)}
+            />
           )}
-        </div>
+        </EpisodeHeaderActions>
+      )}
 
-        {/* ---- Tab bar (only when draft exists) ---- */}
-        {showTabs && (
-          <div className="mb-4 flex gap-0 border-b border-gray-800">
-            <button
-              type="button"
-              onClick={() => setActiveTab("preprocessing")}
-              className={`border-b-2 px-4 py-2 text-sm transition-colors focus-ring rounded-t ${
-                activeTab === "preprocessing"
-                  ? "border-indigo-500 text-indigo-400 font-medium"
-                  : "border-transparent text-gray-500 hover:text-gray-300"
-              }`}
-            >
-              {t("preprocessing_tab")}
-            </button>
-            <button
-              type="button"
-              onClick={() => hasScript && setActiveTab("timeline")}
-              disabled={!hasScript}
-              className={`border-b-2 px-4 py-2 text-sm transition-colors focus-ring rounded-t ${
-                activeTab === "timeline"
-                  ? "border-indigo-500 text-indigo-400 font-medium"
-                  : !hasScript
-                    ? "border-transparent text-gray-700 cursor-not-allowed"
-                    : "border-transparent text-gray-500 hover:text-gray-300"
-              }`}
-            >
-              {t("timeline_tab")}
-            </button>
+      {batchKind && (
+        <StoryboardBatchDialog
+          projectName={projectName}
+          episode={episode}
+          kind={batchKind}
+          onClose={() => setBatchKind(null)}
+        />
+      )}
+
+      {editorContentMode === "ad" && hasScript && (
+        <AdScriptProgress projectName={projectName} episode={episode} noScript={false} className="mx-4 mt-3" />
+      )}
+
+      {/* 主体 */}
+      <div className="flex min-h-0 flex-1 flex-col" data-onboarding={ONBOARDING_ANCHORS.workbenchTimeline}>
+        <RetainedEditUnit identity={episodeScript && segments.length > 0 ? "shots" : "empty"} message={t("shot_externally_removed")} value={view === "plan" && hasDraft && editorContentMode !== "ad" ? (
+          <div className="relative h-full overflow-y-auto p-4">
+            <ScriptReviewGate
+              key={`${projectName}:${episode}`}
+              projectName={projectName}
+              episode={episode}
+              contentMode={editorContentMode}
+              videoModelUnresolved={videoModelUnresolved}
+              durationOptions={planDurationOptions}
+              durationEndpointFixed={durationEndpointFixed}
+              durationWarningReason={durationWarningReason}
+              onOpenTimeline={hasScript ? () => onViewChange("board") : undefined}
+            />
           </div>
-        )}
-
-        {/* ---- Tab content ---- */}
-        {activeTab === "preprocessing" && hasDraft ? (
-          <PreprocessingView
+        ) : episodeScript && segments.length > 0 ? (
+          <ShotSplitView
+            segments={segments}
+            contentMode={editorContentMode}
+            aspectRatio={aspectRatio}
             projectName={projectName}
             episode={episode}
-            contentMode={contentMode}
+            scriptFile={scriptFile}
+            onUpdatePrompt={handleUpdatePrompt}
+            onMoveShot={handleMoveShot}
+            onInsertShot={handleInsertShot}
+            onRemoveShot={handleRemoveShot}
+            onGenerateStoryboard={handleGenSb}
+            onGenerateVideo={handleGenVid}
+            onGenerateNarration={handleGenNarration}
+            onRestoreStoryboard={onRestoreStoryboard}
+            onRestoreVideo={onRestoreVideo}
+            generatingStoryboard={generatingStoryboard}
+            generatingVideo={generatingVideo}
+            generatingNarration={generatingNarration}
+            durationOptions={durationOptions}
+            durationEndpointFixed={durationEndpointFixed}
+            lastFrame={lastFrame}
+            capabilitiesLoading={capabilitiesLoading}
+            durationWarningReason={durationWarningReason}
           />
-        ) : episodeScript ? (
-          isGridMode && segmentGroups.length > 0 ? (
-            /* ---- Grid mode: grouped segments without virtualization ---- */
-            <div>
-              {/* Batch generate all grids button */}
-              {onGenerateGrid && scriptFile && (
-                <div className="mb-4">
-                  <motion.button
-                    type="button"
-                    onClick={handleGenerateAllGrids}
-                    disabled={generatingAllGrids}
-                    className={`inline-flex items-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-medium transition-colors ${
-                      generatingAllGrids
-                        ? "border-blue-700 text-blue-400 opacity-70 cursor-not-allowed"
-                        : "border-blue-600 text-blue-400 hover:bg-blue-600/10"
-                    }`}
-                    animate={
-                      generatingAllGrids
-                        ? { opacity: [0.7, 1, 0.7] }
-                        : { opacity: 1 }
-                    }
-                    transition={
-                      generatingAllGrids
-                        ? { duration: 1.5, repeat: Infinity, ease: "easeInOut" }
-                        : { duration: 0.3 }
-                    }
-                  >
-                    <AnimatePresence mode="wait" initial={false}>
-                      {generatingAllGrids ? (
-                        <motion.span
-                          key="loader"
-                          initial={{ opacity: 0, rotate: -90 }}
-                          animate={{ opacity: 1, rotate: 0 }}
-                          exit={{ opacity: 0, rotate: 90 }}
-                          transition={{ duration: 0.2 }}
-                        >
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        </motion.span>
-                      ) : (
-                        <motion.span
-                          key="sparkles"
-                          initial={{ opacity: 0, scale: 0.5 }}
-                          animate={{ opacity: 1, scale: 1 }}
-                          exit={{ opacity: 0, scale: 0.5 }}
-                          transition={{ duration: 0.2 }}
-                        >
-                          <Sparkles className="h-4 w-4" />
-                        </motion.span>
-                      )}
-                    </AnimatePresence>
-                    {generatingAllGrids ? t("submitting") : t("generate_all_grids")}
-                  </motion.button>
-                </div>
-              )}
-
-              {segmentGroups.map((group, groupIdx) => {
-                const gridResult = computeGridSize(group.length, aspectRatio);
-                return (
-                  <GridSegmentGroup
-                    key={groupIdx}
-                    groupIndex={groupIdx}
-                    scenes={group}
-                    gridSize={gridResult.gridSize}
-                    sceneCount={group.length}
-                    batchCount={gridResult.batchCount}
-                    onGenerateGrid={() => handleGenerateGroupGrid(groupIdx, group)}
-                    generatingGrid={generatingGridGroups.has(groupIdx)}
-                    gridIds={getGridIdsForGroup(group)}
-                    projectName={projectName}
-                    onGridRegenerated={refreshGrids}
-                    gridsVersion={gridsVersion}
-                  >
-                    {group.map((segment) => {
-                      const segId = getSegmentId(segment, contentMode);
-                      return (
-                        <div id={`segment-${segId}`} key={segId}>
-                          <SegmentCard
-                            segment={segment}
-                            contentMode={contentMode}
-                            aspectRatio={aspectRatio}
-                            characters={projectData.characters}
-                            clues={projectData.clues}
-                            projectName={projectName}
-                            durationOptions={durationOptions}
-                            isGridMode
-                            onUpdatePrompt={onUpdatePrompt && ((id, field, value) => onUpdatePrompt(id, field, value, scriptFile))}
-                            onGenerateStoryboard={onGenerateStoryboard && ((id) => onGenerateStoryboard(id, scriptFile))}
-                            onGenerateVideo={onGenerateVideo && ((id) => onGenerateVideo(id, scriptFile))}
-                            onRestoreStoryboard={onRestoreStoryboard}
-                            onRestoreVideo={onRestoreVideo}
-                          />
-                        </div>
-                      );
-                    })}
-                  </GridSegmentGroup>
-                );
-              })}
-            </div>
-          ) : (
-            /* ---- Normal mode: virtualized flat list ---- */
-            <div
-              className="relative"
-              style={{ height: `${virtualizer.getTotalSize()}px` }}
-            >
-              {virtualItems.map((virtualItem) => {
-                const segment = segments[virtualItem.index];
-                const segId = getSegmentId(segment, contentMode);
-                return (
-                  <div
-                    id={`segment-${segId}`}
-                    key={segId}
-                    data-index={virtualItem.index}
-                    ref={virtualizer.measureElement}
-                    className="absolute left-0 top-0 w-full"
-                    style={{
-                      transform: `translateY(${virtualItem.start}px)`,
-                      paddingBottom: virtualItem.index === segments.length - 1 ? 0 : 16,
-                    }}
-                  >
-                    <SegmentCard
-                      segment={segment}
-                      contentMode={contentMode}
-                      aspectRatio={aspectRatio}
-                      characters={projectData.characters}
-                      clues={projectData.clues}
-                      projectName={projectName}
-                      durationOptions={durationOptions}
-                      onUpdatePrompt={onUpdatePrompt && ((id, field, value) => onUpdatePrompt(id, field, value, scriptFile))}
-                      onGenerateStoryboard={onGenerateStoryboard && ((id) => onGenerateStoryboard(id, scriptFile))}
-                      onGenerateVideo={onGenerateVideo && ((id) => onGenerateVideo(id, scriptFile))}
-                      onRestoreStoryboard={onRestoreStoryboard}
-                      onRestoreVideo={onRestoreVideo}
-                    />
-                  </div>
-                );
-              })}
-            </div>
-          )
-        ) : null}
-
-        {/* Bottom spacer for scroll comfort */}
-        <div className="h-16" />
+        ) : episodeScript && contentMode === editorContentMode ? (
+          <EmptyScriptState contentMode={editorContentMode} onInsert={handleInsertShot} />
+        ) : (
+          // 兜底：分镜视图下无可编辑分镜（未知 content_mode），
+          // 或剧本回退后仍停留在分镜视图——给出指引而非空白
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+            {hasScript ? t("timeline_no_editable_segments") : t("timeline_script_not_ready")}
+          </div>
+        )}>
+          {(content) => content}
+        </RetainedEditUnit>
       </div>
     </div>
   );

@@ -2,7 +2,7 @@
 
 Supports async engines (aiosqlite / asyncpg) by using run_sync().
 The database URL is read from the DATABASE_URL environment variable via
-lib.db.engine.get_database_url(), falling back to SQLite in projects/.arcreel.db.
+lib.db.engine.get_database_url(), falling back to SQLite in projects/arcreel.db.
 """
 
 import asyncio
@@ -11,11 +11,15 @@ from logging.config import fileConfig
 from sqlalchemy import DateTime, String, pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
-# Import all models so their tables are included in metadata
-import lib.db.models  # noqa: F401
 from alembic import context
+from lib.agent.agent_session_store.models import register_models as register_agent_session_models
 from lib.db.base import Base
 from lib.db.engine import get_database_url
+from lib.db.models import register_models as register_db_models
+
+# 把全部 ORM 模型登记到 Base.metadata，否则 autogenerate 的对比范围取决于 import 链
+register_agent_session_models()
+register_db_models()
 
 # Alembic Config object
 config = context.config

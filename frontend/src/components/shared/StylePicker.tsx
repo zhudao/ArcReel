@@ -1,6 +1,11 @@
-import { useRef } from "react";
+import { TruncatedText } from "@/components/shared/TruncatedText";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Check, Upload, X } from "lucide-react";
+import { cn } from "cn";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   DEFAULT_TEMPLATE_ID,
   getTemplatesByCategory,
@@ -11,8 +16,9 @@ export interface StylePickerValue {
   mode: "template" | "custom";
   templateId: string | null;
   activeCategory: "live" | "anim";
+  /** 待上传的参考图；有文件时选择器按文件自建预览，不读 `uploadedPreview`。 */
   uploadedFile: File | null;
-  /** Either a blob: URL (just-uploaded) or a /api/v1/files/... URL (already saved). */
+  /** 已保存的参考图地址（/api/v1/files/...）；选择器不往这里写 blob: 地址。 */
   uploadedPreview: string | null;
 }
 
@@ -20,6 +26,8 @@ export interface StylePickerProps {
   value: StylePickerValue;
   onChange: (next: StylePickerValue) => void;
 }
+
+type StyleTab = "custom" | StyleCategory;
 
 interface TemplateCardProps {
   thumbnail: string;
@@ -31,93 +39,95 @@ interface TemplateCardProps {
   onClick: () => void;
 }
 
-function TemplateCard({
-  thumbnail,
-  label,
-  tagline,
-  isSelected,
-  isDefault,
-  defaultLabel,
-  onClick,
-}: TemplateCardProps) {
+function TemplateCard({ thumbnail, label, tagline, isSelected, isDefault, defaultLabel, onClick }: TemplateCardProps) {
+  const [broken, setBroken] = useState(false);
   return (
     <button
       type="button"
       aria-label={label}
       aria-pressed={isSelected}
       onClick={onClick}
-      className={[
-        "aspect-[3/4] relative rounded-lg overflow-hidden transition-all duration-150",
-        isSelected
-          ? "ring-2 ring-indigo-500 ring-offset-2 ring-offset-gray-950"
-          : "ring-1 ring-gray-800 hover:ring-gray-600",
-      ].join(" ")}
-    >
-      <img
-        src={thumbnail}
-        alt={label}
-        width={240}
-        height={320}
-        loading="lazy"
-        decoding="async"
-        className="w-full h-full object-cover"
-        onError={(e) => {
-          (e.currentTarget as HTMLImageElement).style.display = "none";
-        }}
-      />
-      <div className="absolute inset-0 bg-gradient-to-br from-gray-800 to-gray-900 -z-10" />
-
-      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-2 py-1.5">
-        <p className="text-[11px] text-white leading-tight truncate">{label}</p>
-        {tagline && (
-          <p className="text-[9px] text-gray-400 leading-tight truncate mt-0.5">{tagline}</p>
-        )}
-      </div>
-
-      {isSelected && (
-        <div className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-indigo-500 text-white flex items-center justify-center shadow">
-          <Check size={12} strokeWidth={3} />
-        </div>
+      className={cn(
+        "group relative aspect-3/4 overflow-hidden rounded-lg bg-muted ring-1 transition-shadow focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+        isSelected ? "ring-2 ring-primary" : "ring-border hover:ring-input",
       )}
-
+    >
+      {!broken && (
+        <img
+          src={thumbnail}
+          alt=""
+          width={240}
+          height={320}
+          loading="lazy"
+          decoding="async"
+          className="size-full object-cover"
+          onError={() => setBroken(true)}
+        />
+      )}
+      <div className="absolute inset-x-0 bottom-0 bg-linear-to-b from-transparent to-background/90 px-2 pt-6 pb-1.5 text-left">
+        <TruncatedText text={label} focusable={false} className="text-xs font-medium text-foreground" />
+        {tagline && <TruncatedText text={tagline} focusable={false} className="text-xs text-subtle-foreground" />}
+      </div>
+      {isSelected && (
+        <span className="absolute top-1.5 right-1.5 grid size-5 place-items-center rounded-full bg-primary text-primary-foreground">
+          <Check className="size-3" strokeWidth={3} aria-hidden />
+        </span>
+      )}
       {isDefault && (
-        <div className="absolute top-1.5 left-1.5 px-1.5 py-0.5 text-[9px] rounded-full bg-indigo-500/25 backdrop-blur text-indigo-200 leading-tight">
+        <Badge variant="secondary" className="absolute top-1.5 left-1.5">
           {defaultLabel}
-        </div>
+        </Badge>
       )}
     </button>
   );
 }
 
+/**
+ * 待上传文件的预览地址，只由选择器持有：随文件创建，换文件或卸载时收回；重新挂载时按文件重建，
+ * 不会把已收回的地址留在调用方的取值里。layout effect 在绘制前换上地址，预览不闪一帧空态。
+ */
+function useFilePreview(file: File | null): string | null {
+  const [preview, setPreview] = useState<{ file: File; url: string } | null>(null);
+  useLayoutEffect(() => {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- object URL 随文件创建并在换文件或卸载时回收（同 AssetCreateDialog）
+    setPreview({ file, url });
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+  return preview?.file === file ? preview.url : null;
+}
+
+/**
+ * 风格选择：风格模版（真人、动画两类）或上传一张风格参考图。
+ * 模版网格不自带滚动，由所在的弹层或页面负责滚动，避免嵌套滚动区。
+ */
 export function StylePicker({ value, onChange }: StylePickerProps) {
   const { t } = useTranslation(["common", "templates"]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const filePreview = useFilePreview(value.uploadedFile);
+  const preview = value.uploadedFile ? filePreview : value.uploadedPreview;
 
-  // 切换 tab "无损失"：保留对侧 state。
-  // - 切到 custom：保留 templateId，回到模板 tab 时恢复选中
-  // - 切到 template category：保留 uploadedFile/uploadedPreview，回到 custom tab 时恢复
-  // blob: URL 生命周期仍由 parent 的 effect 清理（见 CreateProjectModal /
-  // ProjectSettingsPage），onChange 只更换引用。
-  const handleCustomTab = () => {
-    onChange({ ...value, mode: "custom" });
-  };
+  const activeTab: StyleTab = value.mode === "custom" ? "custom" : value.activeCategory;
 
-  const handleCategoryTab = (cat: StyleCategory) => {
-    // Preserve templateId across tab switches. If it belongs to the other
-    // category, the current tab will simply render no selected card —
-    // clicking a tab must never silently overwrite the user's chosen style.
-    onChange({
-      ...value,
-      mode: "template",
-      activeCategory: cat,
-    });
+  const handleTabChange = (tab: StyleTab) => {
+    if (tab === "custom") {
+      onChange({ ...value, mode: "custom" });
+    } else {
+      onChange({ ...value, mode: "template", activeCategory: tab });
+    }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const objectUrl = URL.createObjectURL(file);
-    onChange({ ...value, mode: "custom", templateId: null, uploadedFile: file, uploadedPreview: objectUrl });
+    onChange({
+      ...value,
+      mode: "custom",
+      templateId: null,
+      uploadedFile: file,
+      uploadedPreview: null,
+    });
     e.target.value = "";
   };
 
@@ -125,64 +135,55 @@ export function StylePicker({ value, onChange }: StylePickerProps) {
     onChange({ ...value, uploadedFile: null, uploadedPreview: null });
   };
 
-  const tabCls = (active: boolean) =>
-    [
-      "rounded-md px-3 py-1 text-xs transition-colors",
-      active
-        ? "bg-indigo-500/15 text-indigo-300 font-medium"
-        : "text-gray-400 hover:text-gray-200",
-    ].join(" ");
-
-  const isCustomActive = value.mode === "custom";
-  const isLiveActive = value.mode === "template" && value.activeCategory === "live";
-  const isAnimActive = value.mode === "template" && value.activeCategory === "anim";
-  const templates = value.mode === "template" ? getTemplatesByCategory(value.activeCategory) : [];
+  const templateGrid = (category: StyleCategory) => (
+    <div className="grid grid-cols-4 gap-3">
+      {getTemplatesByCategory(category).map((tpl) => (
+        <TemplateCard
+          key={tpl.id}
+          thumbnail={tpl.thumbnail}
+          label={t(`templates:name.${tpl.id}`)}
+          tagline={t(`templates:tagline.${tpl.id}`, "")}
+          isSelected={value.templateId === tpl.id}
+          isDefault={tpl.id === DEFAULT_TEMPLATE_ID}
+          defaultLabel={t("templates:template_default_badge")}
+          onClick={() => onChange({ ...value, mode: "template", templateId: tpl.id })}
+        />
+      ))}
+    </div>
+  );
 
   return (
-    <div className="space-y-4">
-      <div className="rounded-lg bg-gray-900 border border-gray-800 p-1 flex gap-1 w-fit">
-        <button type="button" onClick={handleCustomTab} className={tabCls(isCustomActive)}>
-          {t("templates:category.custom")}
-        </button>
-        <button type="button" onClick={() => handleCategoryTab("live")} className={tabCls(isLiveActive)}>
-          {t("templates:category.live")}
-        </button>
-        <button type="button" onClick={() => handleCategoryTab("anim")} className={tabCls(isAnimActive)}>
-          {t("templates:category.anim")}
-        </button>
-      </div>
+    <Tabs value={activeTab} onValueChange={(tab: StyleTab) => handleTabChange(tab)}>
+      <TabsList>
+        <TabsTrigger value="live">{t("templates:category.live")}</TabsTrigger>
+        <TabsTrigger value="anim">{t("templates:category.anim")}</TabsTrigger>
+        <TabsTrigger value="custom">{t("templates:category.custom")}</TabsTrigger>
+      </TabsList>
 
-      {value.mode === "custom" ? (
-        <div>
-          <p className="text-sm text-gray-400 mb-3">{t("templates:tab_custom_desc")}</p>
-
-          {value.uploadedPreview ? (
-            <div className="relative rounded-lg border border-gray-700 overflow-hidden">
-              <img
-                src={value.uploadedPreview}
-                alt={t("templates:upload_reference")}
-                className="w-full h-40 object-cover"
-              />
-              <button
-                type="button"
-                onClick={handleClearUpload}
-                aria-label={t("common:remove")}
-                className="absolute top-1.5 right-1.5 rounded-full bg-gray-900/80 p-1 text-gray-300 hover:bg-gray-900 hover:text-white transition-colors"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
+      <TabsContent value="live" className="mt-2">{templateGrid("live")}</TabsContent>
+      <TabsContent value="anim" className="mt-2">{templateGrid("anim")}</TabsContent>
+      <TabsContent value="custom" className="mt-2">
+        <div className="flex flex-col gap-3">
+          <p className="text-sm text-muted-foreground">{t("templates:tab_custom_desc")}</p>
+          {preview ? (
+            <div className="relative overflow-hidden rounded-lg border border-border">
+              <img src={preview} alt={t("templates:upload_reference")} className="h-48 w-full object-cover" />
+              <div className="absolute top-2 right-2">
+                <Button variant="secondary" size="icon-sm" onClick={handleClearUpload} aria-label={t("common:remove")}>
+                  <X />
+                </Button>
+              </div>
             </div>
           ) : (
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-gray-700 bg-gray-800/50 px-3 py-6 text-sm text-gray-500 transition-colors hover:border-gray-500 hover:text-gray-300"
+              className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-input px-3 py-8 text-sm text-muted-foreground transition-colors hover:border-primary/50 hover:bg-primary/10 hover:text-foreground focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
             >
-              <Upload className="h-4 w-4" />
-              <span>{t("templates:upload_reference")}</span>
+              <Upload className="size-4" aria-hidden />
+              {t("templates:upload_reference")}
             </button>
           )}
-
           <input
             ref={fileInputRef}
             type="file"
@@ -190,24 +191,9 @@ export function StylePicker({ value, onChange }: StylePickerProps) {
             onChange={handleFileChange}
             className="hidden"
           />
-          <p className="mt-1.5 text-xs text-gray-600">{t("templates:supported_formats")}</p>
+          <p className="text-xs text-muted-foreground">{t("templates:supported_formats")}</p>
         </div>
-      ) : (
-        <div className="grid grid-cols-4 gap-3 max-h-[420px] overflow-y-auto p-1 pr-2">
-          {templates.map((tpl) => (
-            <TemplateCard
-              key={tpl.id}
-              thumbnail={tpl.thumbnail}
-              label={t(`templates:name.${tpl.id}`)}
-              tagline={t(`templates:tagline.${tpl.id}`, "")}
-              isSelected={value.templateId === tpl.id}
-              isDefault={tpl.id === DEFAULT_TEMPLATE_ID}
-              defaultLabel={t("templates:template_selected_default")}
-              onClick={() => onChange({ ...value, mode: "template", templateId: tpl.id })}
-            />
-          ))}
-        </div>
-      )}
-    </div>
+      </TabsContent>
+    </Tabs>
   );
 }

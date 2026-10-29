@@ -1,438 +1,370 @@
-
-import { useState, useEffect, useRef, useCallback } from "react";
-import { voidCall, voidPromise } from "@/utils/async";
-import { useLocation } from "wouter";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useLocation } from "wouter";
 import { useTranslation } from "react-i18next";
 import {
-  ChevronRight,
-  ChevronDown,
-  FileText,
-  Users,
-  Puzzle,
-  Film,
-  Circle,
-  User,
+  BookOpen,
+  Clapperboard,
+  FilePlus,
+  FolderTree,
+  Landmark,
   LayoutDashboard,
+  Package,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plus,
+  Search,
+  ShoppingBag,
   Upload,
-  X,
+  Users,
+  type LucideIcon,
 } from "lucide-react";
-import { API } from "@/api";
+import { cn } from "cn";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
+import { Separator } from "@/components/ui/separator";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useProjectsStore } from "@/stores/projects-store";
-import { useAppStore } from "@/stores/app-store";
-// ---------------------------------------------------------------------------
-// Sidebar Dot Status mapping
-// ---------------------------------------------------------------------------
-
-const STATUS_DOT_CLASSES: Record<string, string> = {
-  draft: "text-gray-600",
-  scripted: "text-indigo-500",
-  in_production: "text-amber-500",
-  completed: "text-emerald-500",
-};
-
-// ---------------------------------------------------------------------------
-// CollapsibleSection — sub-component for sidebar groups
-// ---------------------------------------------------------------------------
-
-function CollapsibleSection({
-  title,
-  icon: Icon,
-  children,
-  action,
-  defaultOpen = false,
-}: {
-  title: string;
-  icon: React.ComponentType<{ className?: string }>;
-  children: React.ReactNode;
-  action?: React.ReactNode;
-  defaultOpen?: boolean;
-}) {
-  const [isOpen, setIsOpen] = useState(defaultOpen);
-
-  return (
-    <div className="flex flex-col">
-      <div className="group flex items-center justify-between px-3 py-2 text-xs font-semibold uppercase tracking-wider text-gray-500 transition-colors hover:text-gray-300">
-        <button
-          type="button"
-          onClick={() => setIsOpen(!isOpen)}
-          className="flex flex-1 items-center gap-2 focus-ring rounded"
-        >
-          {isOpen ? (
-            <ChevronDown className="h-3 w-3 shrink-0" />
-          ) : (
-            <ChevronRight className="h-3 w-3 shrink-0" />
-          )}
-          <Icon className="h-3.5 w-3.5 shrink-0" />
-          <span>{title}</span>
-        </button>
-        {action && (
-          <div className="opacity-0 group-hover:opacity-100 transition-opacity">
-            {action}
-          </div>
-        )}
-      </div>
-      {isOpen && <div className="pb-2">{children}</div>}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// AssetThumbnail — shared thumbnail for characters (circle) and clues (square)
-// ---------------------------------------------------------------------------
-
-function AssetThumbnail({
-  name,
-  sheetPath,
-  projectName,
-  shape,
-  FallbackIcon,
-}: {
-  name: string;
-  sheetPath: string | undefined;
-  projectName: string;
-  shape: "circle" | "square";
-  FallbackIcon: React.ComponentType<{ className?: string }>;
-}) {
-  const sheetFp = useProjectsStore((s) =>
-    sheetPath ? s.getAssetFingerprint(sheetPath) : null,
-  );
-  const [imgError, setImgError] = useState(false);
-
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- 图片源变更时重置错误态，确保新 URL 正常加载
-    setImgError(false);
-  }, [sheetFp, sheetPath]);
-
-  const roundedClass = shape === "circle" ? "rounded-full" : "rounded";
-
-  if (!sheetPath || imgError) {
-    return (
-      <span className={`flex h-6 w-6 shrink-0 items-center justify-center ${roundedClass} bg-gray-700 text-gray-400`}>
-        <FallbackIcon className="h-3.5 w-3.5" />
-      </span>
-    );
-  }
-
-  return (
-    <img
-      src={API.getFileUrl(projectName, sheetPath, sheetFp)}
-      alt={name}
-      className={`h-6 w-6 shrink-0 ${roundedClass} object-cover`}
-      onError={() => setImgError(true)}
-    />
-  );
-}
-
-// ---------------------------------------------------------------------------
-// EmptyState — shared empty placeholder
-// ---------------------------------------------------------------------------
-
-function EmptyState({ text }: { text: string }) {
-  return (
-    <div className="px-8 py-3 text-[11px] italic text-gray-600">
-      {text}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// AssetSidebar
-// ---------------------------------------------------------------------------
+import { useCostStore } from "@/stores/cost-store";
+import { WORKSPACE_ROUTE_EPISODES, WORKSPACE_ROUTE_FILES } from "@/app-routes";
+import { useDemoWorkbench } from "@/onboarding/use-demo-workbench";
+import { normalizeRoute } from "@/utils/generation-mode";
+import { CreateEpisodeDialog } from "@/components/canvas/episodes/CreateEpisodeDialog";
+import { episodesViewPath } from "@/components/canvas/episodes/episodes-view-model";
+import { useDeleteEpisode } from "@/components/canvas/episodes/useDeleteEpisode";
+import { useMoveEpisode } from "@/components/canvas/episodes/useMoveEpisode";
+import { EpisodeCard } from "./EpisodeCard";
+import { SidebarEpisodeList } from "./SidebarEpisodeList";
 
 interface AssetSidebarProps {
-  className?: string;
+  /** 收为 56px 图标栏：只显示导航图标与集序号，名称在悬停或聚焦时显示。 */
+  collapsed: boolean;
+  onCollapsedChange: (collapsed: boolean) => void;
 }
 
-export function AssetSidebar({ className }: AssetSidebarProps) {
+interface NavItem {
+  key: string;
+  path: string;
+  label: string;
+  icon: LucideIcon;
+  count?: number;
+}
+
+/**
+ * 工作区侧栏：上方是工作区导航（项目概览、分集、角色、场景、道具，广告项目另有商品、没有分集），
+ * 下方是分集列表（搜索、排序与每集的操作）。宽度由外壳的调宽手柄决定；折叠时收为图标栏。
+ */
+export function AssetSidebar({ collapsed, onCollapsedChange }: AssetSidebarProps) {
   const { t } = useTranslation(["common", "dashboard"]);
-  const tRef = useRef(t);
-  // eslint-disable-next-line react-hooks/refs -- tRef 是稳定 event-handler ref 模式，用于在回调中获取最新 t 而不触发无限 useCallback 重建
-  tRef.current = t;
-  const { currentProjectData, currentProjectName } = useProjectsStore();
-  const sourceFilesVersion = useAppStore((s) => s.sourceFilesVersion);
+  const { currentProjectName, currentProjectData } = useProjectsStore();
+  const debouncedFetchCost = useCostStore((s) => s.debouncedFetch);
   const [location, setLocation] = useLocation();
+  const [search, setSearch] = useState("");
+  /** 新建一集对话框：undefined 为关闭，null 放在末尾，数字为插在这一集之后。 */
+  const [createAfter, setCreateAfter] = useState<number | null | undefined>(undefined);
 
-  const characters = currentProjectData?.characters ?? {};
-  const clues = currentProjectData?.clues ?? {};
   const episodes = currentProjectData?.episodes ?? [];
-  const projectName = currentProjectName ?? "";
-
-  // 源文件列表
-  const [sourceFiles, setSourceFiles] = useState<string[]>([]);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const loadSourceFiles = useCallback(() => {
-    if (!projectName) {
-      setSourceFiles([]);
-      return;
-    }
-    API.listFiles(projectName)
-      .then((res) => {
-        const raw = res.files as unknown;
-        if (Array.isArray(raw)) {
-          setSourceFiles(raw);
-        } else if (raw && typeof raw === "object") {
-          const grouped = raw as Record<string, Array<{ name: string }>>;
-          setSourceFiles((grouped.source ?? []).map((f) => f.name));
-        }
-      })
-      .catch(() => {
-        setSourceFiles([]);
-      });
-  }, [projectName]);
+  // 广告/短片项目恒单集：隐藏「集」语义（标题/计数/搜索/添加），直达唯一视频
+  const isAd = currentProjectData?.content_mode === "ad";
+  // 演示项目没有服务端侧数据，「分集」入口与添加菜单隐藏（导航其余项与分集列表照常渲染）
+  const demoMode = useDemoWorkbench();
+  const route = normalizeRoute(currentProjectData?.generation_mode);
 
   useEffect(() => {
-    loadSourceFiles();
-  }, [loadSourceFiles, sourceFilesVersion]);
+    if (currentProjectName) debouncedFetchCost(currentProjectName);
+  }, [currentProjectName, debouncedFetchCost]);
 
-  // 上传源文件
-  const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !projectName) return;
-    try {
-      await API.uploadFile(projectName, "source", file);
-      loadSourceFiles();
-      useAppStore.getState().invalidateSourceFiles();
-    } catch {
-      // 静默失败
-    }
-    // 重置 input 以允许再次选择同一文件
-    e.target.value = "";
-  }, [projectName, loadSourceFiles]);
+  // Derive active episode from `/episodes/:id`
+  const activeEp = useMemo(() => {
+    const m = location.match(/^\/episodes\/(\d+)/);
+    return m ? parseInt(m[1], 10) : null;
+  }, [location]);
 
-  // 删除源文件
-  const handleDeleteFile = useCallback(async (filename: string) => {
-    if (!projectName) return;
-    if (!confirm(tRef.current("dashboard:confirm_delete_file", { name: filename }))) return;
-    try {
-      await API.deleteSourceFile(projectName, filename);
-      loadSourceFiles();
-      useAppStore.getState().invalidateSourceFiles();
-      // 如果当前正在查看该文件，返回概览
-      if (location === `/source/${encodeURIComponent(filename)}`) {
-        setLocation("/");
-      }
-    } catch {
-      // 静默失败
-    }
-  }, [projectName, loadSourceFiles, location, setLocation]);
+  const moveEpisode = useMoveEpisode(currentProjectName);
+  const deletion = useDeleteEpisode(currentProjectName ?? "", (episode) => {
+    // 删的是正在看的那一集时回到「分集」视图
+    if (episode === activeEp) setLocation(episodesViewPath());
+  });
 
-  const characterEntries = Object.entries(characters);
-  const clueEntries = Object.entries(clues);
+  const navItems: NavItem[] = [
+    { key: "overview", path: "/", label: t("dashboard:workspace_nav_overview"), icon: LayoutDashboard },
+    // 演示项目后端不存在，广告/短片恒单集、不经分集：隐藏入口而非渲染必然报错或无意义的页面
+    ...(demoMode || isAd
+      ? []
+      : [
+          {
+            key: "episodes",
+            path: `/${WORKSPACE_ROUTE_EPISODES}`,
+            label: t("dashboard:workspace_nav_episodes"),
+            icon: BookOpen,
+            count: episodes.length,
+          },
+        ]),
+    {
+      key: "characters",
+      path: "/characters",
+      label: t("dashboard:workspace_nav_characters"),
+      icon: Users,
+      count: Object.keys(currentProjectData?.characters ?? {}).length,
+    },
+    {
+      key: "scenes",
+      path: "/scenes",
+      label: t("dashboard:workspace_nav_scenes"),
+      icon: Landmark,
+      count: Object.keys(currentProjectData?.scenes ?? {}).length,
+    },
+    {
+      key: "props",
+      path: "/props",
+      label: t("dashboard:workspace_nav_props"),
+      icon: Package,
+      count: Object.keys(currentProjectData?.props ?? {}).length,
+    },
+    // 商品资产仅广告/短片项目使用（v1 单商品设定），其余模式隐藏入口
+    ...(isAd
+      ? [
+          {
+            key: "products",
+            path: "/products",
+            label: t("dashboard:workspace_nav_products"),
+            icon: ShoppingBag,
+            count: Object.keys(currentProjectData?.products ?? {}).length,
+          },
+        ]
+      : []),
+    // 演示项目没有服务端文件可列
+    ...(demoMode
+      ? []
+      : [{ key: "files", path: `/${WORKSPACE_ROUTE_FILES}`, label: t("dashboard:workspace_nav_files"), icon: FolderTree }]),
+  ];
 
-  // Check if a path is active (matches current nested location)
-  const isActive = (path: string) => location === path;
+  const isNavActive = (item: NavItem): boolean => {
+    // 集页 /episodes/:id 由下方分集列表高亮，「分集」只在分集视图本身高亮
+    if (item.path === "/" || item.key === "episodes") return location === item.path;
+    return location === item.path || location.startsWith(item.path + "/");
+  };
+
+  // 播出位置按完整账本的排列算，过滤不改变它；搜索按标题与播出位置匹配，集 ID 不参与。
+  const positioned = episodes.map((ep, index) => ({ ep, position: index + 1 }));
+  // ad 隐藏搜索框，残留的 search state 不参与过滤，避免唯一视频入口被吞
+  const filteredEps = isAd
+    ? positioned
+    : positioned.filter(
+        ({ ep, position }) => !search || ep.title.includes(search) || String(position).includes(search),
+      );
+
+  const sectionTitle = isAd ? t("dashboard:ad_video_section_title") : t("dashboard:episodes_section_title");
+  const addEpisodeMenu =
+    isAd || demoMode ? null : (
+      <AddEpisodeMenu
+        onCreate={() => setCreateAfter(null)}
+        onUpload={() => setLocation(episodesViewPath({ upload: "episode" }))}
+      />
+    );
 
   return (
-    <aside
-      className={`flex flex-col overflow-y-auto bg-gray-900 ${className ?? ""}`}
-    >
-      {/* ---- Project Overview nav item ---- */}
-      <button
-        type="button"
-        onClick={() => setLocation("/")}
-        className={`flex w-full items-center gap-2 px-3 py-2.5 text-sm transition-colors focus-ring ${
-          isActive("/")
-            ? "bg-gray-800 text-white"
-            : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-        }`}
-      >
-        <LayoutDashboard className="h-4 w-4 shrink-0 text-indigo-400" />
-        <span className="font-medium">{t("dashboard:project_overview")}</span>
-      </button>
+    <div className="@container/sidebar relative flex h-full min-w-0 flex-col">
+      <nav aria-label={t("dashboard:workspace_nav_label")} className={cn("flex shrink-0 flex-col gap-0.5 p-2", collapsed && "items-center")}>
+        {navItems.map((item) =>
+          collapsed ? (
+            <RailLink key={item.key} href={item.path} label={item.label} icon={item.icon} active={isNavActive(item)} />
+          ) : (
+            <NavLink key={item.key} item={item} active={isNavActive(item)} />
+          ),
+        )}
+      </nav>
 
-      {/* ---- Divider ---- */}
-      <div className="mx-3 border-t border-gray-800" />
+      <Separator />
 
-      {/* ---- Section 1: Source Files ---- */}
-      <CollapsibleSection
-        title={t("dashboard:source_files")}
-        icon={FileText}
-        action={
-          <>
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="rounded p-1 text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-300 focus-ring"
-              title={t("dashboard:upload_source_files")}
-            >
-              <Upload className="h-3.5 w-3.5" />
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".txt,.md,.doc,.docx"
-              aria-label={t("dashboard:upload_asset_file_aria")}
-              onChange={voidPromise(handleUpload)}
-              className="hidden"
+      {collapsed ? (
+        <div className="relative flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto py-2">
+          {addEpisodeMenu}
+          {/* 图标栏不显示搜索框，按看不见的搜索词过滤会让集无故消失 */}
+          {positioned.map(({ ep, position }) => (
+            <RailLink
+              key={ep.episode}
+              href={`/episodes/${ep.episode}`}
+              active={ep.episode === activeEp}
+              label={
+                isAd
+                  ? sectionTitle
+                  : t("dashboard:episode_collapsed_button_label", {
+                      position,
+                      title: ep.title || t("common:episode_position_name", { position }),
+                    })
+              }
+              icon={isAd ? Clapperboard : undefined}
+              text={isAd ? undefined : String(position)}
             />
-          </>
+          ))}
+        </div>
+      ) : (
+        <section aria-label={sectionTitle} className="flex min-h-0 flex-1 flex-col">
+          <div className="flex shrink-0 items-center gap-2 px-4 pb-1 pt-3">
+            <h2 className="text-xs font-medium text-muted-foreground">{sectionTitle}</h2>
+            {!isAd && <span className="text-xs tabular-nums text-muted-foreground">{episodes.length}</span>}
+            <span className="flex-1" />
+            {addEpisodeMenu}
+          </div>
+
+          {!isAd && (
+            <div className="shrink-0 px-2 pb-2">
+              <InputGroup>
+                <InputGroupAddon>
+                  <Search aria-hidden />
+                </InputGroupAddon>
+                <InputGroupInput
+                  type="search"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder={t("dashboard:episode_search_placeholder")}
+                  aria-label={t("dashboard:episode_search_placeholder")}
+                />
+              </InputGroup>
+            </div>
+          )}
+
+          <div className="relative min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+            {filteredEps.length === 0 ? (
+              <p className="px-2 py-6 text-center text-xs text-muted-foreground">
+                {episodes.length === 0 ? t("dashboard:no_episodes_yet") : t("dashboard:no_episode_search_results")}
+              </p>
+            ) : isAd || demoMode ? (
+              filteredEps.map(({ ep, position }) => (
+                <EpisodeCard
+                  key={ep.episode}
+                  ep={ep}
+                  position={position}
+                  active={ep.episode === activeEp}
+                  onClick={() => setLocation(`/episodes/${ep.episode}`)}
+                  showEpisodeBadge={!isAd}
+                  fallbackTitle={isAd ? currentProjectData?.title : undefined}
+                  route={route}
+                />
+              ))
+            ) : (
+              <SidebarEpisodeList
+                episodes={episodes}
+                shown={filteredEps}
+                wholeSourceFiles={currentProjectData?.whole_source_files ?? []}
+                activeEp={activeEp}
+                route={route}
+                reorderable={!search}
+                onOpen={(episode) => setLocation(`/episodes/${episode}`)}
+                onCreateAfter={setCreateAfter}
+                onMove={moveEpisode}
+                onDelete={(episode) => void deletion.requestDelete(episode)}
+              />
+            )}
+          </div>
+        </section>
+      )}
+
+      <div className={cn("flex shrink-0 border-t border-border p-2", collapsed && "justify-center")}>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? t("dashboard:sidebar_expand") : t("dashboard:sidebar_collapse")}
+          onClick={() => onCollapsedChange(!collapsed)}
+        >
+          {collapsed ? <PanelLeftOpen aria-hidden /> : <PanelLeftClose aria-hidden />}
+        </Button>
+      </div>
+
+      {createAfter !== undefined && currentProjectName ? (
+        <CreateEpisodeDialog
+          projectName={currentProjectName}
+          initialAfter={createAfter}
+          onClose={() => setCreateAfter(undefined)}
+          onCreated={(episode) => {
+            setCreateAfter(undefined);
+            setLocation(`/episodes/${episode}`);
+          }}
+        />
+      ) : null}
+      {deletion.dialog}
+    </div>
+  );
+}
+
+function NavLink({ item, active }: { item: NavItem; active: boolean }) {
+  const Icon = item.icon;
+  return (
+    <Link
+      href={item.path}
+      aria-current={active ? "page" : undefined}
+      className={cn(
+        "flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+        active ? "bg-primary/15 text-foreground" : "text-subtle-foreground hover:bg-muted/50 hover:text-foreground",
+      )}
+    >
+      <Icon aria-hidden className={cn("size-4 shrink-0", active ? "text-primary" : "text-muted-foreground")} />
+      <span className="min-w-0 flex-1 truncate">{item.label}</span>
+      {item.count !== undefined && <span className="text-xs tabular-nums text-muted-foreground">{item.count}</span>}
+    </Link>
+  );
+}
+
+/** 图标栏里的一项：只显示图标或集序号，名称经悬停或聚焦的提示显示，读屏读完整名称。 */
+function RailLink({
+  href,
+  label,
+  icon: Icon,
+  text,
+  active,
+}: {
+  href: string;
+  label: string;
+  icon?: LucideIcon;
+  text?: string;
+  active: boolean;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Link
+            href={href}
+            aria-current={active ? "page" : undefined}
+            className={cn(
+              "flex size-10 shrink-0 items-center justify-center rounded-md text-xs font-medium tabular-nums transition-colors outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+              active ? "bg-primary/15 text-primary" : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+            )}
+          />
         }
       >
-        {sourceFiles.length === 0 ? (
-          <EmptyState text={t("dashboard:no_files_yet")} />
-        ) : (
-          <ul>
-            {sourceFiles.map((name) => {
-              const filePath = `/source/${encodeURIComponent(name)}`;
-              const active = isActive(filePath);
-              return (
-                <li key={name}>
-                  <div
-                    className={`group flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors ${
-                      active
-                        ? "bg-gray-800 text-white"
-                        : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-                    }`}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => setLocation(filePath)}
-                      className="flex flex-1 items-center gap-2 truncate text-left focus-ring rounded"
-                    >
-                      <FileText className="h-3.5 w-3.5 shrink-0 text-gray-500" />
-                      <span className="truncate">{name}</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={(e) => { e.stopPropagation(); voidCall(handleDeleteFile(name)); }}
-                      className="shrink-0 rounded p-0.5 text-gray-600 opacity-0 transition-opacity hover:text-red-400 group-hover:opacity-100 focus-ring focus-visible:opacity-100"
-                      title={t("dashboard:delete_file")}
-                    >
-                      <X className="h-3 w-3" />
-                    </button>
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </CollapsibleSection>
+        {Icon ? <Icon aria-hidden className="size-4" /> : <span aria-hidden>{text}</span>}
+        <span className="sr-only">{label}</span>
+      </TooltipTrigger>
+      <TooltipContent side="right">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
 
-      {/* ---- Divider ---- */}
-      <div className="mx-3 border-t border-gray-800" />
-
-      {/* ---- Section 2: Lorebook (Characters + Clues) ---- */}
-      <CollapsibleSection title={t("dashboard:lorebook")} icon={Users} defaultOpen={true}>
-        {/* Characters sub-section */}
-        <div className="mb-1">
-          <div className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-gray-600">
-            <Users className="h-3 w-3" />
-            <span>{t("dashboard:characters")}</span>
-          </div>
-          {characterEntries.length === 0 ? (
-            <EmptyState text={t("dashboard:no_characters_hint")} />
-          ) : (
-            <ul>
-              {characterEntries.map(([name, char]) => (
-                <li key={name}>
-                  <button
-                    type="button"
-                    onClick={() => setLocation("/characters")}
-                    className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors focus-ring ${
-                      isActive("/characters")
-                        ? "bg-gray-800 text-white"
-                        : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-                    }`}
-                  >
-                    <AssetThumbnail
-                      name={name}
-                      sheetPath={char.character_sheet}
-                      projectName={projectName}
-                      shape="circle"
-                      FallbackIcon={User}
-                    />
-                    <span className="truncate">{name}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        {/* Clues sub-section */}
-        <div>
-          <div className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-gray-600">
-            <Puzzle className="h-3 w-3" />
-            <span>{t("dashboard:clues")}</span>
-          </div>
-          {clueEntries.length === 0 ? (
-            <EmptyState text={t("dashboard:no_clues_hint")} />
-          ) : (
-            <ul>
-              {clueEntries.map(([name, clue]) => (
-                <li key={name}>
-                  <button
-                    type="button"
-                    onClick={() => setLocation("/clues")}
-                    className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors focus-ring ${
-                      isActive("/clues")
-                        ? "bg-gray-800 text-white"
-                        : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-                    }`}
-                  >
-                    <AssetThumbnail
-                      name={name}
-                      sheetPath={clue.clue_sheet}
-                      projectName={projectName}
-                      shape="square"
-                      FallbackIcon={Puzzle}
-                    />
-                    <span className="truncate">{name}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </CollapsibleSection>
-
-      {/* ---- Divider ---- */}
-      <div className="mx-3 border-t border-gray-800" />
-
-      {/* ---- Section 3: Episodes ---- */}
-      <CollapsibleSection title={t("dashboard:episodes")} icon={Film}>
-        {episodes.length === 0 ? (
-          <EmptyState text={t("dashboard:no_episodes_yet")} />
-        ) : (
-          <ul>
-            {episodes.map((ep) => {
-              const episodePath = `/episodes/${ep.episode}`;
-              const active = isActive(episodePath);
-              const isSegmented = ep.script_status === "segmented";
-              const statusClass =
-                STATUS_DOT_CLASSES[isSegmented ? "draft" : (ep.status ?? "draft")] ??
-                STATUS_DOT_CLASSES.draft;
-
-              return (
-                <li key={ep.episode}>
-                  <button
-                    type="button"
-                    onClick={() => setLocation(episodePath)}
-                    className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors focus-ring ${
-                      active
-                        ? "bg-gray-800 text-white"
-                        : "text-gray-300 hover:bg-gray-800/50 hover:text-white"
-                    }`}
-                  >
-                    <Circle
-                      className={`h-2.5 w-2.5 shrink-0 fill-current ${statusClass}`}
-                    />
-                    <span className="truncate">
-                      E{ep.episode}: {ep.title}
-                    </span>
-                    {isSegmented && !ep.scenes_count && (
-                      <span className="ml-auto shrink-0 rounded bg-indigo-950 px-1.5 py-0.5 text-[10px] text-indigo-400">
-                        {t("dashboard:preprocessing")}
-                      </span>
-                    )}
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </CollapsibleSection>
-    </aside>
+function AddEpisodeMenu({ onCreate, onUpload }: { onCreate: () => void; onUpload: () => void }) {
+  const { t } = useTranslation("dashboard");
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" aria-label={t("add_episode")} />}>
+        <Plus aria-hidden />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent aria-label={t("add_episode")} className="w-52">
+        <DropdownMenuItem onClick={onCreate}>
+          <FilePlus aria-hidden />
+          {t("episode_create_title")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={onUpload}>
+          <Upload aria-hidden />
+          {t("episode_menu_upload_sources")}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

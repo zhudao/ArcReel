@@ -15,12 +15,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from lib import config  # noqa: E402,F401  # 先初始化 config 以打破 db.repositories 的循环导入
-from lib.db import async_session_factory  # noqa: E402
-from lib.db.repositories.credential_repository import CredentialRepository  # noqa: E402
-from lib.image_backends.base import ImageGenerationRequest  # noqa: E402
-from lib.image_backends.grok import GrokImageBackend  # noqa: E402
-from lib.style_templates import STYLE_TEMPLATES  # noqa: E402
+from lib.backends.image_backends.base import ImageGenerationRequest
+from lib.backends.image_backends.grok import GrokImageBackend
+from lib.db import async_session_factory
+from lib.db.repositories.credential_repository import CredentialRepository
+from lib.prompts.style_templates import list_template_ids, resolve_template_prompt
 
 OUT_DIR = ROOT / "frontend" / "public" / "style-thumbnails"
 
@@ -73,14 +72,13 @@ async def load_grok_api_key() -> str:
     async with async_session_factory() as session:
         cred = await CredentialRepository(session).get_active("grok")
     if cred is None or not cred.api_key:
-        raise RuntimeError("未找到 grok 活跃凭证（provider_credential 表）")
+        raise RuntimeError("未找到 grok 生效凭证（provider_credential 表）")
     return cred.api_key
 
 
 def build_prompt(tpl_id: str) -> str:
-    tpl = STYLE_TEMPLATES[tpl_id]
     subject = SUBJECTS[tpl_id]
-    style = tpl["prompt"]
+    style = resolve_template_prompt(tpl_id)
     return (
         f"{subject}。{style}。"
         "中景半身像（medium bust portrait），人物位于画面中心，正面或三分之二侧面，"
@@ -95,7 +93,7 @@ async def generate_one(
     tpl_id: str,
     out_path: Path,
 ) -> tuple[str, bool, str]:
-    out_path.unlink(missing_ok=True)
+    out_path.unlink(missing_ok=True)  # noqa: ASYNC240 -- 一次性脚本清理输出文件，本地元数据
     prompt = build_prompt(tpl_id)
     async with sem:
         try:
@@ -114,7 +112,8 @@ async def generate_one(
 
 async def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    missing = set(STYLE_TEMPLATES) - set(SUBJECTS)
+    template_ids = list_template_ids()
+    missing = set(template_ids) - set(SUBJECTS)
     if missing:
         raise RuntimeError(f"SUBJECTS 缺少: {sorted(missing)}")
 
@@ -122,7 +121,7 @@ async def main() -> None:
     backend = GrokImageBackend(api_key=api_key)
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    tasks = [generate_one(backend, sem, tpl_id, OUT_DIR / f"{tpl_id}.png") for tpl_id in STYLE_TEMPLATES]
+    tasks = [generate_one(backend, sem, tpl_id, OUT_DIR / f"{tpl_id}.png") for tpl_id in template_ids]
 
     ok = fail = 0
     for coro in asyncio.as_completed(tasks):
@@ -134,7 +133,7 @@ async def main() -> None:
             fail += 1
             print(f"  ❌ {tpl_id} — {msg}")
 
-    print(f"\n完成：成功 {ok} / 失败 {fail} / 共 {len(STYLE_TEMPLATES)}")
+    print(f"\n完成：成功 {ok} / 失败 {fail} / 共 {len(template_ids)}")
     if fail:
         sys.exit(1)
 

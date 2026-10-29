@@ -1,202 +1,197 @@
-import { useEffect, type RefObject } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-  ArrowUpRight,
-  BellRing,
-  CheckCheck,
-  CircleAlert,
-  Info,
-  Sparkles,
-  X,
-} from "lucide-react";
+import { ArrowUpRight, Bell, BellRing, CircleAlert, CircleCheck, Info, X } from "lucide-react";
+import { cn } from "cn";
+import { Button } from "@/components/ui/button";
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
+import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
+import { useNowTick } from "@/hooks/useNowTick";
 import { useAppStore } from "@/stores/app-store";
-import { Popover } from "@/components/ui/Popover";
 import type { WorkspaceNotification } from "@/types";
 
-interface WorkspaceNotificationsDrawerProps {
-  open: boolean;
-  onClose: () => void;
-  anchorRef: RefObject<HTMLElement | null>;
+interface WorkspaceNotificationsProps {
+  /** 点「查看定位」：调用方负责跳转与滚动定位；面板随之关闭。 */
   onNavigate: (notification: WorkspaceNotification) => void;
 }
 
-export function WorkspaceNotificationsDrawer({
-  open,
-  onClose,
-  anchorRef,
-  onNavigate,
-}: WorkspaceNotificationsDrawerProps) {
-  const { t } = useTranslation("dashboard");
-  const workspaceNotifications = useAppStore((s) => s.workspaceNotifications);
-  const markAllWorkspaceNotificationsRead = useAppStore(
-    (s) => s.markAllWorkspaceNotificationsRead
-  );
-  const removeWorkspaceNotification = useAppStore(
-    (s) => s.removeWorkspaceNotification
-  );
-  useEffect(() => {
-    if (open) {
-      markAllWorkspaceNotificationsRead();
-    }
-  }, [markAllWorkspaceNotificationsRead, open]);
+const TONE_ICON = {
+  success: { icon: CircleCheck, className: "text-good" },
+  warning: { icon: CircleAlert, className: "text-warn" },
+  error: { icon: CircleAlert, className: "text-destructive" },
+  info: { icon: Info, className: "text-primary" },
+} as const;
 
-  const unreadCount = workspaceNotifications.filter((item) => !item.read).length;
+function unreadIds(): string[] {
+  return useAppStore
+    .getState()
+    .workspaceNotifications.filter((item) => !item.read)
+    .map((item) => item.id);
+}
+
+/**
+ * 顶栏的通知铃铛与锚定在它下方的通知面板。打开面板即把全部通知标为已读，角标立即清零；
+ * 打开时未读（以及打开期间新到）的条目保持高亮，直到关闭面板。
+ */
+export function WorkspaceNotifications({ onNavigate }: WorkspaceNotificationsProps) {
+  const { t } = useTranslation("dashboard");
+  const notifications = useAppStore((s) => s.workspaceNotifications);
+  const markAllRead = useAppStore((s) => s.markAllWorkspaceNotificationsRead);
+  const remove = useAppStore((s) => s.removeWorkspaceNotification);
+  const [open, setOpen] = useState(false);
+  const [highlighted, setHighlighted] = useState<ReadonlySet<string>>(() => new Set());
+
+  const handleOpenChange = (next: boolean) => {
+    setOpen(next);
+    if (next) {
+      setHighlighted(new Set(unreadIds()));
+      markAllRead();
+    } else {
+      setHighlighted(new Set());
+    }
+  };
+
+  // 面板开着时新到的通知同样直接算已读，高亮保留到关闭
+  useEffect(() => {
+    if (!open) return;
+    return useAppStore.subscribe((state, prev) => {
+      if (state.workspaceNotifications === prev.workspaceNotifications) return;
+      const arrived = unreadIds();
+      if (arrived.length === 0) return;
+      setHighlighted((current) => new Set([...current, ...arrived]));
+      markAllRead();
+    });
+  }, [open, markAllRead]);
+
+  const unreadCount = notifications.filter((item) => !item.read).length;
 
   return (
-    <Popover
-      open={open}
-      onClose={onClose}
-      anchorRef={anchorRef}
-      sideOffset={10}
-      width="w-[24rem]"
-      backgroundColor="rgb(2 6 23 / 0.96)"
-      className="overflow-hidden rounded-[1.35rem] border border-amber-200/10 bg-slate-950/96 shadow-[0_24px_80px_rgba(15,23,42,0.55)] backdrop-blur-xl"
-    >
-      <div className="border-b border-white/8 bg-[radial-gradient(circle_at_top_right,rgba(251,191,36,0.16),transparent_42%),radial-gradient(circle_at_top_left,rgba(56,189,248,0.12),transparent_36%)] px-4 py-3">
-        <div className="flex items-center justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl border border-amber-300/18 bg-amber-300/10 text-amber-100 shadow-[0_12px_32px_rgba(245,158,11,0.18)]">
-              <BellRing className="h-4 w-4" />
-            </span>
-            <span className="rounded-full border border-white/8 bg-white/4 px-2.5 py-1 text-[11px] text-slate-300">
-              {t("notifications_count", { count: workspaceNotifications.length })}
-            </span>
-            <span className="flex items-center gap-1.5 text-[11px] text-amber-100/85">
-              <Sparkles className="h-3.5 w-3.5" />
-              {t("unread_count", { count: unreadCount })}
-            </span>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-xl p-1.5 text-slate-500 transition-colors hover:bg-white/6 hover:text-slate-200"
-            aria-label={t("close_notification_panel")}
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      <PopoverTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon"
+            className="relative"
+            aria-label={
+              unreadCount > 0
+                ? t("notifications_trigger_unread", { count: unreadCount })
+                : t("workspace_notifications_title")
+            }
+          />
+        }
+      >
+        <Bell aria-hidden />
+        {unreadCount > 0 && (
+          <span
+            aria-hidden
+            className="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-xs font-medium text-primary-foreground"
           >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-      </div>
-
-      <div className="max-h-[28rem] overflow-y-auto px-3 py-3">
-        {workspaceNotifications.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-3 rounded-[1.1rem] border border-dashed border-white/10 bg-white/[0.03] px-6 py-12 text-center">
-            <BellRing className="h-5 w-5 text-slate-500" />
-            <div>
-              <p className="text-sm text-slate-200">{t("no_notifications")}</p>
-              <p className="mt-1 text-xs text-slate-500">
-                {t("notifications_hint")}
-              </p>
-            </div>
-          </div>
-        ) : (
-          <div className="space-y-2">
-            {workspaceNotifications.map((item) => {
-              const actionable = Boolean(item.target);
-              const toneClasses = getToneClasses(item.tone, actionable);
-              const ToneIcon = getToneIcon(item.tone);
-
-              return (
-                <article
-                  key={item.id}
-                  className={`group rounded-[1.1rem] border px-3.5 py-3 text-sm transition-all ${toneClasses}`}
-                >
-                  <div className="flex items-start gap-3">
-                    <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl border border-white/10 bg-black/15">
-                      <ToneIcon className="h-4 w-4" />
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[11px] uppercase tracking-[0.18em] text-slate-400">
-                          {item.read ? t("read_status") : t("new_notification")}
-                        </span>
-                        <span className="text-[11px] text-slate-500">
-                          {formatNotificationTime(item.created_at, t)}
-                        </span>
-                      </div>
-                      <p className="mt-1.5 whitespace-pre-wrap leading-5 text-slate-100">
-                        {item.text}
-                      </p>
-                      <div className="mt-3 flex items-center justify-between gap-2">
-                        {actionable ? (
-                          <button
-                            type="button"
-                            onClick={() => onNavigate(item)}
-                            className="inline-flex items-center gap-1 rounded-full border border-sky-300/18 bg-sky-300/10 px-3 py-1 text-xs font-medium text-sky-100 transition-all hover:-translate-y-0.5 hover:border-sky-200/35 hover:bg-sky-300/14"
-                          >
-                            {t("view_location")}
-                            <ArrowUpRight className="h-3.5 w-3.5" />
-                          </button>
-                        ) : (
-                          <span className="text-[11px] text-slate-500">{t("notification_only")}</span>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => removeWorkspaceNotification(item.id)}
-                          className="rounded-full px-2 py-1 text-[11px] text-slate-500 transition-colors hover:bg-white/6 hover:text-slate-200"
-                        >
-                          {t("remove_label")}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </article>
-              );
-            })}
-          </div>
+            {unreadCount > 9 ? "9+" : unreadCount}
+          </span>
         )}
-      </div>
-
-      {workspaceNotifications.length > 0 && (
-        <div className="border-t border-white/8 px-4 py-2.5">
-          <div className="flex items-center justify-between text-[11px] text-slate-500">
-            <span>{t("auto_mark_read_hint")}</span>
-            <span className="inline-flex items-center gap-1">
-              <CheckCheck className="h-3.5 w-3.5" />
-              {t("session_records")}
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-96">
+        <div className="flex shrink-0 items-baseline gap-2 px-1">
+          <PopoverTitle className="min-w-0 flex-1">{t("workspace_notifications_title")}</PopoverTitle>
+          {notifications.length > 0 && (
+            <span className="text-xs text-muted-foreground">
+              {t("notifications_count", { count: notifications.length })}
             </span>
-          </div>
+          )}
         </div>
-      )}
+        {notifications.length === 0 ? (
+          <Empty>
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <BellRing aria-hidden />
+              </EmptyMedia>
+              <EmptyTitle>{t("no_notifications")}</EmptyTitle>
+              <EmptyDescription>{t("notifications_hint")}</EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        ) : (
+          <ul className="relative -mx-1 flex min-h-0 flex-col gap-0.5 overflow-y-auto">
+            {notifications.map((item) => (
+              <NotificationRow
+                key={item.id}
+                item={item}
+                highlighted={highlighted.has(item.id)}
+                onNavigate={() => {
+                  handleOpenChange(false);
+                  onNavigate(item);
+                }}
+                onRemove={() => remove(item.id)}
+              />
+            ))}
+          </ul>
+        )}
+        {notifications.length > 0 && (
+          <p className="shrink-0 border-t border-border px-1 pt-2 text-xs text-muted-foreground">
+            {t("notifications_session_hint")}
+          </p>
+        )}
+      </PopoverContent>
     </Popover>
   );
 }
 
-function getToneClasses(tone: WorkspaceNotification["tone"], actionable: boolean): string {
-  if (actionable) {
-    return "border-sky-300/14 bg-[linear-gradient(135deg,rgba(14,165,233,0.16),rgba(15,23,42,0.62)_58%,rgba(245,158,11,0.08))] shadow-[0_12px_34px_rgba(14,165,233,0.08)]";
-  }
-  switch (tone) {
-    case "success":
-      return "border-emerald-300/12 bg-emerald-300/6";
-    case "warning":
-      return "border-amber-300/12 bg-amber-300/6";
-    case "error":
-      return "border-rose-300/12 bg-rose-300/6";
-    default:
-      return "border-white/8 bg-white/[0.03]";
-  }
+function NotificationRow({
+  item,
+  highlighted,
+  onNavigate,
+  onRemove,
+}: {
+  item: WorkspaceNotification;
+  highlighted: boolean;
+  onNavigate: () => void;
+  onRemove: () => void;
+}) {
+  const { t } = useTranslation("dashboard");
+  const tone = TONE_ICON[item.tone];
+  const ToneIcon = tone.icon;
+  return (
+    <li className={cn("flex gap-2.5 rounded-md py-2 pr-1 pl-2.5", highlighted && "bg-primary/10")}>
+      <ToneIcon aria-hidden className={cn("mt-0.5 size-4 shrink-0", tone.className)} />
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <p className="text-sm break-words whitespace-pre-wrap">
+          {highlighted && <span className="sr-only">{t("new_notification")}：</span>}
+          {item.text}
+        </p>
+        <div className="flex items-center gap-2">
+          <NotificationAge timestamp={item.created_at} />
+          {item.target && (
+            <Button variant="link" size="xs" onClick={onNavigate}>
+              {t("view_location")}
+              <ArrowUpRight aria-hidden data-icon="inline-end" />
+            </Button>
+          )}
+        </div>
+      </div>
+      <Button variant="ghost" size="icon-xs" aria-label={t("remove_notification")} onClick={onRemove}>
+        <X aria-hidden />
+      </Button>
+    </li>
+  );
 }
 
-function getToneIcon(tone: WorkspaceNotification["tone"]) {
-  switch (tone) {
-    case "warning":
-    case "error":
-      return CircleAlert;
-    case "success":
-      return Sparkles;
-    default:
-      return Info;
-  }
+/**
+ * 通知的年龄。抽成组件，让共享时钟只在面板打开、条目挂载时走动。
+ */
+function NotificationAge({ timestamp }: { timestamp: number }) {
+  const { t } = useTranslation("dashboard");
+  const now = useNowTick();
+  return <span className="num text-xs text-subtle-foreground">{formatNotificationTime(timestamp, now, t)}</span>;
 }
 
-function formatNotificationTime(timestamp: number, t: (key: string, opts?: Record<string, unknown>) => string): string {
-  const diff = Date.now() - timestamp;
+function formatNotificationTime(
+  timestamp: number,
+  now: number,
+  t: (key: string, opts?: Record<string, unknown>) => string,
+): string {
+  const diff = now - timestamp;
   if (diff < 60_000) return t("just_now");
   if (diff < 3_600_000) return t("minutes_ago", { count: Math.max(1, Math.floor(diff / 60_000)) });
 
   const date = new Date(timestamp);
-  return `${date.getHours().toString().padStart(2, "0")}:${date
-    .getMinutes()
-    .toString()
-    .padStart(2, "0")}`;
+  return `${date.getHours().toString().padStart(2, "0")}:${date.getMinutes().toString().padStart(2, "0")}`;
 }

@@ -6,19 +6,79 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Callable, Collection
 from typing import Any
 
+from sqlalchemy import ColumnElement, func, select, text, update
+from sqlalchemy import bindparam as sa_bindparam
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from lib.backends.providers import CallStatus
 from lib.db.base import DEFAULT_USER_ID, dt_to_iso, utc_now
-from lib.db.models.task import Task, TaskEvent, WorkerLease
-from lib.db.repositories.base import BaseRepository
+from lib.db.models.api_call import ApiCall
+from lib.db.models.task import BatchTask, GenerationBatch, Task, WorkerLease
+from lib.db.repositories.base import BaseRepository, rowcount
+from lib.generation.task_failure import bound_reason, collapse_cascade_reason, encode_failure, parse_failure
+from lib.generation.task_terminal_events import TERMINAL_TASK_STATUSES
 
 logger = logging.getLogger(__name__)
 
 ACTIVE_TASK_STATUSES = ("queued", "running")
+
+# 落库 error_message 的长度上限。裸切片会把结构化原因切在 JSON 中途，使 render_failure
+# 无法解析、用户看到机器码碎片而非本地化文案，因此两条落库路径都经 bound_reason 收窄。
+# 级联编码另在编码前按预算裁剪 reason（_encode_bounded_cascade_failure），保证结果本身
+# 不需要再被截断，深层依赖链也不会近指数增长。
+_MAX_ERROR_MESSAGE_LEN = 2000
+
+
+def _active_dedupe_clauses(
+    *,
+    project_name: str,
+    user_id: str,
+    task_type: str,
+    script_file: str | None,
+    resource_type: str | None,
+) -> list[ColumnElement[bool]]:
+    """``idx_tasks_dedupe_active`` 去重键中与 ``resource_id`` 无关的那部分匹配条件。
+
+    ``enqueue`` 的 ``IntegrityError`` 回查与 :meth:`TaskRepository.get_active_tasks_for_resources`
+    共用这一份，去重口径只有一处定义。``script_file`` / ``resource_type`` 以空串归一，与索引
+    表达式里的 ``COALESCE`` 对齐。
+    """
+    return [
+        Task.project_name == project_name,
+        Task.user_id == user_id,
+        Task.task_type == task_type,
+        func.coalesce(Task.script_file, "") == (script_file or ""),
+        func.coalesce(Task.resource_type, "") == (resource_type or ""),
+        Task.status.in_(ACTIVE_TASK_STATUSES),
+    ]
+
+
+def _encode_bounded_cascade_failure(*, dependency_task_id: str, reason: str) -> str:
+    # 上游原因本身是级联串时先折叠到根本原因：逐层包裹近指数增长，深链上裁剪只能把内层信封
+    # 切在 JSON 中途，读侧会把残缺内层当普通文本嵌进本地化文案。折叠后串长与链深无关。
+    reason = collapse_cascade_reason(reason)
+    encoded = encode_failure("cascade_blocked_dependency", dependency_task_id=dependency_task_id, reason=reason)
+    if len(encoded) <= _MAX_ERROR_MESSAGE_LEN:
+        return encoded
+
+    overhead = len(encode_failure("cascade_blocked_dependency", dependency_task_id=dependency_task_id, reason=""))
+    budget = max(_MAX_ERROR_MESSAGE_LEN - overhead, 0)
+    # JSON 转义（reason 中的引号/反斜杠）会让 budget 字符的 reason 编码后略超预算；始终经
+    # bound_reason 收窄以保持结构化 reason 合法，不对已裁剪结果做原始字符再截断（那会切断
+    # JSON 尾部）。极少数迭代仍超限时接受结果略超 _MAX_ERROR_MESSAGE_LEN，好过写坏 JSON。
+    for _ in range(5):
+        reason = bound_reason(reason, budget)
+        encoded = encode_failure("cascade_blocked_dependency", dependency_task_id=dependency_task_id, reason=reason)
+        overflow = len(encoded) - _MAX_ERROR_MESSAGE_LEN
+        if overflow <= 0 or budget <= 0:
+            break
+        budget = max(budget - overflow, 0)
+    return encoded
 
 
 def _json_dumps(value: Any) -> str:
@@ -37,10 +97,12 @@ def _json_loads(value: str | None, default: Any) -> Any:
 def _task_to_dict(row: Task) -> dict[str, Any]:
     return {
         "task_id": row.task_id,
+        "batch_id": row.batch_id,
         "project_name": row.project_name,
         "task_type": row.task_type,
         "media_type": row.media_type,
         "resource_id": row.resource_id,
+        "resource_type": row.resource_type,
         "script_file": row.script_file,
         "payload": _json_loads(row.payload_json, {}),
         "status": row.status,
@@ -51,6 +113,11 @@ def _task_to_dict(row: Task) -> dict[str, Any]:
         "dependency_group": row.dependency_group,
         "dependency_index": row.dependency_index,
         "cancelled_by": row.cancelled_by,
+        "provider_id": row.provider_id,
+        "provider_job_id": row.provider_job_id,
+        "provider_endpoint": row.provider_endpoint,
+        "submitted_base_url": row.submitted_base_url,
+        "execution_checkpoint_json": row.execution_checkpoint_json,
         "queued_at": dt_to_iso(row.queued_at),
         "started_at": dt_to_iso(row.started_at),
         "finished_at": dt_to_iso(row.finished_at),
@@ -59,40 +126,70 @@ def _task_to_dict(row: Task) -> dict[str, Any]:
     }
 
 
-def _event_to_dict(row: TaskEvent) -> dict[str, Any]:
-    return {
-        "id": row.id,
-        "task_id": row.task_id,
-        "project_name": row.project_name,
-        "event_type": row.event_type,
-        "status": row.status,
-        "data": _json_loads(row.data_json, {}),
-        "created_at": dt_to_iso(row.created_at),
-    }
+class TaskNotCancellableError(Exception):
+    """任务已开始执行，不可取消：取消只对 queued 开放，执行中的任务照常跑完。"""
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__(f"任务 '{task_id}' 正在执行，不可取消")
+        self.task_id = task_id
 
 
 class TaskRepository(BaseRepository):
-    async def _append_event(
+    def __init__(self, session: AsyncSession):
+        super().__init__(session)
+        # 该 session 内落地的任务终态，供上层（GenerationQueue）在事务提交后发布项目事件。
+        # 在此收集而非各终态方法各自记账：所有终态迁移（含级联失败/级联取消、批量取消
+        # 队列）都经 _record_terminal_event 收口，一处挂钩即全覆盖。
+        self.terminal_events: list[dict[str, Any]] = []
+
+    def _record_terminal_event(
         self,
         *,
         task_id: str,
         project_name: str,
-        event_type: str,
         status: str,
-        data: dict | None = None,
-    ) -> int:
-        now = utc_now()
-        event = TaskEvent(
-            task_id=task_id,
-            project_name=project_name,
-            event_type=event_type,
-            status=status,
-            data_json=_json_dumps(data or {}),
-            created_at=now,
+        task_type: str | None = None,
+    ) -> None:
+        """非终态调用是空操作：状态守卫兜住未来新增的非终态调用点，避免发出无对应动作的事件。"""
+        if status in TERMINAL_TASK_STATUSES:
+            self.terminal_events.append(
+                {
+                    "task_id": task_id,
+                    "project_name": project_name,
+                    "status": status,
+                    "task_type": task_type,
+                }
+            )
+
+    async def _require_batch_units(
+        self,
+        *,
+        project_name: str,
+        batch_id: str,
+        unit_ids: tuple[str, ...],
+        user_id: str,
+    ) -> None:
+        result = await self.session.execute(
+            select(GenerationBatch).where(
+                GenerationBatch.batch_id == batch_id,
+                GenerationBatch.project_name == project_name,
+                GenerationBatch.user_id == user_id,
+            )
         )
-        self.session.add(event)
-        await self.session.flush()
-        return event.id
+        batch = result.scalar_one_or_none()
+        requested = _json_loads(batch.requested_json, {}) if batch is not None else {}
+        requested_ids = {item.get("unit_id") for item in requested.get("requested", []) if isinstance(item, dict)}
+        blocked_ids = {
+            item["item"].get("unit_id")
+            for item in (_json_loads(batch.blocked_json, []) if batch is not None else [])
+            if isinstance(item, dict) and isinstance(item.get("item"), dict)
+        }
+        invalid = next(
+            (unit_id for unit_id in unit_ids if unit_id not in requested_ids or unit_id in blocked_ids), None
+        )
+        if batch is None or invalid is not None:
+            unit_id = invalid or unit_ids[0]
+            raise ValueError(f"batch '{batch_id}' does not own unit '{unit_id}' in project '{project_name}'")
 
     async def enqueue(
         self,
@@ -103,90 +200,314 @@ class TaskRepository(BaseRepository):
         resource_id: str,
         payload: dict[str, Any] | None = None,
         script_file: str | None = None,
+        resource_type: str | None = None,
         source: str = "webui",
         dependency_task_id: str | None = None,
         dependency_group: str | None = None,
         dependency_index: int | None = None,
         user_id: str = DEFAULT_USER_ID,
+        provider_id: str | None = None,
+        batch_id: str | None = None,
+        batch_unit_id: str | None = None,
+        batch_unit_ids: tuple[str, ...] = (),
+        dedupe_guard: Callable[[dict[str, Any], str], None] | None = None,
     ) -> dict[str, Any]:
+        unit_ids = tuple(dict.fromkeys((*(batch_unit_ids or ()), *((batch_unit_id,) if batch_unit_id else ()))))
+        if unit_ids and batch_id is None:
+            raise ValueError("batch_id and at least one batch unit id must be provided together")
+        if batch_id is not None:
+            if not unit_ids:
+                raise ValueError("batch_id and at least one batch unit id must be provided together")
+            await self._require_batch_units(
+                project_name=project_name,
+                batch_id=batch_id,
+                unit_ids=unit_ids,
+                user_id=user_id,
+            )
         now = utc_now()
 
         task_id = uuid.uuid4().hex
         task = Task(
             task_id=task_id,
+            batch_id=batch_id,
             project_name=project_name,
             task_type=task_type,
             media_type=media_type,
             resource_id=resource_id,
             script_file=script_file,
+            resource_type=resource_type,
             payload_json=_json_dumps(payload or {}),
             status="queued",
             source=source,
             dependency_task_id=dependency_task_id,
             dependency_group=dependency_group,
             dependency_index=dependency_index,
+            provider_id=provider_id,
             queued_at=now,
             updated_at=now,
             user_id=user_id,
         )
         self.session.add(task)
+        deduped = False
+        existing_task_id: str | None = None
+        existing_payload: dict[str, Any] | None = None
         try:
             await self.session.flush()
         except IntegrityError:
             await self.session.rollback()
             # Unique partial index violation: an active task already exists
-            sf = script_file or ""
             result = await self.session.execute(
                 select(Task)
                 .where(
-                    Task.project_name == project_name,
-                    Task.task_type == task_type,
+                    *_active_dedupe_clauses(
+                        project_name=project_name,
+                        user_id=user_id,
+                        task_type=task_type,
+                        script_file=script_file,
+                        resource_type=resource_type,
+                    ),
                     Task.resource_id == resource_id,
-                    func.coalesce(Task.script_file, "") == sf,
-                    Task.status.in_(ACTIVE_TASK_STATUSES),
                 )
                 .order_by(Task.queued_at.desc())
                 .limit(1)
             )
             existing = result.scalar_one_or_none()
             if existing:
-                return {
-                    "task_id": existing.task_id,
-                    "status": existing.status,
-                    "deduped": True,
-                    "existing_task_id": existing.task_id,
-                }
-            raise
+                task_id = existing.task_id
+                deduped = True
+                existing_task_id = existing.task_id
+                loaded_payload: dict[str, Any] = _json_loads(existing.payload_json, {})
+                existing_payload = loaded_payload
+                if dedupe_guard is not None:
+                    dedupe_guard(loaded_payload, existing.task_id)
+                status = existing.status
+            else:
+                raise
+        else:
+            status = "queued"
 
-        task_data = _task_to_dict(task)
-        await self._append_event(
-            task_id=task_id,
-            project_name=project_name,
-            event_type="queued",
-            status="queued",
-            data=task_data,
-        )
+        if batch_id is not None:
+            self.session.add_all(
+                BatchTask(batch_id=batch_id, task_id=task_id, unit_id=unit_id, deduped=deduped) for unit_id in unit_ids
+            )
+            await self.session.flush()
+
         await self.session.commit()
 
         return {
             "task_id": task_id,
-            "status": "queued",
-            "deduped": False,
-            "existing_task_id": None,
+            "status": status,
+            "deduped": deduped,
+            "existing_task_id": existing_task_id,
+            "_existing_payload": existing_payload,
         }
 
+    async def create_batch(
+        self,
+        *,
+        batch_id: str,
+        project_name: str,
+        operation: str,
+        requested: dict[str, Any],
+        blocked: list[dict[str, Any]],
+        source: str,
+        user_id: str,
+    ) -> None:
+        self.session.add(
+            GenerationBatch(
+                batch_id=batch_id,
+                project_name=project_name,
+                operation=operation,
+                requested_json=_json_dumps(requested),
+                blocked_json=_json_dumps(blocked),
+                source=source,
+                user_id=user_id,
+                created_at=utc_now(),
+            )
+        )
+        await self.session.commit()
+
+    async def attach_batch_task(
+        self,
+        *,
+        project_name: str,
+        batch_id: str,
+        task_id: str,
+        unit_id: str,
+        deduped: bool,
+        user_id: str,
+    ) -> None:
+        await self._require_batch_units(
+            project_name=project_name,
+            batch_id=batch_id,
+            unit_ids=(unit_id,),
+            user_id=user_id,
+        )
+        task_result = await self.session.execute(
+            select(Task).where(
+                Task.task_id == task_id,
+                Task.project_name == project_name,
+                Task.user_id == user_id,
+            )
+        )
+        task = task_result.scalar_one_or_none()
+        if task is None:
+            raise ValueError(f"batch '{batch_id}' does not own unit '{unit_id}' in project '{project_name}'")
+        self.session.add(BatchTask(batch_id=batch_id, task_id=task_id, unit_id=unit_id, deduped=deduped))
+        await self.session.commit()
+
+    async def get_batch(
+        self, *, project_name: str, batch_id: str, user_id: str = DEFAULT_USER_ID
+    ) -> dict[str, Any] | None:
+        result = await self.session.execute(
+            select(GenerationBatch).where(
+                GenerationBatch.batch_id == batch_id,
+                GenerationBatch.project_name == project_name,
+                GenerationBatch.user_id == user_id,
+            )
+        )
+        batch = result.scalar_one_or_none()
+        if batch is None:
+            return None
+
+        rows = await self.session.execute(
+            select(BatchTask, Task)
+            .join(Task, Task.task_id == BatchTask.task_id)
+            .where(
+                BatchTask.batch_id == batch_id,
+                Task.project_name == batch.project_name,
+                Task.user_id == batch.user_id,
+            )
+        )
+        memberships = []
+        for membership, task in rows.all():
+            item = _task_to_dict(task)
+            item.update(unit_id=membership.unit_id, deduped=membership.deduped)
+            memberships.append(item)
+
+        task_types = {item["task_type"] for item in memberships}
+        depth: dict[str, int] = {}
+        if task_types:
+            depth_rows = await self.session.execute(
+                select(Task.task_type, func.count())
+                .where(
+                    Task.project_name == batch.project_name,
+                    Task.user_id == batch.user_id,
+                    Task.task_type.in_(task_types),
+                    Task.status == "queued",
+                )
+                .group_by(Task.task_type)
+            )
+            depth = {str(task_type): int(count) for task_type, count in depth_rows.all()}
+        return {
+            "batch_id": batch.batch_id,
+            "project_name": batch.project_name,
+            "operation": batch.operation,
+            "requested": json.loads(batch.requested_json),
+            "blocked": json.loads(batch.blocked_json),
+            "source": batch.source,
+            "user_id": batch.user_id,
+            "created_at": dt_to_iso(batch.created_at),
+            "memberships": memberships,
+            "queue_depth": depth,
+        }
+
+    async def delete_fresh_batch(self, *, project_name: str, batch_id: str, user_id: str) -> int:
+        scope = (
+            GenerationBatch.batch_id == batch_id,
+            GenerationBatch.project_name == project_name,
+            GenerationBatch.user_id == user_id,
+        )
+        if self.session.get_bind().dialect.name == "postgresql":
+            # Serialize with membership FK checks before the fresh-snapshot delete.
+            await self.session.execute(select(GenerationBatch.batch_id).where(*scope).with_for_update())
+        result = await self.session.execute(
+            sa_delete(GenerationBatch).where(
+                *scope,
+                ~select(Task.task_id).where(Task.batch_id == GenerationBatch.batch_id).exists(),
+                ~select(BatchTask.task_id).where(BatchTask.batch_id == GenerationBatch.batch_id).exists(),
+            )
+        )
+        await self.session.commit()
+        return rowcount(result)
+
+    async def get_active_tasks_for_resources(
+        self,
+        *,
+        project_name: str,
+        task_type: str,
+        resource_ids: list[str],
+        script_file: str | None = None,
+        resource_type: str | None = None,
+        user_id: str = DEFAULT_USER_ID,
+    ) -> list[dict[str, Any]]:
+        """查询命中 ``idx_tasks_dedupe_active`` 去重键、当前处于活动态的任务。
+
+        match 条件与 :meth:`enqueue` 的 ``IntegrityError`` 分支共用
+        :func:`_active_dedupe_clauses`，供调用方在真正入队前探测冲突并拒绝，而不是让
+        ``enqueue`` 的原子去重悄悄回退到既有任务。结果按入队时间定序，调用方据此
+        组织的文案不随实现漂移。
+        """
+        if not resource_ids:
+            return []
+        result = await self.session.execute(
+            select(Task)
+            .where(
+                *_active_dedupe_clauses(
+                    project_name=project_name,
+                    user_id=user_id,
+                    task_type=task_type,
+                    script_file=script_file,
+                    resource_type=resource_type,
+                ),
+                Task.resource_id.in_(resource_ids),
+            )
+            .order_by(Task.queued_at, Task.task_id)
+        )
+        return [_task_to_dict(t) for t in result.scalars().all()]
+
     # NOTE: In multi-user mode, override this method to add user_id filtering
-    async def claim_next(self, media_type: str) -> dict[str, Any] | None:
+    async def claim_next(
+        self,
+        media_type: str,
+        *,
+        pool_full_providers: frozenset[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """领取下一个 queued 任务。
+
+        ``pool_full_providers`` 为本 cycle 已知池满的 provider_id 集合（黑名单语义）：
+        - ``None`` / 空集合 —— 不做 provider 过滤
+        - 非空集合 —— 按排队时记录的 ``provider_id`` 排除这些 provider 的任务，所有任务类型
+          同一口径。``provider_id IS NULL`` 的老数据和 ``provider_id`` 不在已知池集合里的任务
+          （例如自定义 provider 被删除）都不会被排除，worker claim 后再校验容量。
+
+        记录的 provider 可能已与项目现状不一致，按记录过滤不会让任务永久卡住：黑名单只含
+        此刻占满的 provider，它们的在跑任务结束后就会空出槽位，任务届时照常被领取，由执行
+        入口按现状核对 provider，不一致时改写记录并原位回队。
+
+        采用黑名单语义而非白名单（早期实现）的原因：白名单会把"已知但未在当前
+        ``_pools`` 里的 provider"任务永久过滤掉（例如自定义 provider 被禁用 / 删除），
+        导致静默堆积。黑名单只排除已知池满，未知 provider 任务正常 claim 走 worker
+        二次解析（解析失败走 mark_failed 兜底，不会无声卡死）。
+        """
         now = utc_now()
 
+        params: dict[str, Any] = {"media_type": media_type}
+        provider_filter = ""
+        if pool_full_providers:
+            # SQLite/PG 都支持 expanding bindparam：list 形式 + NOT IN (:providers)
+            provider_filter = "AND (tasks.provider_id IS NULL OR tasks.provider_id NOT IN :providers)"
+            params["providers"] = tuple(pool_full_providers)
+
         # Use raw SQL for the dependency join (clearer than ORM for self-join)
-        raw_stmt = text("""
+        raw_stmt = text(f"""
             SELECT tasks.task_id
             FROM tasks
             LEFT JOIN tasks AS dependency
               ON dependency.task_id = tasks.dependency_task_id
             WHERE tasks.status = 'queued'
               AND tasks.media_type = :media_type
+              {provider_filter}
               AND (
                 tasks.dependency_task_id IS NULL
                 OR dependency.status = 'succeeded'
@@ -194,8 +515,10 @@ class TaskRepository(BaseRepository):
             ORDER BY tasks.queued_at ASC
             LIMIT 1
         """)
+        if "providers" in params:
+            raw_stmt = raw_stmt.bindparams(sa_bindparam("providers", expanding=True))
 
-        result = await self.session.execute(raw_stmt, {"media_type": media_type})
+        result = await self.session.execute(raw_stmt, params)
         row = result.first()
         if not row:
             return None
@@ -212,7 +535,7 @@ class TaskRepository(BaseRepository):
                 updated_at=now,
             )
         )
-        if update_result.rowcount == 0:
+        if rowcount(update_result) == 0:
             # Another worker claimed this task between our SELECT and UPDATE
             await self.session.rollback()
             return None
@@ -222,23 +545,19 @@ class TaskRepository(BaseRepository):
         result = await self.session.execute(select(Task).where(Task.task_id == target_task_id))
         running_task = result.scalar_one()
         task_data = _task_to_dict(running_task)
-
-        await self._append_event(
-            task_id=target_task_id,
-            project_name=running_task.project_name,
-            event_type="running",
-            status="running",
-            data=task_data,
-        )
         await self.session.commit()
         return task_data
 
-    async def mark_succeeded(self, task_id: str, result: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    async def mark_succeeded(self, task_id: str, result: dict[str, Any] | None = None) -> int:
+        """SQL `WHERE status='running'` 守卫；返回受影响行数。
+
+        rows=0 表示任务已不在 running（已由别的路径落终态），该写入不生效，调用方只记录。
+        """
         now = utc_now()
 
-        await self.session.execute(
+        update_result = await self.session.execute(
             update(Task)
-            .where(Task.task_id == task_id)
+            .where(Task.task_id == task_id, Task.status == "running")
             .values(
                 status="succeeded",
                 result_json=_json_dumps(result or {}),
@@ -247,88 +566,162 @@ class TaskRepository(BaseRepository):
                 updated_at=now,
             )
         )
+        affected = rowcount(update_result)
+        if affected == 0:
+            # 不 commit；外部已写过其他终态，不要触发 event
+            return 0
+
         await self.session.flush()
-
         res = await self.session.execute(select(Task).where(Task.task_id == task_id))
-        done_task = res.scalar_one_or_none()
-        if not done_task:
-            return None
-
-        task_data = _task_to_dict(done_task)
-        await self._append_event(
+        done_task = res.scalar_one()
+        self._record_terminal_event(
             task_id=task_id,
             project_name=done_task.project_name,
-            event_type="succeeded",
             status="succeeded",
-            data=task_data,
+            task_type=done_task.task_type,
         )
         await self.session.commit()
-        return task_data
+        return affected
 
-    async def mark_failed(self, task_id: str, error_message: str) -> dict[str, Any] | None:
-        failed_task, changed = await self._mark_failed_internal(
-            task_id=task_id,
-            error_message=error_message,
-            allowed_statuses=ACTIVE_TASK_STATUSES,
-        )
-        if failed_task is None:
-            return None
+    async def mark_failed(self, task_id: str, error_message: str) -> int:
+        """SQL `WHERE status='running'` 守卫；返回受影响行数。
 
-        if changed:
-            await self._cascade_failed_dependents(
-                task_id=task_id,
-                error_message=failed_task.get("error_message") or error_message,
-            )
+        rows=0 表示任务已不在 running（已由别的路径落终态），该写入不生效，调用方只记录。
+        级联失败（依赖 task）走独立路径。
+        """
+        affected = await self._mark_failed_running(task_id=task_id, error_message=error_message)
+        if affected == 0:
+            return 0
 
+        await self._cascade_failed_queued(task_id=task_id, error_message=error_message)
         await self.session.commit()
-        return failed_task
+        return affected
 
-    async def _mark_failed_internal(
-        self,
-        *,
-        task_id: str,
-        error_message: str,
-        allowed_statuses: tuple[str, ...],
-    ) -> tuple[dict[str, Any] | None, bool]:
-        result = await self.session.execute(select(Task).where(Task.task_id == task_id))
+    async def retry_artifact_download(self, task_id: str) -> dict[str, Any]:
+        """把可恢复的下载失败任务原地翻回 running，并重开原 ApiCall 供 resume 结算。
+
+        派发所需的 ``provider_id`` 一并作为资格条件：状态一旦翻成 running，本方法就已提交，
+        派发侧再拒绝就没有回滚点，任务会永久停在 running 上无人接手。
+        """
+        result = await self.session.execute(self._scope_query(select(Task).where(Task.task_id == task_id), Task))
         task = result.scalar_one_or_none()
-        if not task:
-            return None, False
-
-        if task.status not in allowed_statuses:
-            return _task_to_dict(task), False
-
+        parsed = parse_failure(task.error_message or "") if task is not None else None
+        if (
+            task is None
+            or task.status != "failed"
+            or parsed is None
+            or parsed[0] != "artifact_download_failed"
+            or not task.provider_job_id
+            or not task.provider_id
+        ):
+            raise ValueError(f"task is not eligible for artifact download retry: {task_id}")
+        # 落 artifact_download_failed 的任务，其调用可能停在 failed（首次下载耗尽后已结算），
+        # 也可能停在 pending（续跑路径下载耗尽，结算与任务翻状态之间有窗口）。两种都受理并
+        # 原地翻回 pending：仍是同一条调用，不新增计费行；上一次下载的失败原文与机器码一并
+        # 清掉，否则重试成功后 resume 结算只翻状态，这条 success 行会一直挂着 download_failed。
+        # 调用行按 ``api_calls.task_id`` 反查——任务与调用的关联只有这一个真相源。
+        call_row = await self.session.execute(
+            select(ApiCall.id)
+            .where(
+                ApiCall.task_id == task_id,
+                ApiCall.status.in_((CallStatus.FAILED, CallStatus.PENDING)),
+            )
+            .order_by(ApiCall.id.desc())
+            .limit(1)
+        )
+        call_id = call_row.scalars().first()
+        if call_id is None:
+            raise ValueError(f"task has no settleable api call for artifact download retry: {task_id}")
+        call_update = await self.session.execute(
+            update(ApiCall)
+            .where(ApiCall.id == call_id, ApiCall.status.in_((CallStatus.FAILED, CallStatus.PENDING)))
+            .values(
+                status=CallStatus.PENDING,
+                finished_at=None,
+                error_message=None,
+                error_code=None,
+                error_params=None,
+            )
+        )
+        if rowcount(call_update) != 1:
+            await self.session.rollback()
+            raise ValueError(f"api call is not eligible for artifact download retry: {call_id}")
         now = utc_now()
-        await self.session.execute(
+        task_update = await self.session.execute(
             update(Task)
-            .where(Task.task_id == task_id)
+            .where(Task.task_id == task_id, Task.status == "failed")
+            # started_at 一并刷新：重试是新的一段执行，留着首次提交的时间会让面板上的
+            # 耗时按上一段的起点算。
+            .values(status="running", error_message=None, finished_at=None, started_at=now, updated_at=now)
+        )
+        if rowcount(task_update) != 1:
+            await self.session.rollback()
+            raise ValueError(f"task is not eligible for artifact download retry: {task_id}")
+        await self.session.commit()
+        refreshed = await self.session.execute(select(Task).where(Task.task_id == task_id))
+        return _task_to_dict(refreshed.scalar_one())
+
+    async def _mark_failed_running(self, *, task_id: str, error_message: str) -> int:
+        """单点：将 running task 标 failed；返回受影响行数。不 commit。"""
+        now = utc_now()
+        update_result = await self.session.execute(
+            update(Task)
+            .where(Task.task_id == task_id, Task.status == "running")
             .values(
                 status="failed",
-                error_message=error_message[:2000],
+                error_message=bound_reason(error_message, _MAX_ERROR_MESSAGE_LEN),
                 finished_at=now,
                 updated_at=now,
             )
         )
-        await self.session.flush()
+        affected = rowcount(update_result)
+        if affected == 0:
+            return 0
 
+        await self.session.flush()
         res = await self.session.execute(select(Task).where(Task.task_id == task_id))
         failed_task = res.scalar_one()
-        task_data = _task_to_dict(failed_task)
-        await self._append_event(
+        self._record_terminal_event(
             task_id=task_id,
             project_name=failed_task.project_name,
-            event_type="failed",
             status="failed",
-            data=task_data,
+            task_type=failed_task.task_type,
         )
-        return task_data, True
+        return affected
 
-    async def _cascade_failed_dependents(
-        self,
-        *,
-        task_id: str,
-        error_message: str,
-    ) -> int:
+    async def _mark_failed_queued_dep(self, *, task_id: str, error_message: str) -> int:
+        """级联专用：将 queued 依赖 task 标 failed；返回受影响行数。不 commit。"""
+        now = utc_now()
+        update_result = await self.session.execute(
+            update(Task)
+            .where(Task.task_id == task_id, Task.status == "queued")
+            .values(
+                status="failed",
+                error_message=bound_reason(error_message, _MAX_ERROR_MESSAGE_LEN),
+                finished_at=now,
+                updated_at=now,
+            )
+        )
+        affected = rowcount(update_result)
+        if affected == 0:
+            return 0
+
+        await self.session.flush()
+        res = await self.session.execute(select(Task).where(Task.task_id == task_id))
+        failed_task = res.scalar_one()
+        self._record_terminal_event(
+            task_id=task_id,
+            project_name=failed_task.project_name,
+            status="failed",
+            task_type=failed_task.task_type,
+        )
+        return affected
+
+    async def _cascade_failed_queued(self, *, task_id: str, error_message: str) -> int:
+        """按依赖链级联标失败。`error_message` 沿链条原样传递（根因，不随层数重新嵌套），
+        每层只把自己的直接阻塞方 `task_id` 写入编码——避免深层依赖链把上一层的完整编码串
+        再嵌套进新一层 JSON 造成的近指数增长与落库截断损坏。
+        """
         result = await self.session.execute(
             select(Task.task_id)
             .where(
@@ -341,34 +734,33 @@ class TaskRepository(BaseRepository):
 
         cascaded = 0
         for dep_id in dependent_ids:
-            blocked_message = f"blocked by failed dependency {task_id}: {error_message}"
-            failed_task, changed = await self._mark_failed_internal(
-                task_id=dep_id,
-                error_message=blocked_message,
-                allowed_statuses=("queued",),
-            )
-            if not changed or failed_task is None:
+            blocked_message = _encode_bounded_cascade_failure(dependency_task_id=task_id, reason=error_message)
+            affected = await self._mark_failed_queued_dep(task_id=dep_id, error_message=blocked_message)
+            if affected == 0:
                 continue
-            cascaded += 1
-            cascaded += await self._cascade_failed_dependents(
-                task_id=dep_id,
-                error_message=failed_task.get("error_message") or blocked_message,
-            )
+            cascaded += affected
+            cascaded += await self._cascade_failed_queued(task_id=dep_id, error_message=error_message)
         return cascaded
 
     async def get_cancel_preview(self, task_id: str) -> dict[str, Any]:
-        """预览取消某个任务的影响范围。"""
-        result = await self.session.execute(select(Task).where(Task.task_id == task_id))
+        """预览取消某个排队中任务的影响范围：列出会被一并取消的排队中下游。
+
+        取消只对 ``queued`` 开放；执行中的任务抛 ``TaskNotCancellableError``。终态任务照常
+        返回摘要，由调用方决定是否继续。
+        """
+        result = await self.session.execute(self._scope_query(select(Task).where(Task.task_id == task_id), Task))
         task = result.scalar_one_or_none()
         if not task:
             raise ValueError(f"任务 '{task_id}' 不存在")
-        if task.status != "queued":
-            raise ValueError("只有排队中的任务可以取消")
+        if task.status == "running":
+            raise TaskNotCancellableError(task_id)
 
         task_summary = {
             "task_id": task.task_id,
+            "project_name": task.project_name,
             "task_type": task.task_type,
             "resource_id": task.resource_id,
+            "status": task.status,
         }
 
         cascaded = await self._collect_queued_dependents(task_id)
@@ -377,7 +769,7 @@ class TaskRepository(BaseRepository):
     async def _collect_queued_dependents(self, task_id: str) -> list[dict[str, Any]]:
         """递归收集依赖于 task_id 的所有 queued 任务摘要。"""
         result = await self.session.execute(
-            select(Task.task_id, Task.task_type, Task.resource_id)
+            select(Task.task_id, Task.task_type, Task.resource_id, Task.project_name)
             .where(
                 Task.dependency_task_id == task_id,
                 Task.status == "queued",
@@ -386,43 +778,59 @@ class TaskRepository(BaseRepository):
         )
         dependents = []
         for row in result.all():
-            summary = {"task_id": row[0], "task_type": row[1], "resource_id": row[2]}
+            summary = {"task_id": row[0], "task_type": row[1], "resource_id": row[2], "project_name": row[3]}
             dependents.append(summary)
             dependents.extend(await self._collect_queued_dependents(row[0]))
         return dependents
 
     async def cancel_task(self, task_id: str) -> dict[str, Any]:
-        """取消一个 queued 任务，级联取消其所有 queued 依赖任务。"""
-        result = await self.session.execute(select(Task).where(Task.task_id == task_id))
+        """取消一个排队中的任务，并级联取消依赖它的排队中下游。
+
+        - ``queued`` → ``cancelled('user')``，下游 ``cancelled('cascade')``（含 grandchildren）；
+        - ``running`` → 抛 ``TaskNotCancellableError``，任务照常跑完；
+        - 终态（succeeded/failed/cancelled）→ ``skipped_terminal``。
+
+        读到 queued 后 UPDATE 前被 worker 认领的竞态同样按 running 拒绝。
+        """
+        result = await self.session.execute(self._scope_query(select(Task).where(Task.task_id == task_id), Task))
         task = result.scalar_one_or_none()
         if not task:
             raise ValueError(f"任务 '{task_id}' 不存在")
-        if task.status != "queued":
-            raise ValueError("只有排队中的任务可以取消")
 
-        cancelled = []
-        skipped_running = []
+        cancelled: list[dict[str, Any]] = []
+        skipped_terminal: list[dict[str, Any]] = []
+        if task.status in TERMINAL_TASK_STATUSES:
+            skipped_terminal.append(_task_to_dict(task))
+            return {"cancelled": cancelled, "skipped_terminal": skipped_terminal}
 
-        task_dict = await self._mark_cancelled(task_id, cancelled_by="user")
-        if task_dict:
-            cancelled.append(task_dict)
-        else:
-            refreshed = await self.session.execute(select(Task).where(Task.task_id == task_id))
-            t = refreshed.scalar_one_or_none()
-            if t and t.status == "running":
-                skipped_running.append(_task_to_dict(t))
-
-        await self._cascade_cancel_dependents(task_id, cancelled, skipped_running)
+        if await self._mark_cancelled(task.task_id, cancelled_by="user", cancelled=cancelled) is None:
+            await self.session.rollback()
+            await self.session.refresh(task)
+            if task.status in TERMINAL_TASK_STATUSES:
+                return {"cancelled": [], "skipped_terminal": [_task_to_dict(task)]}
+            raise TaskNotCancellableError(task_id)
 
         await self.session.commit()
-        return {"cancelled": cancelled, "skipped_running": skipped_running}
+        return {"cancelled": cancelled, "skipped_terminal": skipped_terminal}
 
-    async def _mark_cancelled(self, task_id: str, *, cancelled_by: str) -> dict[str, Any] | None:
-        """将一个 queued 任务标记为 cancelled。"""
+    async def _mark_cancelled(
+        self,
+        task_id: str,
+        *,
+        cancelled_by: str,
+        cancelled: list[dict[str, Any]],
+        from_statuses: tuple[str, ...] = ("queued",),
+    ) -> dict[str, Any] | None:
+        """把 ``from_statuses`` 内的任务落 cancelled 终态，再级联取消排队中的下游。
+
+        用户取消只从 ``queued`` 转移；进程级打断经 ``finalize_interrupted`` 额外放行
+        ``running``。下游依赖上游完成才会被认领，上游未完成时下游必然仍在排队，级联只需
+        处理 ``queued``。UPDATE 影响 0 行时返回 None。
+        """
         now = utc_now()
         stmt = (
             update(Task)
-            .where(Task.task_id == task_id, Task.status == "queued")
+            .where(Task.task_id == task_id, Task.status.in_(from_statuses))
             .values(
                 status="cancelled",
                 cancelled_by=cancelled_by,
@@ -431,64 +839,158 @@ class TaskRepository(BaseRepository):
             )
         )
         result = await self.session.execute(stmt)
-        if result.rowcount == 0:
+        if rowcount(result) == 0:
             return None
 
         await self.session.flush()
         res = await self.session.execute(select(Task).where(Task.task_id == task_id))
         cancelled_task = res.scalar_one()
         task_data = _task_to_dict(cancelled_task)
-        await self._append_event(
+        self._record_terminal_event(
             task_id=task_id,
             project_name=cancelled_task.project_name,
-            event_type="cancelled",
             status="cancelled",
-            data=task_data,
+            task_type=cancelled_task.task_type,
         )
+
+        # 先把自身入列再级联，响应体里父先于子。
+        cancelled.append(task_data)
+        dependents = await self.session.execute(
+            select(Task.task_id)
+            .where(Task.dependency_task_id == task_id, Task.status == "queued")
+            .order_by(Task.queued_at.asc())
+        )
+        for dep_task_id in dependents.scalars().all():
+            await self._mark_cancelled(dep_task_id, cancelled_by="cascade", cancelled=cancelled)
         return task_data
 
-    async def _cascade_cancel_dependents(
+    async def persist_provider_job_id(
         self,
         task_id: str,
-        cancelled: list[dict[str, Any]],
-        skipped_running: list[dict[str, Any]],
+        job_id: str,
+        *,
+        endpoint: str | None = None,
+        base_url: str | None = None,
     ) -> None:
-        """递归取消依赖于 task_id 的所有 queued 任务。"""
-        result = await self.session.execute(
-            select(Task).where(Task.dependency_task_id == task_id).order_by(Task.queued_at.asc())
-        )
-        for dep_task in result.scalars().all():
-            if dep_task.status == "queued":
-                task_data = await self._mark_cancelled(dep_task.task_id, cancelled_by="cascade")
-                if task_data:
-                    cancelled.append(task_data)
-                    await self._cascade_cancel_dependents(dep_task.task_id, cancelled, skipped_running)
-                else:
-                    # 竞态：初始查询时为 queued 但 UPDATE 失败，刷新检查实际状态
-                    await self.session.refresh(dep_task)
-                    if dep_task.status == "running":
-                        skipped_running.append(_task_to_dict(dep_task))
-            elif dep_task.status == "running":
-                skipped_running.append(_task_to_dict(dep_task))
+        """单独事务持久化 provider_job_id；不带 WHERE 状态守卫（worker 内调用，确定是 running）。
 
-    async def get_cancel_all_preview(self, project_name: str) -> int:
-        """返回项目中当前 queued 状态的任务数量。"""
+        端点信息按维度分列：``endpoint`` 是协议标识（只有自定义供应商有），落 ``provider_endpoint``；
+        ``base_url`` 是本次实际请求的域名（两类供应商通用），落 ``submitted_base_url``。两者都与
+        job_id 同一次 UPDATE 落地：域名必须与 job_id 同时可见，否则续跑拿到 job_id 却无从回放原
+        域名；协议标识同批落地，这笔供应商任务的协议归属才可查。None 时不写对应列——保留既有值比
+        清空更安全（清空等于丢掉协议归属 / 放弃回放）。
+
+        失败抛异常，由 worker finally 兜底 mark_failed（ADR 0007 fail-fast：未持久化的
+        submit 视为整笔失败，避免「幽灵任务」继续在 provider 端跑而 DB 已忘）。
+        """
+        now = utc_now()
+        values: dict[str, Any] = {"provider_job_id": job_id, "updated_at": now}
+        if endpoint is not None:
+            values["provider_endpoint"] = endpoint
+        if base_url is not None:
+            values["submitted_base_url"] = base_url
+        await self.session.execute(update(Task).where(Task.task_id == task_id).values(**values))
+        await self.session.commit()
+
+    async def persist_execution_checkpoint(self, task_id: str, checkpoint_json: str, provider_id: str) -> None:
+        """Persist the once-only pre-submit checkpoint and actual provider atomically.
+
+        The guarded transition is deliberately narrower than ordinary task metadata updates: only a running
+        video task with neither a checkpoint nor a provider job may cross the submit boundary. A
+        zero-row update is an execution conflict and must abort before the provider call.
+        """
         result = await self.session.execute(
-            select(func.count()).select_from(Task).where(Task.project_name == project_name, Task.status == "queued")
+            update(Task)
+            .where(
+                Task.task_id == task_id,
+                Task.task_type.in_(("video", "reference_video")),
+                Task.status == "running",
+                Task.execution_checkpoint_json.is_(None),
+                Task.provider_job_id.is_(None),
+            )
+            .values(
+                execution_checkpoint_json=checkpoint_json,
+                provider_id=provider_id,
+                updated_at=utc_now(),
+            )
         )
+        if rowcount(result) != 1:
+            await self.session.rollback()
+            raise ValueError(f"execution checkpoint persistence guard rejected task: {task_id}")
+        await self.session.commit()
+
+    async def persist_execution_provider_id(self, task_id: str, provider_id: str) -> None:
+        """改写 ``task.provider_id`` 这份排队记录，worker 的池满过滤与槽位归属都按它走。
+
+        写入时机：认领时推算了 provider 的任务（没有记录的存量任务，或记录的 provider 已不支持该
+        媒体类型）写回推算值；执行入口按项目现状解析出的 provider 与记录不一致时，回队前写入实际值，
+        下一次认领即落到新 provider 的槽位。
+        它不锁定 model，也不是执行身份。不带 WHERE 状态守卫，与 ``persist_provider_job_id`` 同理。
+        """
+        now = utc_now()
+        await self.session.execute(
+            update(Task).where(Task.task_id == task_id).values(provider_id=provider_id, updated_at=now)
+        )
+        await self.session.commit()
+
+    async def list_orphan_tasks_on_start(self) -> list[dict[str, Any]]:
+        """返回 running 状态任务用于重启自愈（ADR 0007）。"""
+        result = await self.session.execute(
+            select(Task).where(Task.status == "running").order_by(Task.updated_at.asc())
+        )
+        return [_task_to_dict(t) for t in result.scalars().all()]
+
+    async def finalize_interrupted(self, task_id: str) -> int:
+        """进程级打断的兜底：把被打断的 queued / running 任务落 cancelled，返回受影响行数。
+
+        执行协程被进程级原因（事件循环拆除、关停超时等）打断时由 worker 调用，让任务不停在
+        ``running``、不在每次重启时被重启自愈重新拉起。这不是用户取消：用户取消只对 queued
+        开放，见 ``cancel_task``。本 task 落终态后级联取消排队中的下游。
+        """
+        data = await self._mark_cancelled(
+            task_id,
+            cancelled_by="interrupted",
+            cancelled=[],
+            from_statuses=("queued", "running"),
+        )
+        await self.session.commit()
+        return 1 if data is not None else 0
+
+    async def get_cancel_all_preview(self, project_name: str, *, exclude_media_types: Collection[str] = ()) -> int:
+        """返回项目中当前 queued 状态的任务数量；``exclude_media_types`` 里的媒体类型不计。"""
+        stmt = (
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_name == project_name, Task.status == "queued", Task.media_type.not_in(exclude_media_types)
+            )
+        )
+        result = await self.session.execute(self._scope_query(stmt, Task))
         return result.scalar_one()
 
-    async def cancel_all_queued(self, project_name: str) -> dict[str, Any]:
-        """取消项目中所有 queued 任务。"""
+    async def cancel_all_queued(
+        self, project_name: str, *, exclude_media_types: Collection[str] = ()
+    ) -> dict[str, Any]:
+        """取消项目中所有 queued 任务；``exclude_media_types`` 里的媒体类型不取消。"""
         queued_result = await self.session.execute(
-            select(Task).where(Task.project_name == project_name, Task.status == "queued")
+            self._scope_query(
+                select(Task).where(
+                    Task.project_name == project_name,
+                    Task.status == "queued",
+                    Task.media_type.not_in(exclude_media_types),
+                ),
+                Task,
+            )
         )
-        queued_tasks = list(queued_result.scalars().all())
+        task_ids = [t.task_id for t in queued_result.scalars().all()]
+        if not task_ids:
+            return {"cancelled_count": 0, "skipped_running_count": 0}
 
+        # UPDATE 不经 _scope_query（只接受 Select），按作用域内查出的 id 集合限定目标行
         now = utc_now()
         stmt = (
             update(Task)
-            .where(Task.project_name == project_name, Task.status == "queued")
+            .where(Task.task_id.in_(task_ids), Task.status == "queued")
             .values(
                 status="cancelled",
                 cancelled_by="user",
@@ -497,33 +999,33 @@ class TaskRepository(BaseRepository):
             )
         )
         result = await self.session.execute(stmt)
-        cancelled_count = result.rowcount
+        cancelled_count = rowcount(result)
 
-        if queued_tasks:
-            await self.session.flush()
-            task_ids = [t.task_id for t in queued_tasks]
-            refreshed = await self.session.execute(
-                select(Task).where(Task.task_id.in_(task_ids), Task.status == "cancelled")
+        await self.session.flush()
+        refreshed = await self.session.execute(
+            select(Task).where(Task.task_id.in_(task_ids), Task.status == "cancelled")
+        )
+        for updated_task in refreshed.scalars().all():
+            self._record_terminal_event(
+                task_id=updated_task.task_id,
+                project_name=project_name,
+                status="cancelled",
+                task_type=updated_task.task_type,
             )
-            for updated_task in refreshed.scalars().all():
-                task_data = _task_to_dict(updated_task)
-                await self._append_event(
-                    task_id=updated_task.task_id,
-                    project_name=project_name,
-                    event_type="cancelled",
-                    status="cancelled",
-                    data=task_data,
-                )
 
         await self.session.commit()
         # 竞态时部分任务可能在 UPDATE 前被 worker 领走，skipped = 预期取消数 - 实际取消数
-        skipped = len(queued_tasks) - cancelled_count
+        skipped = len(task_ids) - cancelled_count
         return {
             "cancelled_count": cancelled_count,
             "skipped_running_count": max(0, skipped),
         }
 
     async def requeue_running(self, *, limit: int = 1000) -> int:
+        """救援扳手：批量把 running 任务回队（保留供 ops 手动执行）。
+
+        Worker 启动期不再自动调，改走 ``list_orphan_tasks_on_start`` + ``resume_video``（ADR 0007）。
+        """
         now = utc_now()
         limit = max(1, min(5000, limit))
 
@@ -554,20 +1056,6 @@ class TaskRepository(BaseRepository):
         rows = await self.session.execute(select(Task).where(Task.task_id.in_(task_ids), Task.status == "queued"))
         requeued_tasks = rows.scalars().all()
 
-        # Step 4: bulk-insert all requeue events
-        event_now = utc_now()
-        events = [
-            TaskEvent(
-                task_id=t.task_id,
-                project_name=t.project_name,
-                event_type="requeued",
-                status="queued",
-                data_json=_json_dumps(_task_to_dict(t)),
-                created_at=event_now,
-            )
-            for t in requeued_tasks
-        ]
-        self.session.add_all(events)
         await self.session.commit()
         return len(requeued_tasks)
 
@@ -616,6 +1104,7 @@ class TaskRepository(BaseRepository):
         items_stmt = self._scope_query(items_stmt, Task)
         result = await self.session.execute(items_stmt)
         items = [_task_to_dict(t) for t in result.scalars().all()]
+        await self._attach_running_models(items)
 
         return {
             "items": items,
@@ -623,6 +1112,24 @@ class TaskRepository(BaseRepository):
             "page": page,
             "page_size": page_size,
         }
+
+    async def _attach_running_models(self, items: list[dict[str, Any]]) -> None:
+        """给运行中任务补上实际调用的模型（取该任务最近一次调用记录）；其余任务的 model 为 None。
+
+        排队中的任务还没发出调用，模型尚未解析，使用记录按模型筛选时据此把它们算作不匹配。
+        """
+        for item in items:
+            item["model"] = None
+        running = {item["task_id"]: item for item in items if item["status"] == "running"}
+        if not running:
+            return
+        stmt = (
+            select(ApiCall.task_id, ApiCall.model)
+            .where(ApiCall.task_id.in_(running.keys()))
+            .order_by(ApiCall.started_at.asc(), ApiCall.id.asc())
+        )
+        for task_id, model in (await self.session.execute(stmt)).all():
+            running[task_id]["model"] = model
 
     async def get_stats(self, *, project_name: str | None = None) -> dict[str, int]:
         filters = []
@@ -634,7 +1141,14 @@ class TaskRepository(BaseRepository):
         stmt = self._scope_query(stmt, Task)
         result = await self.session.execute(stmt)
 
-        stats = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "cancelled": 0, "total": 0}
+        stats = {
+            "queued": 0,
+            "running": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "total": 0,
+        }
         total = 0
         for row in result.all():
             s, cnt = row[0], row[1]
@@ -643,47 +1157,6 @@ class TaskRepository(BaseRepository):
             total += cnt
         stats["total"] = total
         return stats
-
-    async def get_recent_tasks_snapshot(
-        self,
-        *,
-        project_name: str | None = None,
-        limit: int = 200,
-    ) -> list[dict[str, Any]]:
-        limit = max(1, min(1000, limit))
-        stmt = select(Task)
-        if project_name:
-            stmt = stmt.where(Task.project_name == project_name)
-        stmt = stmt.order_by(Task.updated_at.desc()).limit(limit)
-        stmt = self._scope_query(stmt, Task)
-
-        result = await self.session.execute(stmt)
-        return [_task_to_dict(t) for t in result.scalars().all()]
-
-    # NOTE: In multi-user mode, override this method to filter by user via JOIN Task
-    async def get_events_since(
-        self,
-        *,
-        last_event_id: int,
-        project_name: str | None = None,
-        limit: int = 200,
-    ) -> list[dict[str, Any]]:
-        limit = max(1, min(1000, limit))
-        stmt = select(TaskEvent).where(TaskEvent.id > last_event_id)
-        if project_name:
-            stmt = stmt.where(TaskEvent.project_name == project_name)
-        stmt = stmt.order_by(TaskEvent.id.asc()).limit(limit)
-
-        result = await self.session.execute(stmt)
-        return [_event_to_dict(e) for e in result.scalars().all()]
-
-    # NOTE: In multi-user mode, override this method to filter by user via JOIN Task
-    async def get_latest_event_id(self, *, project_name: str | None = None) -> int:
-        stmt = select(func.max(TaskEvent.id))
-        if project_name:
-            stmt = stmt.where(TaskEvent.project_name == project_name)
-        result = await self.session.execute(stmt)
-        return result.scalar() or 0
 
     # ---- Worker Lease ----
 
@@ -711,7 +1184,7 @@ class TaskRepository(BaseRepository):
                 updated_at=updated_at,
             )
         )
-        if update_result.rowcount > 0:
+        if rowcount(update_result) > 0:
             await self.session.commit()
             return True
 

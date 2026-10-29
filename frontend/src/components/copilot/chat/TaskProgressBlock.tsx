@@ -1,60 +1,47 @@
+import { useTranslation } from "react-i18next";
 import type { ContentBlock } from "@/types";
-import { useAssistantStore } from "@/stores/assistant-store";
+import { WorkDetail, WorkRow, useSessionDone } from "./WorkRow";
+import { BACKGROUND_TASK_ICON, type WorkStatus } from "./work-label";
 
-interface TaskProgressBlockProps {
-  block: ContentBlock;
+// ---------------------------------------------------------------------------
+// TaskProgressBlock – 没有锚点 tool_use 的后台任务，显示为一行工序，就地更新状态。
+//
+// 有锚点的 task 块由投影折叠进 SubagentCard（task_info），不经过本组件。
+// ---------------------------------------------------------------------------
+
+function taskStatus(block: ContentBlock, sessionDone: boolean): WorkStatus | null {
+  switch (block.status) {
+    case "task_started":
+    case "task_progress":
+      return sessionDone ? "stopped" : "running";
+    case "task_notification":
+      if (block.task_status === "failed") return "error";
+      return block.task_status === "completed" ? "ok" : "stopped";
+    default:
+      return null;
+  }
 }
 
-const TERMINAL_SESSION = new Set(["completed", "error", "interrupted"]);
+export function TaskProgressBlock({ block }: { block: ContentBlock }) {
+  const { t } = useTranslation("dashboard");
+  const sessionDone = useSessionDone();
+  const status = taskStatus(block, sessionDone);
+  if (!status) return null;
 
-export function TaskProgressBlock({ block }: TaskProgressBlockProps) {
-  const sessionStatus = useAssistantStore((s) => s.sessionStatus);
-  const sessionDone = sessionStatus != null && TERMINAL_SESSION.has(sessionStatus);
+  const text = (status === "running" || status === "stopped" ? block.description : block.summary || block.description) ?? "";
+  const tokens = status === "running" ? block.usage?.total_tokens : undefined;
+  const summary = [text, tokens != null ? t("subagent_tokens", { count: tokens }) : ""].filter(Boolean).join(" · ");
+  const input = block.description?.trim() ? block.description : "";
+  const output = block.summary?.trim() ? block.summary : "";
 
-  const status = block.status;
-  const description = block.description || "";
-  const summary = block.summary || "";
-  const taskStatus = block.task_status;
-
-  if (status === "task_started" || status === "task_progress") {
-    // When session is no longer running, show cancelled state instead of spinner
-    if (sessionDone) {
-      return (
-        <div className="my-1 flex items-center gap-1.5 text-xs text-slate-500">
-          <span>{"\u2013"}</span>
-          <span>{description} (已取消)</span>
-        </div>
-      );
-    }
-
-    const tokens = status === "task_progress" ? block.usage?.total_tokens : undefined;
-    return (
-      <div className="my-1 flex items-center gap-1.5 text-xs text-slate-400">
-        <span className="inline-block h-3 w-3 animate-spin rounded-full border border-slate-500 border-t-transparent" />
-        <span>
-          {status === "task_started" ? `子任务开始: ${description}` : description}
-          {tokens != null && ` (tokens: ${tokens})`}
-        </span>
-      </div>
-    );
-  }
-
-  if (status === "task_notification") {
-    const isCompleted = taskStatus === "completed";
-    const isFailed = taskStatus === "failed";
-    return (
-      <div
-        className={`my-1 flex items-center gap-1.5 text-xs ${
-          isFailed ? "text-red-400" : isCompleted ? "text-green-400" : "text-slate-400"
-        }`}
-      >
-        <span>{isCompleted ? "\u2713" : isFailed ? "\u2717" : "\u2013"}</span>
-        <span>
-          子任务{isCompleted ? "完成" : isFailed ? "失败" : "结束"}: {summary || description}
-        </span>
-      </div>
-    );
-  }
-
-  return null;
+  return (
+    <WorkRow icon={BACKGROUND_TASK_ICON} name={t("work_background_task")} summary={summary} status={status}>
+      {(input || output) && (
+        <>
+          {input && <WorkDetail label={t("tool_call_input_label")} text={input} />}
+          {output && <WorkDetail label={t("tool_call_result_label")} text={output} error={status === "error"} />}
+        </>
+      )}
+    </WorkRow>
+  );
 }

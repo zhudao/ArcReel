@@ -1,24 +1,63 @@
-import { useState, useCallback, useMemo, useEffect, useRef } from "react";
-import { voidPromise } from "@/utils/async";
-import { Route, Switch, Redirect, useLocation } from "wouter";
+import { useCallback } from "react";
+import { errMsg, voidPromise } from "@/utils/async";
+import { Route, Switch, Redirect } from "wouter";
+import {
+  WORKSPACE_ROUTE_CHARACTERS,
+  WORKSPACE_ROUTE_SCENES,
+  WORKSPACE_ROUTE_PROPS,
+  WORKSPACE_ROUTE_PRODUCTS,
+  WORKSPACE_ROUTE_EPISODES,
+  WORKSPACE_ROUTE_FILES,
+} from "@/app-routes";
 import { useTranslation } from "react-i18next";
 import { useProjectsStore } from "@/stores/projects-store";
+import { refreshAfterWrite } from "@/components/canvas/shared/refreshAfterWrite";
+import { useDemoWorkbench } from "@/onboarding/use-demo-workbench";
+import { isDemoProject } from "@/onboarding/demo-project";
 import { useAppStore } from "@/stores/app-store";
-import { useTasksStore } from "@/stores/tasks-store";
-import { LorebookGallery } from "./lorebook/LorebookGallery";
+import { useConfigStatusStore } from "@/stores/config-status-store";
+import { useActiveResourceIds } from "@/stores/tasks-store";
 import { TimelineCanvas } from "./timeline/TimelineCanvas";
-import { OverviewCanvas } from "./OverviewCanvas";
-import { SourceFileViewer } from "./SourceFileViewer";
-import { AddCharacterForm } from "./lorebook/AddCharacterForm";
-import { AddClueForm } from "./lorebook/AddClueForm";
+import { OverviewCanvas } from "./overview/OverviewCanvas";
+import { WorkspaceNotFound } from "./WorkspaceNotFound";
+import { EpisodesView } from "./episodes/EpisodesView";
+import { FileView } from "./files/FileView";
+import { CharactersPage } from "./lorebook/CharactersPage";
+import { ScenesPage } from "./lorebook/ScenesPage";
+import { PropsPage } from "./lorebook/PropsPage";
+import { ProductsPage } from "./lorebook/ProductsPage";
+import { EpisodePage } from "./episode-page/EpisodePage";
+import { LazyBoundary } from "@/components/shared/LazyBoundary";
+import { lazyNamed } from "@/utils/lazy-component";
 import { API } from "@/api";
-import { buildEntityRevisionKey } from "@/utils/project-changes";
-import { getProviderModels, getCustomProviderModels, lookupSupportedDurations } from "@/utils/provider-models";
-import type { Clue, CustomProviderInfo, ProviderInfo } from "@/types";
+import {
+  enqueueCharacter,
+  enqueueEpisodeNarration,
+  enqueueGrid,
+  enqueueNarration,
+  enqueueProduct,
+  enqueueProp,
+  enqueueScene,
+  enqueueStoryboard,
+  enqueueVideo,
+} from "@/actions/generation";
+import {
+  durationOutOfRangeReason,
+  useModelCapabilities,
+} from "@/hooks/useModelCapabilities";
+import { gridStoryboardEnabled, normalizeRoute } from "@/utils/generation-mode";
 import type { EpisodeScript } from "@/types/script";
 
+// 参考生视频与多宫格画布只服务对应生成模式的项目，按需拉取；最常见的逐镜分镜画布
+// （TimelineCanvas）与资产、分集页面保持随工作区加载。
+const ReferenceVideoCanvas = lazyNamed(() => import("./reference/ReferenceVideoCanvas"), "ReferenceVideoCanvas");
+const GridImageToVideoCanvas = lazyNamed(() => import("./grid/GridImageToVideoCanvas"), "GridImageToVideoCanvas");
+
+/** 集级路由 path，与渲染该集的 `<Route>` 共用一份。 */
+const EPISODE_ROUTE_PATH = `/${WORKSPACE_ROUTE_EPISODES}/:episodeId`;
+
 // ---------------------------------------------------------------------------
-// resolveSegmentPrompt — shared segment lookup for generate storyboard/video
+// resolveSegmentPrompt -- shared segment lookup for generate storyboard/video
 // ---------------------------------------------------------------------------
 
 type PromptField = "image_prompt" | "video_prompt";
@@ -33,10 +72,13 @@ function resolveSegmentPrompt(
   if (!resolvedFile) return null;
   const script = scripts[resolvedFile];
   if (!script) return null;
+  if ("video_units" in script) return null;
   const seg =
     script.content_mode === "narration"
       ? script.segments.find((s) => s.segment_id === segmentId)
-      : script.scenes.find((s) => s.scene_id === segmentId);
+      : script.content_mode === "ad"
+        ? script.shots.find((s) => s.shot_id === segmentId)
+        : script.scenes.find((s) => s.scene_id === segmentId);
   return {
     resolvedFile,
     prompt: seg?.[field] ?? "",
@@ -45,290 +87,341 @@ function resolveSegmentPrompt(
 }
 
 // ---------------------------------------------------------------------------
-// StudioCanvasRouter — reads Zustand store data and renders the correct
+// StudioCanvasRouter -- reads Zustand store data and renders the correct
 // canvas view based on the nested route within /app/projects/:projectName.
 // ---------------------------------------------------------------------------
 
 export function StudioCanvasRouter() {
   const { t } = useTranslation("dashboard");
-  const tRef = useRef(t);
-  // eslint-disable-next-line react-hooks/refs -- tRef 是稳定 event-handler ref 模式，用于在回调中获取最新 t 而不触发无限 useCallback 重建
-  tRef.current = t;
-  const { currentProjectData, currentProjectName, currentScripts } =
+  const { currentProjectData, currentProjectName, currentScripts, projectDetailLoading } =
     useProjectsStore();
+  // 演示态：资产画布仍走 readOnly 透传，工作台时间线的只读则由组件自己直读同一判定。
+  // useDemoWorkbench() 已把路由参数与 store 的判定滞后收口在单一来源，此处直接消费。
+  const demoMode = useDemoWorkbench();
 
-  const [addingCharacter, setAddingCharacter] = useState(false);
-  const [addingClue, setAddingClue] = useState(false);
+  // 演示态不发真实能力请求。demoMode 演示→真实切换时先于 store 变为 false，
+  // currentProjectName 单独判一次兜住这一帧仍读到旧演示项目名的窗口。
+  const capabilitiesEnabled = !demoMode && !isDemoProject(currentProjectName);
 
-  const [providers, setProviders] = useState<ProviderInfo[]>([]);
-  const [customProviders, setCustomProviders] = useState<CustomProviderInfo[]>([]);
-  const [globalVideoBackend, setGlobalVideoBackend] = useState("");
+  // 逐个分镜的时长编辑器候选取经联动约束收窄后的集合，用户就选不到入队后必然被拒的组合；
+  // 已保存的越界值不改写，由 ShotDetail 按成因给警告并引导重选。
+  // 不传候选模型、分辨率与参考图路径：服务端按项目生成模式解析实际执行的
+  // i2v/r2v 桶模型及其已保存档位。传项目默认 `video_backend` 会覆盖细分桶、与执行期错位。
+  // 能力按项目生成模式定轴、全项目同一口径，故不带集号。
+  const capabilities = useModelCapabilities({
+    projectName: currentProjectName,
+    enabled: capabilitiesEnabled,
+  });
 
-  useEffect(() => {
-    let disposed = false;
-    Promise.all([getProviderModels(), getCustomProviderModels(), API.getSystemConfig()]).then(
-      ([provList, customList, configRes]) => {
-        if (disposed) return;
-        setProviders(provList);
-        setCustomProviders(customList);
-        setGlobalVideoBackend(configRes.settings?.default_video_backend ?? "");
-      },
-    ).catch(() => {});
-    return () => { disposed = true; };
-  }, []);
+  // 从任务队列派生 loading 状态（替代本地 state）：活跃 + 最新行胜出两条不变量下沉到 store selector
+  const generatingCharacterNames = useActiveResourceIds("character", currentProjectName);
+  const generatingSceneNames = useActiveResourceIds("scene", currentProjectName);
+  const generatingPropNames = useActiveResourceIds("prop", currentProjectName);
+  const generatingProductNames = useActiveResourceIds("product", currentProjectName);
 
-  const durationOptions = useMemo(() => {
-    const backend = currentProjectData?.video_backend || globalVideoBackend;
-    if (!backend) return undefined;
-    return lookupSupportedDurations(providers, backend, customProviders);
-  }, [providers, customProviders, globalVideoBackend, currentProjectData?.video_backend]);
+  // 刷新项目数据；返回本地 store 是否已同步成功，供调用方决定是否推进依赖新顺序的 UI 状态。
+  // 在途合并 + 失败留旧收敛于 projects-store 的 refreshProject，此处仅表达意图。
+  // "cancelled"（项目切换取消域轮换等）与 "failed" 在这里都不算已同步，统一按 false
+  // 处理。这里不提示：只留给自带专属提示的调用方（分镜保存经 PartialSaveError、结构编辑），
+  // 其余写入后的刷新走下面的 refreshAfterAction。
+  const refreshProject = useCallback(
+    (invalidateKeys: string[] = []): Promise<boolean> =>
+      currentProjectName
+        ? useProjectsStore
+            .getState()
+            .refreshProject(currentProjectName, { invalidateKeys })
+            .then((result) => result === "success")
+        : Promise.resolve(false),
+    [currentProjectName],
+  );
 
-  // 从任务队列派生 loading 状态（替代本地 state）
-  const tasks = useTasksStore((s) => s.tasks);
-  const generatingCharacterNames = useMemo(() => {
-    const names = new Set<string>();
-    for (const t of tasks) {
-      if (
-        t.task_type === "character" &&
-        t.project_name === currentProjectName &&
-        (t.status === "queued" || t.status === "running")
-      ) {
-        names.add(t.resource_id);
-      }
-    }
-    return names;
-  }, [tasks, currentProjectName]);
-  const generatingClueNames = useMemo(() => {
-    const names = new Set<string>();
-    for (const t of tasks) {
-      if (
-        t.task_type === "clue" &&
-        t.project_name === currentProjectName &&
-        (t.status === "queued" || t.status === "running")
-      ) {
-        names.add(t.resource_id);
-      }
-    }
-    return names;
-  }, [tasks, currentProjectName]);
-
-  // 刷新项目数据
-  const refreshProject = useCallback(async (invalidateKeys: string[] = []) => {
-    if (!currentProjectName) return;
-    try {
-      const res = await API.getProject(currentProjectName);
-      useProjectsStore.getState().setCurrentProject(
-        currentProjectName,
-        res.project,
-        res.scripts ?? {},
-        res.asset_fingerprints,
-      );
-      if (invalidateKeys.length > 0) {
-        useAppStore.getState().invalidateEntities(invalidateKeys);
-      }
-    } catch {
-      // 静默失败
-    }
-  }, [currentProjectName]);
+  // 写入成功后的刷新：失败时提示（见 refreshAfterWrite），resolve 为本地 store 是否已同步，
+  // 调用方据此决定是否推进依赖新数据的后续动作（选中态跟随、报告成功）。
+  const refreshAfterAction = useCallback(
+    async (): Promise<boolean> =>
+      currentProjectName ? (await refreshAfterWrite(currentProjectName, t)) === "success" : false,
+    [currentProjectName, t],
+  );
 
   // ---- Timeline action callbacks ----
   // These receive scriptFile from TimelineCanvas so they always use the active episode's script.
-  const handleUpdatePrompt = useCallback(async (segmentId: string, field: string, value: unknown, scriptFile?: string) => {
-    if (!currentProjectName) return;
+  // 分镜详情编辑单元的保存：PATCH 失败时如实抛错，由编辑单元显示在未保存提示条上。
+  // resolve 为本地 store 是否已同步到新剧本；PATCH 已落库但刷新失败或被取消时为 false，
+  // 此时 store 仍是旧剧本，接着生成会拿旧提示词入队，调用方据此不再继续生成。
+  const handleUpdatePrompt = useCallback(async (
+    segmentId: string,
+    patch: Record<string, unknown>,
+    scriptFile?: string,
+  ): Promise<boolean> => {
+    if (!currentProjectName) throw new Error(t("common:no_project_selected"));
     const mode = currentProjectData?.content_mode ?? "narration";
-    try {
-      if (mode === "drama") {
-        await API.updateScene(currentProjectName, segmentId, scriptFile ?? "", { [field]: value });
-      } else {
-        await API.updateSegment(currentProjectName, segmentId, { script_file: scriptFile, [field]: value });
-      }
-      await refreshProject();
-    } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("update_prompt_failed", { message: (err as Error).message }), "error");
+    if (mode === "ad") {
+      await API.updateShot(currentProjectName, segmentId, scriptFile ?? "", patch);
+    } else if (mode === "drama") {
+      await API.updateScene(currentProjectName, segmentId, scriptFile ?? "", patch);
+    } else {
+      await API.updateSegment(currentProjectName, segmentId, { script_file: scriptFile, ...patch });
     }
-  }, [currentProjectName, currentProjectData, refreshProject]);
+    return refreshProject();
+  }, [currentProjectName, currentProjectData, refreshProject, t]);
 
+  // 分镜改序（各形态通用）：把分镜移到 afterId 之后，null 移到最前。
+  // 返回是否移动成功，供编辑器把选中态跟随到分镜的新位置。
+  const handleMoveShot = useCallback(async (
+    shotId: string,
+    afterId: string | null,
+    scriptFile?: string,
+  ): Promise<boolean> => {
+    if (!currentProjectName || !currentScripts) return false;
+    const resolvedFile = scriptFile ?? Object.keys(currentScripts)[0];
+    if (!resolvedFile) return false;
+    try {
+      await API.moveScriptItem(currentProjectName, resolvedFile, shotId, afterId);
+      // 仅在本地 store 已写回新顺序时报告成功：刷新失败时 segments 仍是旧序，
+      // 此时让选中态跟随新位置会静默切到别的分镜。
+      return await refreshAfterAction();
+    } catch (err) {
+      useAppStore.getState().pushToast(t("reorder_shot_failed", { message: errMsg(err) }), "error");
+      return false;
+    }
+  }, [currentProjectName, currentScripts, refreshAfterAction, t]);
+
+  // 时间线新增 / 移除分镜：服务端按当前剧本 revision 执行，这里不取快照。
+  // 写入一经提交即报告成功：随后的本地刷新失败时只提示重新加载，不让调用方保持可重试，
+  // 否则重试会再新增一条分镜或对已移除的分镜再发一次移除。
+  const refreshAfterStructureEdit = useCallback(async () => {
+    if (!(await refreshProject())) {
+      useAppStore.getState().pushToast(t("shot_structure_refresh_failed"), "warning");
+    }
+  }, [refreshProject, t]);
+
+  // afterId 为 null 时追加到末尾（空脚本里即第一条）。
+  const handleInsertShot = useCallback(async (
+    afterId: string | null,
+    novelText: string | undefined,
+    scriptFile?: string,
+  ): Promise<boolean> => {
+    if (!currentProjectName || !currentScripts) return false;
+    const resolvedFile = scriptFile ?? Object.keys(currentScripts)[0];
+    if (!resolvedFile) return false;
+    try {
+      await API.insertScriptItem(currentProjectName, resolvedFile, { afterId: afterId ?? undefined, novelText });
+    } catch (err) {
+      useAppStore.getState().pushToast(t("shot_insert_failed", { message: errMsg(err) }), "error");
+      return false;
+    }
+    await refreshAfterStructureEdit();
+    return true;
+  }, [currentProjectName, currentScripts, refreshAfterStructureEdit, t]);
+
+  const handleRemoveShot = useCallback(async (itemId: string, scriptFile?: string): Promise<boolean> => {
+    if (!currentProjectName || !currentScripts) return false;
+    const resolvedFile = scriptFile ?? Object.keys(currentScripts)[0];
+    if (!resolvedFile) return false;
+    try {
+      await API.removeScriptItem(currentProjectName, itemId, resolvedFile);
+    } catch (err) {
+      useAppStore.getState().pushToast(t("shot_remove_failed", { message: errMsg(err) }), "error");
+      return false;
+    }
+    await refreshAfterStructureEdit();
+    return true;
+  }, [currentProjectName, currentScripts, refreshAfterStructureEdit, t]);
+
+  const handleUpdateEpisodeTitle = useCallback(async (episode: number, title: string) => {
+    if (!currentProjectName) return;
+    try {
+      await API.updateEpisode(currentProjectName, episode, { title });
+    } catch (err) {
+      useAppStore.getState().pushToast(t("episode_title_update_failed", { message: errMsg(err) }), "error");
+      throw err; // 让 EditableEpisodeTitle 保持编辑态，不误清空
+    }
+    // 标题已保存：刷新失败只提示，不让标题停在编辑态引人重复提交
+    await refreshAfterAction();
+  }, [currentProjectName, refreshAfterAction, t]);
+
+  // 生成回调在调用时读 store 里的最新剧本，不用渲染时的闭包：「保存并生成」在同一次点击里先保存、
+  // 刷新剧本再生成，此刻调用的仍是点击前那次渲染的回调，闭包里是保存前的提示词。
   const handleGenerateStoryboard = useCallback(async (segmentId: string, scriptFile?: string) => {
-    if (!currentProjectName || !currentScripts) return;
-    const resolved = resolveSegmentPrompt(currentScripts, segmentId, "image_prompt", scriptFile);
+    const scripts = useProjectsStore.getState().currentScripts;
+    if (!currentProjectName || !scripts) return;
+    const resolved = resolveSegmentPrompt(scripts, segmentId, "image_prompt", scriptFile);
     if (!resolved) return;
     try {
-      await API.generateStoryboard(
+      await enqueueStoryboard(
         currentProjectName,
         segmentId,
         resolved.prompt as string | Record<string, unknown>,
         resolved.resolvedFile,
       );
-      useAppStore.getState().pushToast(tRef.current("storyboard_task_submitted_toast", { id: segmentId }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("generate_storyboard_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(t("generate_storyboard_failed", { message: errMsg(err) }), "error");
     }
-  }, [currentProjectName, currentScripts]);
+  }, [currentProjectName, t]);
 
   const handleGenerateVideo = useCallback(async (segmentId: string, scriptFile?: string) => {
-    if (!currentProjectName || !currentScripts) return;
-    const resolved = resolveSegmentPrompt(currentScripts, segmentId, "video_prompt", scriptFile);
+    const scripts = useProjectsStore.getState().currentScripts;
+    if (!currentProjectName || !scripts) return;
+    const resolved = resolveSegmentPrompt(scripts, segmentId, "video_prompt", scriptFile);
     if (!resolved) return;
     try {
-      await API.generateVideo(
+      await enqueueVideo(
         currentProjectName,
         segmentId,
         resolved.prompt as string | Record<string, unknown>,
         resolved.resolvedFile,
         resolved.duration,
       );
-      useAppStore.getState().pushToast(tRef.current("video_task_submitted_toast", { id: segmentId }), "success");
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("generate_video_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(t("generate_video_failed", { message: errMsg(err) }), "error");
     }
-  }, [currentProjectName, currentScripts]);
+  }, [currentProjectName, t]);
 
-  // ---- Character CRUD callbacks ----
-  const handleSaveCharacter = useCallback(async (
-    name: string,
-    payload: {
-      description: string;
-      voiceStyle: string;
-      referenceFile?: File | null;
-    },
-  ) => {
-    if (!currentProjectName) return;
+  // 未配置 audio 供应商时在前端就给出清晰提示（后端入队前还有同语义的 400 兜底）
+  const ensureAudioProviderConfigured = useCallback((): boolean => {
+    const cfg = useConfigStatusStore.getState();
+    if (cfg.initialized && !cfg.hasMediaType("audio")) {
+      useAppStore.getState().pushToast(t("audio_provider_not_configured_toast"), "error");
+      return false;
+    }
+    return true;
+  }, [t]);
+
+  const handleGenerateNarration = useCallback(async (segmentId: string, scriptFile?: string) => {
+    if (!currentProjectName || !currentScripts) return;
+    if (!ensureAudioProviderConfigured()) return;
+    const resolvedFile = scriptFile ?? Object.keys(currentScripts)[0];
+    if (!resolvedFile) return;
     try {
-      await API.updateCharacter(currentProjectName, name, {
-        description: payload.description,
-        voice_style: payload.voiceStyle,
-      });
-
-      if (payload.referenceFile) {
-        await API.uploadFile(
-          currentProjectName,
-          "character_ref",
-          payload.referenceFile,
-          name,
-        );
-      }
-
-      await refreshProject(
-        payload.referenceFile
-          ? [buildEntityRevisionKey("character", name)]
-          : [],
-      );
-      useAppStore.getState().pushToast(tRef.current("character_updated_toast", { name }), "success");
+      await enqueueNarration(currentProjectName, segmentId, resolvedFile);
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("update_character_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(t("generate_narration_failed", { message: errMsg(err) }), "error");
     }
-  }, [currentProjectName, refreshProject]);
+  }, [currentProjectName, currentScripts, ensureAudioProviderConfigured, t]);
 
+  const handleGenerateEpisodeNarration = useCallback(async (scriptFile?: string) => {
+    if (!currentProjectName || !currentScripts) return;
+    if (!ensureAudioProviderConfigured()) return;
+    const resolvedFile = scriptFile ?? Object.keys(currentScripts)[0];
+    if (!resolvedFile) return;
+    try {
+      await enqueueEpisodeNarration(currentProjectName, resolvedFile);
+    } catch (err) {
+      useAppStore.getState().pushToast(t("generate_narration_failed", { message: errMsg(err) }), "error");
+    }
+  }, [currentProjectName, currentScripts, ensureAudioProviderConfigured, t]);
+
+  // 后期配音项目不生成旁白配音：收起画布上的生成入口，已有配音照常试听。
+  const narrationGenerationEnabled = currentProjectData?.narration_delivery === "use_tts";
+
+  // ---- Workflow panel callbacks ----
+  // 面板只陈述状态，动作交回既有入口执行：跳转复用 Agent 定位用的同一条 scrollTarget 缝，
+  // 重生复用本组件已有的入队回调。面板不自建播放器，也不自建入队路径。
+  const handleViewWorkflowUnit = useCallback((unitId: string) => {
+    useAppStore.getState().triggerScrollTo({
+      type: normalizeRoute(currentProjectData?.generation_mode) === "reference_video"
+        ? "reference_unit"
+        : "segment",
+      id: unitId,
+    });
+  }, [currentProjectData?.generation_mode]);
+
+  // 剧本文件由调用方按当前剧集给出：多集项目里 currentScripts 装着全部剧集，
+  // 取第一个键会把重生打到别集的剧本上，用户看到的是另一集被重做。
+  const handleWorkflowRegenerate = useCallback(async (
+    stepId: string,
+    unitIds: string[],
+    scriptFile: string,
+  ) => {
+    if (!currentProjectName || !currentScripts) return;
+    for (const unitId of unitIds) {
+      try {
+        if (stepId === "storyboard") {
+          // react-doctor-disable-next-line react-doctor/async-await-in-loop -- 逐个入队保持任务队列与画布单元同序，并发提交会打乱入队顺序
+          await handleGenerateStoryboard(unitId, scriptFile);
+        } else if (stepId === "video") {
+          await handleGenerateVideo(unitId, scriptFile);
+        }
+      } catch (err) {
+        useAppStore.getState().pushToast(t("generate_video_failed", { message: errMsg(err) }), "error");
+      }
+    }
+  }, [
+    currentProjectName,
+    currentScripts,
+    handleGenerateStoryboard,
+    handleGenerateVideo,
+    t,
+  ]);
+
+  // ---- Asset sheet generation callbacks ----
   const handleGenerateCharacter = useCallback(async (name: string) => {
     if (!currentProjectName) return;
     try {
-      await API.generateCharacter(
-        currentProjectName,
-        name,
-        currentProjectData?.characters?.[name]?.description ?? "",
-      );
-      useAppStore
-        .getState()
-        .pushToast(tRef.current("character_task_submitted_toast", { name }), "success");
+      await enqueueCharacter(currentProjectName, name);
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("submit_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(t("submit_failed", { message: errMsg(err) }), "error");
     }
-  }, [currentProjectName, currentProjectData]);
+  }, [currentProjectName, t]);
 
-  const handleAddCharacterSubmit = useCallback(async (
-    name: string,
-    description: string,
-    voiceStyle: string,
-    referenceFile?: File | null,
-  ) => {
+  const handleGenerateScene = useCallback(async (name: string) => {
     if (!currentProjectName) return;
     try {
-      await API.addCharacter(currentProjectName, name, description, voiceStyle);
-
-      if (referenceFile) {
-        await API.uploadFile(currentProjectName, "character_ref", referenceFile, name);
-      }
-
-      await refreshProject(
-        referenceFile
-          ? [buildEntityRevisionKey("character", name)]
-          : [],
-      );
-      setAddingCharacter(false);
-      useAppStore.getState().pushToast(tRef.current("character_added_toast", { name }), "success");
+      await enqueueScene(currentProjectName, name);
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("add_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(t("submit_failed", { message: errMsg(err) }), "error");
     }
-  }, [currentProjectName, refreshProject]);
+  }, [currentProjectName, t]);
 
-  // ---- Clue CRUD callbacks ----
-  const handleUpdateClue = useCallback(async (name: string, updates: Partial<Clue>) => {
+  const handleGenerateProp = useCallback(async (name: string) => {
     if (!currentProjectName) return;
     try {
-      await API.updateClue(currentProjectName, name, updates);
-      await refreshProject();
+      await enqueueProp(currentProjectName, name);
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("update_clue_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(t("submit_failed", { message: errMsg(err) }), "error");
     }
-  }, [currentProjectName, refreshProject]);
+  }, [currentProjectName, t]);
 
-  const handleGenerateClue = useCallback(async (name: string) => {
+  const handleGenerateProduct = useCallback(async (name: string) => {
     if (!currentProjectName) return;
     try {
-      await API.generateClue(
-        currentProjectName,
-        name,
-        currentProjectData?.clues?.[name]?.description ?? "",
-      );
-      useAppStore
-        .getState()
-        .pushToast(tRef.current("clue_task_submitted_toast", { name }), "success");
+      await enqueueProduct(currentProjectName, name);
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("submit_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(t("submit_failed", { message: errMsg(err) }), "error");
     }
-  }, [currentProjectName, currentProjectData]);
-
-  const handleAddClueSubmit = useCallback(async (name: string, clueType: string, description: string, importance: string) => {
-    if (!currentProjectName) return;
-    try {
-      await API.addClue(currentProjectName, name, clueType, description, importance);
-      await refreshProject();
-      setAddingClue(false);
-      useAppStore.getState().pushToast(tRef.current("clue_added_toast", { name }), "success");
-    } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("add_failed", { message: (err as Error).message }), "error");
-    }
-  }, [currentProjectName, refreshProject]);
+  }, [currentProjectName, t]);
 
   const handleGenerateGrid = useCallback(async (episode: number, scriptFile: string, sceneIds?: string[]) => {
     if (!currentProjectName) return;
     try {
-      const result = await API.generateGrid(currentProjectName, episode, scriptFile, sceneIds);
-      useAppStore.getState().pushToast(result.message, "success");
+      await enqueueGrid(currentProjectName, episode, scriptFile, sceneIds);
     } catch (err) {
-      useAppStore.getState().pushToast(tRef.current("grid_generation_failed", { message: (err as Error).message }), "error");
+      useAppStore.getState().pushToast(t("grid_generation_failed", { message: errMsg(err) }), "error");
     }
-  }, [currentProjectName]);
+  }, [currentProjectName, t]);
 
-  const handleRestoreAsset = useCallback(async () => {
-    await refreshProject();
-  }, [refreshProject]);
+  // 版本恢复与媒体上传之后的刷新；resolve 为是否已同步，调用方据此决定是否报告成功。
+  const handleRestoreAsset = refreshAfterAction;
 
-  const handleUpdateClueVoid = useCallback((...args: Parameters<typeof handleUpdateClue>) => {
-    void handleUpdateClue(...args).catch(console.error);
-  }, [handleUpdateClue]);
   const handleGenerateCharacterVoid = useCallback((...args: Parameters<typeof handleGenerateCharacter>) => {
     void handleGenerateCharacter(...args).catch(console.error);
   }, [handleGenerateCharacter]);
-  const handleGenerateClueVoid = useCallback((...args: Parameters<typeof handleGenerateClue>) => {
-    void handleGenerateClue(...args).catch(console.error);
-  }, [handleGenerateClue]);
+  const handleGenerateSceneVoid = useCallback((...args: Parameters<typeof handleGenerateScene>) => {
+    void handleGenerateScene(...args).catch(console.error);
+  }, [handleGenerateScene]);
+  const handleGeneratePropVoid = useCallback((...args: Parameters<typeof handleGenerateProp>) => {
+    void handleGenerateProp(...args).catch(console.error);
+  }, [handleGenerateProp]);
+  const handleGenerateProductVoid = useCallback((...args: Parameters<typeof handleGenerateProduct>) => {
+    void handleGenerateProduct(...args).catch(console.error);
+  }, [handleGenerateProduct]);
 
-  const [location] = useLocation();
-
-  if (!currentProjectName) {
+  // `currentProjectName` 在详情到达前就已落地（见 router.tsx 首屏加载的注释），
+  // 仅查它会在深链（/characters 等）直接打开或详情较慢时把空集合渲染成可交互的
+  // 「空项目」页面；`projectDetailLoading` 才是详情是否已到达的信号。
+  if (!currentProjectName || projectDetailLoading) {
     return (
-      <div className="flex h-full items-center justify-center text-gray-500">
+      <div className="flex h-full items-center justify-center text-muted-foreground">
         {t("loading_placeholder")}
       </div>
     );
@@ -340,89 +433,206 @@ export function StudioCanvasRouter() {
         <OverviewCanvas
           projectName={currentProjectName}
           projectData={currentProjectData}
+          readOnly={demoMode}
         />
       </Route>
 
-      <Route path="/lorebook">
-        <Redirect to="/characters" />
-      </Route>
-
-      {/* Characters & Clues share one LorebookGallery to avoid remount flash */}
-      {(location === "/characters" || location === "/clues") && (
-        <div className="p-4">
-          <LorebookGallery
-            projectName={currentProjectName}
-            characters={currentProjectData?.characters ?? {}}
-            clues={currentProjectData?.clues ?? {}}
-            mode={location === "/clues" ? "clues" : "characters"}
-            onSaveCharacter={handleSaveCharacter}
-            onUpdateClue={handleUpdateClueVoid}
-            onGenerateCharacter={handleGenerateCharacterVoid}
-            onGenerateClue={handleGenerateClueVoid}
-            onRestoreCharacterVersion={handleRestoreAsset}
-            onRestoreClueVersion={handleRestoreAsset}
-            generatingCharacterNames={generatingCharacterNames}
-            generatingClueNames={generatingClueNames}
-            onAddCharacter={() => setAddingCharacter(true)}
-            onAddClue={() => setAddingClue(true)}
-          />
-          {addingCharacter && (
-            <AddCharacterForm
-              onSubmit={handleAddCharacterSubmit}
-              onCancel={() => setAddingCharacter(false)}
-            />
-          )}
-          {addingClue && (
-            <AddClueForm
-              onSubmit={handleAddClueSubmit}
-              onCancel={() => setAddingClue(false)}
-            />
-          )}
-        </div>
-      )}
-
-      <Route path="/source/:filename">
-        {(params) => (
-          <SourceFileViewer
-            projectName={currentProjectName}
-            filename={decodeURIComponent(params.filename)}
-          />
+      <Route path={`/${WORKSPACE_ROUTE_EPISODES}`}>
+        {/* 演示项目后端不存在，广告/短片恒单集、不经分集；侧栏已隐藏入口，这里兜底直接输入 URL 的情形 */}
+        {demoMode || currentProjectData?.content_mode === "ad" ? (
+          <Redirect to="/" />
+        ) : (
+          <EpisodesView key={currentProjectName} projectName={currentProjectName} />
         )}
       </Route>
 
-      <Route path="/episodes/:episodeId">
+      <Route path={`/${WORKSPACE_ROUTE_CHARACTERS}`}>
+        <CharactersPage
+          key={currentProjectName}
+          projectName={currentProjectName}
+          characters={currentProjectData?.characters ?? {}}
+          readOnly={demoMode}
+          onGenerateCharacter={handleGenerateCharacterVoid}
+          onRestoreCharacterVersion={handleRestoreAsset}
+          onRefreshProject={refreshAfterAction}
+          generatingCharacterNames={generatingCharacterNames}
+        />
+      </Route>
+
+      <Route path={`/${WORKSPACE_ROUTE_SCENES}`}>
+        <ScenesPage
+          key={currentProjectName}
+          projectName={currentProjectName}
+          scenes={currentProjectData?.scenes ?? {}}
+          readOnly={demoMode}
+          onGenerateScene={handleGenerateSceneVoid}
+          onRestoreSceneVersion={handleRestoreAsset}
+          onRefreshProject={refreshAfterAction}
+          generatingSceneNames={generatingSceneNames}
+        />
+      </Route>
+
+      <Route path={`/${WORKSPACE_ROUTE_PROPS}`}>
+        <PropsPage
+          key={currentProjectName}
+          projectName={currentProjectName}
+          props={currentProjectData?.props ?? {}}
+          readOnly={demoMode}
+          onGenerateProp={handleGeneratePropVoid}
+          onRestorePropVersion={handleRestoreAsset}
+          onRefreshProject={refreshAfterAction}
+          generatingPropNames={generatingPropNames}
+        />
+      </Route>
+
+      <Route path={`/${WORKSPACE_ROUTE_PRODUCTS}`}>
+        <ProductsPage
+          key={currentProjectName}
+          projectName={currentProjectName}
+          products={currentProjectData?.products ?? {}}
+          readOnly={demoMode}
+          onGenerateProduct={handleGenerateProductVoid}
+          onRestoreProductVersion={handleRestoreAsset}
+          onRefreshProject={refreshAfterAction}
+          generatingProductNames={generatingProductNames}
+        />
+      </Route>
+
+      <Route path={`/${WORKSPACE_ROUTE_FILES}`}>
+        {/* 演示项目后端不存在，侧栏已隐藏入口，这里兜底直接输入 URL 的情形 */}
+        {demoMode ? <Redirect to="/" /> : <FileView key={currentProjectName} projectName={currentProjectName} />}
+      </Route>
+
+      <Route path={EPISODE_ROUTE_PATH}>
         {(params) => {
           const epNum = parseInt(params.episodeId, 10);
-          const episode = currentProjectData?.episodes?.find(
-            (e) => e.episode === epNum,
-          );
+          const episode = currentProjectData?.episodes?.find((e) => e.episode === epNum);
           const scriptFile = episode?.script_file?.replace(/^scripts\//, "");
-          const script = scriptFile
-            ? (currentScripts[scriptFile] ?? null)
-            : null;
-
-          const hasDraft = episode?.script_status === "segmented" || episode?.script_status === "generated";
-
+          const script = scriptFile ? (currentScripts[scriptFile] ?? null) : null;
+          const route = normalizeRoute(currentProjectData?.generation_mode);
+          // 服务端已按项目生成模式（是否走参考图路径）与已保存分辨率收窄。
+          // reference_video 的参考图约束按 unit 而非按集生效：每个 unit 落哪个桶、可选哪些档位
+          // 由服务端按可用参考图逐单元判定，随单元列表到达（reference-video-store），不从这里下发。
+          const durationOptions = capabilities.supportedDurations ?? undefined;
+          // 内容确认页按剧本规划档位选时长：端点固定时 supportedDurations 为空，规划仍有借用档位。
+          const planDurationOptions = capabilities.planningDurations ?? undefined;
+          const durationWarningReason = (seconds: number) =>
+            durationOutOfRangeReason(seconds, capabilities);
+          // 档位空集的两种成因说给用户听的不是同一句：型号没登记时长 vs 这份 workflow 自己定片长。
+          const durationEndpointFixed = capabilities.durationEndpointFixed;
+          const hasDraft =
+            episode?.script_status === "segmented" || episode?.script_status === "generated";
+          const isAd = currentProjectData?.content_mode === "ad";
           return (
-            <TimelineCanvas
-              key={epNum}
+            <EpisodePage
               projectName={currentProjectName}
               episode={epNum}
-              episodeTitle={episode?.title}
-              hasDraft={hasDraft}
-              episodeScript={script}
-              scriptFile={scriptFile ?? undefined}
               projectData={currentProjectData}
-              durationOptions={durationOptions}
-              onUpdatePrompt={voidPromise(handleUpdatePrompt)}
-              onGenerateStoryboard={voidPromise(handleGenerateStoryboard)}
-              onGenerateVideo={voidPromise(handleGenerateVideo)}
-              onGenerateGrid={voidPromise(handleGenerateGrid)}
-              onRestoreStoryboard={handleRestoreAsset}
-              onRestoreVideo={handleRestoreAsset}
+              script={script}
+              demo={demoMode}
+              onSaveTitle={(title) => handleUpdateEpisodeTitle(epNum, title)}
+              onViewUnit={handleViewWorkflowUnit}
+              // 参考生视频的视频入队由 ReferenceVideoCanvas 自己的整批准入判定路径承担，
+              // 本组件的逐单元回调对 video_units 剧本解不出提示词、按下去毫无反应。
+              // 该生成模式只给「查看」跳转，重生入口在跳过去的那张单元卡上。
+              onRegenerate={
+                route === "reference_video" || !scriptFile
+                  ? undefined
+                  : (stepId, unitIds) => void handleWorkflowRegenerate(stepId, unitIds, scriptFile)
+              }
+              renderCanvas={({ view, onViewChange }) => (
+                // 懒加载画布的 chunk 未到达或加载失败时只在画布区域显示占位，页头与视图切换保持可见
+                <LazyBoundary variant="pane">
+                  {route === "reference_video" ? (
+                    <ReferenceVideoCanvas
+                      // 同一 epNum 跨项目不 remount 会让 optimisticUnitIds / prevTaskStatusRef
+                      // 残留上个项目的状态（例如 "E1U1" 长驻 set 里），切到同名 unit 的新项目
+                      // 时 "optimistic && !hasQueueRow" 会误判 busy。改 key 到 project::episode
+                      // 让实例天然按项目隔离，避免显式 pruning 逻辑。
+                      key={`${currentProjectName}::${epNum}`}
+                      projectName={currentProjectName}
+                      episode={epNum}
+                      view={view}
+                      onViewChange={onViewChange}
+                      hasScript={Boolean(script)}
+                      showPreprocess={!isAd}
+                      freeDuration={isAd}
+                      videoModelUnresolved={capabilities.videoModelUnresolved}
+                      planDurationOptions={planDurationOptions}
+                    />
+                  ) : gridStoryboardEnabled(currentProjectData) ? (
+                    <GridImageToVideoCanvas
+                      key={`${currentProjectName}::${epNum}`}
+                      projectName={currentProjectName}
+                      episode={epNum}
+                      view={view}
+                      onViewChange={onViewChange}
+                      hasDraft={hasDraft}
+                      episodeScript={script}
+                      scriptFile={scriptFile ?? undefined}
+                      projectData={currentProjectData}
+                      durationOptions={durationOptions}
+                      planDurationOptions={planDurationOptions}
+                      durationWarningReason={durationWarningReason}
+                      durationEndpointFixed={durationEndpointFixed}
+                      videoModelUnresolved={capabilities.videoModelUnresolved}
+                      lastFrame={capabilities.lastFrame}
+                      capabilitiesLoading={capabilities.loading}
+                      onUpdatePrompt={handleUpdatePrompt}
+                      onGenerateStoryboard={voidPromise(handleGenerateStoryboard)}
+                      onGenerateVideo={handleGenerateVideo}
+                      onGenerateNarration={narrationGenerationEnabled ? voidPromise(handleGenerateNarration) : undefined}
+                      onGenerateEpisodeNarration={narrationGenerationEnabled ? voidPromise(handleGenerateEpisodeNarration) : undefined}
+                      onGenerateGrid={handleGenerateGrid}
+                      onRestoreStoryboard={handleRestoreAsset}
+                      onRestoreVideo={handleRestoreAsset}
+                      onMoveShot={handleMoveShot}
+                      onInsertShot={handleInsertShot}
+                      onRemoveShot={handleRemoveShot}
+                    />
+                  ) : (
+                    <TimelineCanvas
+                      // 和 ReferenceVideoCanvas (上方) 同理：同 epNum 跨项目不 remount
+                      // 会让 TimelineCanvas 内部的 useState / useRef（选中 scene、草稿缓冲、
+                      // 滚动位置等）残留上一个项目的值。key 带上 projectName 天然按项目隔离。
+                      key={`${currentProjectName}::${epNum}`}
+                      projectName={currentProjectName}
+                      episode={epNum}
+                      view={view}
+                      onViewChange={onViewChange}
+                      hasDraft={hasDraft}
+                      episodeScript={script}
+                      scriptFile={scriptFile ?? undefined}
+                      projectData={currentProjectData}
+                      durationOptions={durationOptions}
+                      planDurationOptions={planDurationOptions}
+                      durationWarningReason={durationWarningReason}
+                      durationEndpointFixed={durationEndpointFixed}
+                      videoModelUnresolved={capabilities.videoModelUnresolved}
+                      lastFrame={capabilities.lastFrame}
+                      capabilitiesLoading={capabilities.loading}
+                      onUpdatePrompt={handleUpdatePrompt}
+                      onMoveShot={handleMoveShot}
+                      onInsertShot={handleInsertShot}
+                      onRemoveShot={handleRemoveShot}
+                      onGenerateStoryboard={voidPromise(handleGenerateStoryboard)}
+                      onGenerateVideo={handleGenerateVideo}
+                      onGenerateNarration={narrationGenerationEnabled ? voidPromise(handleGenerateNarration) : undefined}
+                      onGenerateEpisodeNarration={narrationGenerationEnabled ? voidPromise(handleGenerateEpisodeNarration) : undefined}
+                      onRestoreStoryboard={handleRestoreAsset}
+                      onRestoreVideo={handleRestoreAsset}
+                    />
+                  )}
+                </LazyBoundary>
+              )}
             />
           );
         }}
+      </Route>
+
+      {/* 没有路由承接的子路径（含已移除的 lorebook、clues）：画布内显示空状态，外壳保留 */}
+      <Route>
+        <WorkspaceNotFound />
       </Route>
     </Switch>
   );

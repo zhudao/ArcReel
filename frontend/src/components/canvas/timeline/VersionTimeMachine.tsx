@@ -1,177 +1,188 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { useCallback, useEffect, useId, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
-import { ChevronDown, ChevronRight, History } from "lucide-react";
+import { ChevronDown, Download, History } from "lucide-react";
+import { cn } from "cn";
 import { API, type VersionInfo } from "@/api";
+import { Badge } from "@/components/ui/badge";
+import { Button, buttonVariants } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useProjectsStore } from "@/stores/projects-store";
+import { errMsg } from "@/utils/async";
+import { useTrackWrite } from "@/components/canvas/lorebook/useAssetWrites";
+import { PresentationPlayer } from "@/components/shared/PresentationPlayer";
 
 interface VersionTimeMachineProps {
   projectName: string;
-  resourceType: "storyboards" | "videos" | "characters" | "clues";
+  resourceType: "storyboards" | "videos" | "audio" | "characters" | "character_derivatives" | "scenes" | "props" | "products" | "reference_videos" | "grids";
   resourceId: string;
-  onRestore?: (version: number) => void | Promise<void>;
+  onRestore?: (version: number) => void | Promise<unknown>;
+  /** Icon-only trigger button: hides label and chevron for narrow card headers. */
+  iconOnly?: boolean;
+  /** Allow preview/download history without exposing the restore mutation. */
+  readOnly?: boolean;
+  /**
+   * 同资源正被生成/编辑占用（含 image_edit 乐观占用）：禁用版本恢复。
+   * image_edit 任务完成时会无条件把 current 覆盖为编辑结果，占用期间恢复旧版本会
+   * 显示成功但随后被编辑任务覆盖，用户最后一次选择丢失。
+   */
+  busy?: boolean;
+  /**
+   * 恢复请求在途状态回传父级：`busy` 只做「外部占用 → 禁恢复」这一向，兄弟控件
+   * （生成、上传）还需反向知道恢复正在写同一个资源文件，否则恢复返回前它们仍可点，
+   * 两个请求并发写同一路径、后完成者覆盖前者且双方都提示成功。
+   */
+  onRestoringChange?: (restoring: boolean) => void;
+  /**
+   * 提交时刻的占用复核（新鲜读）：`busy` 是最近一次渲染的快照，版本面板打开期间
+   * Agent 入队、批量入口或轮询落库都可能占用该资源，新 prop 冲刷到按钮之前的点击
+   * 仍会发出恢复请求，与在跑的任务并发写同一个资源文件。返回 true 即拒绝本次恢复。
+   */
+  checkBusy?: () => boolean;
+  /**
+   * 受控打开：由外部（如卡片的「更多」菜单）决定开合，不渲染自己的触发按钮，
+   * 弹层按 `anchor` 定位，关闭后焦点回到它。
+   */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  anchor?: RefObject<HTMLElement | null>;
 }
 
 function getImagePreviewHeightClass(
   resourceType: VersionTimeMachineProps["resourceType"],
 ): string {
-  if (resourceType === "characters") return "h-80";
-  if (resourceType === "clues") return "h-56";
+  if (resourceType === "characters" || resourceType === "character_derivatives") return "h-80";
+  if (resourceType === "scenes" || resourceType === "props" || resourceType === "products") return "h-56";
   return "h-64";
 }
 
-/** Find all scrollable ancestor elements. */
-function getScrollParents(el: HTMLElement): HTMLElement[] {
-  const parents: HTMLElement[] = [];
-  let node: HTMLElement | null = el.parentElement;
-  while (node) {
-    const s = getComputedStyle(node);
-    if (/(auto|scroll)/.test(s.overflow + s.overflowY)) parents.push(node);
-    node = node.parentElement;
-  }
-  return parents;
+// 预览选中态记在所属资源身份与版本指纹之下：资源或其版本改变后不沿用另一份资源的选中
+interface VersionSelection {
+  projectName: string;
+  resourcePath: string;
+  fingerprint: number | null;
+  version: number;
 }
 
+/**
+ * 资源的历史版本：触发按钮打开弹层，列出版本号，选中一个即预览媒体与生成说明，
+ * 非当前版本可切换为当前。弹层随触发按钮定位，滚动时跟随，不会自行关闭。
+ */
 export function VersionTimeMachine({
   projectName,
   resourceType,
   resourceId,
   onRestore,
+  iconOnly = false,
+  readOnly = false,
+  busy = false,
+  onRestoringChange,
+  checkBusy,
+  open: controlledOpen,
+  onOpenChange,
+  anchor,
 }: VersionTimeMachineProps) {
-  const { t } = useTranslation("dashboard");
+  const { t } = useTranslation(["dashboard", "common"]);
+  const track = useTrackWrite();
+  const titleId = useId();
+  const busyHintId = useId();
   const resourcePath =
     resourceType === "storyboards" ? `storyboards/scene_${resourceId}.png` :
     resourceType === "videos" ? `videos/scene_${resourceId}.mp4` :
+    resourceType === "reference_videos" ? `reference_videos/${resourceId}.mp4` :
+    resourceType === "audio" ? `audio/segment_${resourceId}.wav` :
     resourceType === "characters" ? `characters/${resourceId}.png` :
-    `clues/${resourceId}.png`;
+    // 衍生的 resource id 本身是 `本体/衍生`，两段原样成为路径层级。
+    resourceType === "character_derivatives" ? `characters/derivatives/${resourceId}.png` :
+    resourceType === "scenes" ? `scenes/${resourceId}.png` :
+    resourceType === "grids" ? `grids/${resourceId}.png` :
+    resourceType === "products" ? `products/${resourceId}.png` :
+    `props/${resourceId}.png`;
   const resourceFp = useProjectsStore((s) => s.getAssetFingerprint(resourcePath));
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  const controlled = controlledOpen !== undefined;
+  const open = controlled ? controlledOpen : uncontrolledOpen;
 
-  const [open, setOpen] = useState(false);
-  const [panelPos, setPanelPos] = useState<{ top: number; left: number } | null>(null);
   const [versions, setVersions] = useState<VersionInfo[]>([]);
   const [currentVersion, setCurrentVersion] = useState(0);
   const [loading, setLoading] = useState(false);
-  const [loadedOnce, setLoadedOnce] = useState(false);
-  const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
+  const [reload, setReload] = useState(0);
+  const [selection, setSelection] = useState<VersionSelection | null>(null);
+  const selectedVersion =
+    selection?.projectName === projectName &&
+    selection.resourcePath === resourcePath &&
+    selection.fingerprint === resourceFp
+      ? selection.version
+      : null;
   const [restoringVersion, setRestoringVersion] = useState<number | null>(null);
+  const setOpen = (next: boolean) => {
+    if (!next && restoringVersion !== null) return;
+    if (controlled) onOpenChange?.(next);
+    else setUncontrolledOpen(next);
+  };
 
-  // Reset version list when the underlying resource changes so it's re-fetched
-  // on next open. Do NOT close the panel — if it's open and a new generation
-  // completes, the user should stay in context and see the refreshed list.
-  useEffect(() => {
-    setVersions([]);
-    setCurrentVersion(0);
-    setLoading(false);
-    setLoadedOnce(false);
-    setSelectedVersion(null);
-    setRestoringVersion(null);
-  }, [resourceFp, projectName, resourceId, resourceType]);
-
-  // Fetch versions once when panel first opens
-  useEffect(() => {
-    if (!open || loadedOnce || !resourceId) return;
-    void loadVersions();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- loadVersions 是组件内普通函数，无法稳定化；加入 deps 会导致每次渲染重复触发
-  }, [open, loadedOnce, resourceId]);
-
-  async function loadVersions() {
+  const loadVersions = useCallback(async (signal: AbortSignal) => {
     setLoading(true);
     try {
-      const data = await API.getVersions(projectName, resourceType, resourceId);
+      const data = await API.getVersions(projectName, resourceType, resourceId, { signal });
+      if (signal.aborted) return;
       setVersions(data.versions);
       setCurrentVersion(data.current_version);
-      setLoadedOnce(true);
     } catch {
-      setVersions([]);
+      if (!signal.aborted) setVersions([]);
     } finally {
-      setLoading(false);
+      // react-doctor-disable-next-line react-doctor/no-loading-flag-reset-outside-finally -- 已在 finally 中复位；被 abort 时由接管的新一轮加载负责复位
+      if (!signal.aborted) setLoading(false);
     }
-  }
+  }, [projectName, resourceType, resourceId]);
+
+  useEffect(() => {
+    if (!open || !resourceId) return;
+    const controller = new AbortController();
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- 打开或资源更新时启动带取消信号的版本加载，并同步展示加载状态
+    void loadVersions(controller.signal);
+    return () => controller.abort();
+  }, [open, resourceId, resourceFp, reload, loadVersions]);
+
 
   async function handleRestore(version: number) {
+    // disabled 是响应式的 restoringVersion/busy：面板打开期间资源转为占用中时随之更新，
+    // 这里兜底防止禁用态生效前的一次点击仍发出恢复请求。
+    if (busy || restoringVersion !== null) return;
+    // 渲染快照之外再做一次新鲜读：状态已变、渲染未到的窗口里按钮仍可点。
+    if (checkBusy?.()) {
+      useAppStore.getState().pushToast(t("version_restore_busy_hint"), "error");
+      return;
+    }
     setRestoringVersion(version);
+    onRestoringChange?.(true);
     try {
-      const result = await API.restoreVersion(projectName, resourceType, resourceId, version);
-      if (result.asset_fingerprints) {
-        useProjectsStore.getState().updateAssetFingerprints(result.asset_fingerprints);
-      }
-      await onRestore?.(version);
-      await loadVersions();
-      setSelectedVersion(version);
-      useAppStore.getState().pushToast(t("switched_to_version", { version }), "success");
+      await track((async () => {
+        const result = await API.restoreVersion(projectName, resourceType, resourceId, version);
+        if (result.asset_fingerprints) {
+          useProjectsStore.getState().updateAssetFingerprints(result.asset_fingerprints);
+        }
+        await onRestore?.(version);
+        setReload((current) => current + 1);
+        // 切换结果直接体现在「当前」标记与媒体上，成功时不弹提示；恢复已换了指纹，按最新指纹记选中
+        setSelection({
+          projectName,
+          resourcePath,
+          fingerprint: useProjectsStore.getState().getAssetFingerprint(resourcePath),
+          version,
+        });
+      })());
     } catch (err) {
       useAppStore
         .getState()
-        .pushToast(t("switch_version_failed", { message: (err as Error).message }), "error");
+        .pushToast(t("switch_version_failed", { message: errMsg(err) }), "error");
     } finally {
       setRestoringVersion(null);
+      onRestoringChange?.(false);
     }
   }
-
-  // Close the panel
-  const close = useCallback(() => setOpen(false), []);
-
-  // Compute ideal top position given the trigger rect and panel height
-  const computeTop = useCallback(
-    (triggerRect: DOMRect, panelHeight: number) => {
-      const GAP = 8;
-      return triggerRect.bottom + GAP + panelHeight > window.innerHeight
-        ? Math.max(GAP, triggerRect.top - GAP - panelHeight)
-        : triggerRect.bottom + GAP;
-    },
-    [],
-  );
-
-  // Re-position panel after it mounts or resizes
-  const panelCallbackRef = useCallback(
-    (node: HTMLDivElement | null) => {
-      panelRef.current = node;
-      if (!node || !triggerRef.current) return;
-      const rect = triggerRef.current.getBoundingClientRect();
-      const top = computeTop(rect, node.offsetHeight);
-      setPanelPos((prev) =>
-        prev && Math.abs(prev.top - top) > 1 ? { ...prev, top } : prev,
-      );
-    },
-    [computeTop],
-  );
-
-  // Position panel & register dismiss listeners
-  useEffect(() => {
-    if (!open || !triggerRef.current) {
-      setPanelPos(null);
-      return;
-    }
-    const rect = triggerRef.current.getBoundingClientRect();
-    // Use estimated height for initial placement; panelCallbackRef corrects after mount
-    const top = computeTop(rect, 320);
-    setPanelPos({ top, left: rect.right });
-
-    // Close on scroll (any scrollable ancestor)
-    const scrollParents = getScrollParents(triggerRef.current);
-    for (const sp of scrollParents) {
-      sp.addEventListener("scroll", close, { passive: true, once: true });
-    }
-
-    // Close on click outside
-    function onMouseDown(e: MouseEvent) {
-      if (
-        panelRef.current?.contains(e.target as Node) ||
-        triggerRef.current?.contains(e.target as Node)
-      )
-        return;
-      close();
-    }
-    document.addEventListener("mousedown", onMouseDown);
-
-    return () => {
-      for (const sp of scrollParents) sp.removeEventListener("scroll", close);
-      document.removeEventListener("mousedown", onMouseDown);
-    };
-  }, [open, close, computeTop]);
 
   if (!resourceId) return null;
 
@@ -180,154 +191,169 @@ export function VersionTimeMachine({
     selectedVersion != null
       ? versions.find((v) => v.version === selectedVersion) ?? null
       : null;
+  const label = t("version_mgmt");
+
+  const trigger = controlled ? null : iconOnly ? (
+    <Tooltip>
+      <TooltipTrigger
+        render={<PopoverTrigger render={<Button variant="ghost" size="icon-sm" aria-label={label} />} />}
+      >
+        <History aria-hidden />
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  ) : (
+    <PopoverTrigger render={<Button variant="ghost" size="xs" className="group/version" />}>
+      <History aria-hidden data-icon="inline-start" />
+      {label}
+      <ChevronDown
+        aria-hidden
+        data-icon="inline-end"
+        className="transition-transform duration-fast group-aria-expanded/version:rotate-180"
+      />
+    </PopoverTrigger>
+  );
 
   return (
-    <div>
-      <button
-        ref={triggerRef}
-        type="button"
-        onClick={() => setOpen((prev) => !prev)}
-        className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-gray-400 transition-colors hover:bg-gray-800 hover:text-gray-200"
-      >
-        <History className="h-3 w-3" />
-        <span>{t("version_mgmt")}</span>
-        {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-      </button>
+    <Popover open={open} onOpenChange={setOpen}>
+      {trigger}
+      <PopoverContent align="end" anchor={anchor} finalFocus={anchor}>
+        <div className="flex items-center justify-between gap-2">
+          <PopoverTitle id={titleId}>{t("history_versions")}</PopoverTitle>
+          {currentVersion > 0 && (
+            <Badge variant="secondary">
+              <span className="num">{t("current_version", { version: currentVersion })}</span>
+            </Badge>
+          )}
+        </div>
 
-      {open &&
-        panelPos &&
-        createPortal(
-          <div
-            ref={panelCallbackRef}
-            style={{
-              position: "fixed",
-              top: panelPos.top,
-              left: panelPos.left,
-              transform: "translateX(-100%)",
-            }}
-            className="z-[9999] w-64 rounded-xl border border-gray-700 bg-gray-900/95 p-3 shadow-2xl shadow-black/40 backdrop-blur"
-          >
-            {loading ? (
-              <span className="text-xs text-gray-500">{t("common:loading")}</span>
-            ) : versions.length === 0 ? (
-              <div className="space-y-1">
-                <p className="text-[11px] font-medium text-gray-300">{t("no_history")}</p>
-                <p className="text-[11px] leading-5 text-gray-500">
-                  {t("history_hint")}
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {/* Header */}
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
-                    {t("history_versions")}
+        {loading ? (
+          <p className="text-xs text-subtle-foreground">{t("common:loading")}</p>
+        ) : versions.length === 0 ? (
+          <div className="flex flex-col gap-1">
+            <p className="text-sm">{t("no_history")}</p>
+            <p className="text-xs text-subtle-foreground">{t("history_hint")}</p>
+          </div>
+        ) : (
+          <>
+            <ToggleGroup
+              aria-labelledby={titleId}
+              variant="outline"
+              size="sm"
+              className="flex-wrap"
+              value={selectedVersion != null ? [String(selectedVersion)] : []}
+              onValueChange={(next: string[]) =>
+                setSelection(next[0] ? { projectName, resourcePath, fingerprint: resourceFp, version: Number(next[0]) } : null)
+              }
+            >
+              {versions.map((v) => (
+                <ToggleGroupItem key={v.version} value={String(v.version)}>
+                  <span className="num">v{v.version}</span>
+                  {v.is_current ? <span aria-hidden className="size-1.5 rounded-full bg-primary" /> : null}
+                </ToggleGroupItem>
+              ))}
+            </ToggleGroup>
+
+            {selectedInfo ? (
+              <div className="flex flex-col gap-2 rounded-md bg-muted/50 p-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+                    <span className="num text-sm font-medium">v{selectedInfo.version}</span>
+                    {selectedInfo.source === "image_edit" && (
+                      <Badge variant="outline">{t("version_image_edit_badge")}</Badge>
+                    )}
+                    <span className="num text-xs text-subtle-foreground">{selectedInfo.created_at}</span>
                   </span>
-                  {currentVersion > 0 && (
-                    <span className="rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] font-medium text-indigo-200">
-                      {t("current_version", { version: currentVersion })}
-                    </span>
-                  )}
+                  {selectedInfo.is_current ? (
+                    <Badge variant="secondary">{t("current_version_badge")}</Badge>
+                  ) : !readOnly && selectedInfo.restorable !== false ? (
+                    <Button
+                      size="xs"
+                      disabled={restoringVersion !== null || busy}
+                      aria-describedby={busy ? busyHintId : undefined}
+                      onClick={() => void handleRestore(selectedInfo.version)}
+                    >
+                      {restoringVersion === selectedInfo.version ? t("switching_version") : t("switch_to_version")}
+                    </Button>
+                  ) : null}
                 </div>
-
-                {/* Version pills */}
-                <div className="flex flex-wrap gap-1.5">
-                  {versions.map((v) => {
-                    const isCurrent = v.is_current;
-                    const isSelected = selectedVersion === v.version;
-                    return (
-                      <button
-                        key={v.version}
-                        type="button"
-                        onClick={() =>
-                          setSelectedVersion((prev) =>
-                            prev === v.version ? null : v.version,
-                          )
-                        }
-                        className={
-                          "rounded-full px-2.5 py-1 text-[10px] font-medium transition-colors " +
-                          (isSelected
-                            ? "bg-indigo-600 text-white ring-1 ring-indigo-400"
-                            : isCurrent
-                              ? "bg-indigo-500/15 text-indigo-300 ring-1 ring-indigo-500/30"
-                              : "bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white")
-                        }
-                      >
-                        v{v.version}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {!selectedInfo && (
-                  <p className="text-[10px] leading-4 text-gray-400">
-                    {t("version_click_hint")}
+                {busy && !selectedInfo.is_current && !readOnly && selectedInfo.restorable !== false ? (
+                  <p id={busyHintId} className="text-xs text-subtle-foreground">
+                    {t("version_restore_busy_hint")}
                   </p>
-                )}
+                ) : null}
 
-                {/* Preview area */}
-                {selectedInfo && (
-                  <div className="rounded-xl border border-gray-700 bg-gray-950/80 p-2.5">
-                    <div className="mb-2 flex items-center justify-between gap-2">
-                      <span className="text-[11px] font-medium text-gray-200">
-                        v{selectedInfo.version}
-                        <span className="ml-1.5 text-[10px] font-normal text-gray-500">
-                          {selectedInfo.created_at}
-                        </span>
-                      </span>
-                      {selectedInfo.is_current ? (
-                        <span className="shrink-0 rounded-full bg-indigo-500/10 px-2 py-0.5 text-[10px] font-medium text-indigo-300">
-                          {t("current_version_badge")}
-                        </span>
-                      ) : (
-                        <button
-                          type="button"
-                          disabled={restoringVersion !== null}
-                          onClick={() => void handleRestore(selectedInfo.version)}
-                          className="shrink-0 rounded-full bg-indigo-600 px-2.5 py-0.5 text-[10px] font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-50"
-                        >
-                          {restoringVersion === selectedInfo.version ? t("switching_version") : t("switch_to_version")}
-                        </button>
-                      )}
-                    </div>
-
-                    {/* Media preview */}
-                    {selectedInfo.file_url &&
-                      (resourceType === "videos" ? (
-                        // eslint-disable-next-line jsx-a11y/media-has-caption -- 生成式预览视频暂无字幕源，将来如引入字幕生成则移除此 disable
+                {selectedInfo.file_url &&
+                  (resourceType === "videos" || resourceType === "reference_videos" ? (
+                    <div className="aspect-video w-full overflow-hidden rounded-md bg-black">
+                      {selectedInfo.presentation_available !== true ? (
+                        // eslint-disable-next-line jsx-a11y/media-has-caption -- 无法进入共享成片读取器的历史视频仅展示原始媒体
                         <video
                           src={selectedInfo.file_url}
-                          className="mb-2 w-full rounded-lg border border-gray-800 bg-black object-contain"
+                          aria-label={t("version_preview_alt", { version: selectedInfo.version })}
+                          className="size-full object-contain"
                           controls
                           playsInline
                           preload="none"
                         />
                       ) : (
-                        <div
-                          className={`mb-2 flex w-full items-center justify-center rounded-lg border border-gray-800 bg-gray-900/70 p-2 ${getImagePreviewHeightClass(resourceType)}`}
-                        >
-                          <img
-                            src={selectedInfo.file_url}
-                            alt={t("version_preview_alt", { version: selectedInfo.version })}
-                            className="max-h-full w-full object-contain"
-                          />
-                        </div>
-                      ))}
+                        <PresentationPlayer
+                          key={`${resourceType}:${resourceId}:${selectedInfo.version}`}
+                          projectName={projectName}
+                          resourceType={resourceType}
+                          resourceId={resourceId}
+                          videoVersion={selectedInfo.version}
+                        />
+                      )}
+                    </div>
+                  ) : resourceType === "audio" ? (
+                    // eslint-disable-next-line jsx-a11y/media-has-caption -- 历史旁白的文字记录显示在同一预览卡片
+                    <audio
+                      src={selectedInfo.file_url}
+                      aria-label={t("version_audio_preview_label", { version: selectedInfo.version })}
+                      className="h-9 w-full"
+                      controls
+                      preload="metadata"
+                    />
+                  ) : (
+                    <div
+                      className={cn(
+                        "flex w-full items-center justify-center rounded-md bg-background p-2",
+                        getImagePreviewHeightClass(resourceType),
+                      )}
+                    >
+                      <img
+                        src={selectedInfo.file_url}
+                        alt={t("version_preview_alt", { version: selectedInfo.version })}
+                        className="max-h-full w-full object-contain"
+                      />
+                    </div>
+                  ))}
 
-                    {/* Prompt text */}
-                    <p className="line-clamp-4 text-[11px] leading-5 text-gray-400">
-                      {selectedInfo.prompt || t("version_no_notes")}
-                    </p>
-
-
-                  </div>
+                {resourceType === "audio" && selectedInfo.file_url && (
+                  <a
+                    href={selectedInfo.file_url}
+                    download
+                    className={cn(buttonVariants({ variant: "outline", size: "xs" }), "self-start")}
+                  >
+                    <Download aria-hidden data-icon="inline-start" />
+                    {t("version_download_audio")}
+                  </a>
                 )}
 
+                <p className="line-clamp-4 text-xs text-subtle-foreground">
+                  {selectedInfo.prompt ||
+                    (selectedInfo.source === "manual_upload"
+                      ? t("version_manual_upload")
+                      : t("version_no_notes"))}
+                </p>
               </div>
+            ) : (
+              <p className="text-xs text-subtle-foreground">{t("version_click_hint")}</p>
             )}
-          </div>,
-          document.body,
+          </>
         )}
-    </div>
+      </PopoverContent>
+    </Popover>
   );
 }

@@ -14,14 +14,14 @@ from sqlalchemy.exc import IntegrityError
 
 from lib.db import async_session_factory
 from lib.db.repositories.api_key_repository import ApiKeyRepository
-from lib.i18n import Translator
 from server.auth import (
     API_KEY_PREFIX,
     CurrentUser,
     CurrentUserInfo,
-    _hash_api_key,
+    hash_api_key,
     invalidate_api_key_cache,
 )
+from server.i18n import Translator
 
 router = APIRouter()
 
@@ -71,13 +71,13 @@ class ApiKeyInfo(BaseModel):
 @router.post("/api-keys", status_code=201)
 async def create_api_key(
     body: CreateApiKeyRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ) -> CreateApiKeyResponse:
     """创建新 API Key。完整 key 仅在响应中出现一次，之后无法再查看。"""
-    _require_jwt_auth(_user, _t)
+    _require_jwt_auth(user, _t)
     key = _generate_api_key()
-    key_hash = _hash_api_key(key)
+    key_hash = hash_api_key(key)
     key_prefix = key[:8]  # e.g. "arc-abcd"
 
     if body.expires_days == 0:
@@ -88,17 +88,16 @@ async def create_api_key(
         expires_at = _default_expires_at()
 
     try:
-        async with async_session_factory() as session:
-            async with session.begin():
-                repo = ApiKeyRepository(session)
-                row = await repo.create(
-                    name=body.name,
-                    key_hash=key_hash,
-                    key_prefix=key_prefix,
-                    expires_at=expires_at,
-                )
-    except IntegrityError:
-        raise HTTPException(status_code=409, detail=_t("api_key_name_exists", name=body.name))
+        async with async_session_factory() as session, session.begin():
+            repo = ApiKeyRepository(session)
+            row = await repo.create(
+                name=body.name,
+                key_hash=key_hash,
+                key_prefix=key_prefix,
+                expires_at=expires_at,
+            )
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail=_t("api_key_name_exists", name=body.name)) from exc
 
     return CreateApiKeyResponse(
         id=row["id"],
@@ -112,15 +111,14 @@ async def create_api_key(
 
 @router.get("/api-keys")
 async def list_api_keys(
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ) -> list[ApiKeyInfo]:
     """查询所有 API Key 的元数据（不含完整 key）。"""
-    _require_jwt_auth(_user, _t)
-    async with async_session_factory() as session:
-        async with session.begin():
-            repo = ApiKeyRepository(session)
-            rows = await repo.list_all()
+    _require_jwt_auth(user, _t)
+    async with async_session_factory() as session, session.begin():
+        repo = ApiKeyRepository(session)
+        rows = await repo.list_all()
 
     return [ApiKeyInfo(**row) for row in rows]
 
@@ -128,22 +126,21 @@ async def list_api_keys(
 @router.delete("/api-keys/{key_id}", status_code=204)
 async def delete_api_key(
     key_id: int,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ) -> None:
     """删除（吊销）指定 API Key，并立即清除内存缓存。"""
-    _require_jwt_auth(_user, _t)
-    async with async_session_factory() as session:
-        async with session.begin():
-            repo = ApiKeyRepository(session)
-            row = await repo.get_by_id(key_id)
-            if row is None:
-                raise HTTPException(status_code=404, detail=_t("api_key_not_found", key_id=key_id))
-            key_hash = row["key_hash"]
-            # 先失效缓存再删库：即使事务提交后崩溃，缓存也已清除，
-            # 不会出现 DB 已删但缓存仍有效的宽限窗口。
-            invalidate_api_key_cache(key_hash)
-            deleted = await repo.delete(key_id)
+    _require_jwt_auth(user, _t)
+    async with async_session_factory() as session, session.begin():
+        repo = ApiKeyRepository(session)
+        row = await repo.get_by_id(key_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=_t("api_key_not_found", key_id=key_id))
+        key_hash = row["key_hash"]
+        # 先失效缓存再删库：即使事务提交后崩溃，缓存也已清除，
+        # 不会出现 DB 已删但缓存仍有效的宽限窗口。
+        invalidate_api_key_cache(key_hash)
+        deleted = await repo.delete(key_id)
 
     if not deleted:
         raise HTTPException(status_code=404, detail=_t("api_key_not_found", key_id=key_id))
