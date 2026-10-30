@@ -211,6 +211,7 @@ MESSAGES = {
     "asset_field_must_be_string": "该字段的值必须是文本",
     "asset_field_must_be_string_list": "该字段的值必须是文本列表",
     "asset_field_invalid_value": "该字段的值不合法",
+    "asset_sheet_file_not_owned": "「{name}」的资产图只能用它自己名下的图，请为它单独上传或生成",
     "asset_reference_file_not_owned": "「{name}」的参考图和参考音频只能用它自己名下的文件，请为它单独上传",
     "invalid_asset_type": "资产类型必须为 character / scene / prop",
     "invalid_asset_filename": "文件名不能包含路径分隔符或 ..",
@@ -590,6 +591,7 @@ MESSAGES = {
     # Image Capability
     "image_endpoint_mismatch_no_i2i": "模型 {model} 仅支持文生图（不支持 /v1/images/edits）；请去掉参考图或换一个支持图生图的模型",
     "image_endpoint_mismatch_no_t2i": "模型 {model} 仅支持图生图（必须传参考图）；请提供参考图或换一个支持文生图的模型",
+    "image_seedream_edits_unavailable": "模型 {model} 当前的调用端点不支持带参考图生成；请在模型设置里把调用端点改为「火山方舟 (Seedream)」后重试",
     "image_capability_missing_i2i": "{provider}/{model} 不支持图生图；请配置一个支持图生图的默认模型",
     "image_capability_missing_t2i": "{provider}/{model} 不支持文生图；请配置一个支持文生图的默认模型",
     "image_dashscope_4k_t2i_only": "模型 {model} 的 4K 输出仅 wan2.7-image-pro 文生图支持；请改用 2K 或更低分辨率",

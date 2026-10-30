@@ -216,6 +216,7 @@ MESSAGES = {
     "asset_field_must_be_string": "this field must be a text value",
     "asset_field_must_be_string_list": "this field must be a list of text values",
     "asset_field_invalid_value": "this field has an invalid value",
+    "asset_sheet_file_not_owned": "The asset sheet for “{name}” can only use an image under its own name. Upload or generate one for it separately",
     "asset_reference_file_not_owned": "Reference images and reference audio for “{name}” can only use files under its own name. Upload them for it separately",
     "invalid_asset_type": "asset type must be character / scene / prop",
     "invalid_asset_filename": "filename must not contain path separators or ..",
@@ -651,6 +652,7 @@ MESSAGES = {
     # Image Capability
     "image_endpoint_mismatch_no_i2i": "Model {model} only supports text-to-image (no /v1/images/edits); remove reference images or pick a model that supports image edits",
     "image_endpoint_mismatch_no_t2i": "Model {model} only supports image-to-image (reference images required); supply reference images or pick a model that supports text-to-image",
+    "image_seedream_edits_unavailable": "The current call endpoint for model {model} does not support generation with reference images; change it to “Volcengine Ark (Seedream)” in model settings and try again",
     "image_capability_missing_i2i": "{provider}/{model} does not support image-to-image; configure a default model that supports image edits",
     "image_capability_missing_t2i": "{provider}/{model} does not support text-to-image; configure a default model that supports text-to-image",
     "image_dashscope_4k_t2i_only": "Model {model}: 4K output is only supported by wan2.7-image-pro for text-to-image; use 2K or lower",
