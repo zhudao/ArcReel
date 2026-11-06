@@ -173,11 +173,24 @@ class TestPrefill:
             ("vidu", "video", "viduq2", "vidu-video-q2"),
             ("vidu", "video", "viduq3-pro", "vidu-video-q3-pro"),
             ("kling", "video", "kling-v2-6", "kling-video-pro-audio"),
+            # 只在新版 API 上提供的型号
+            ("kling", "video", "kling-4.0", "kling-video-model-path"),
+            ("kling", "video", "kling-4.0-flash", "kling-video-model-path"),
+            ("kling", "video", "kling-3.0-turbo", "kling-video-model-path"),
             ("ark", "image", "kling-image-o2", "ark-seedream-4"),
             ("ark", "video", "doubao-seedance-2-5-260628", "ark-seedance-2-5"),
             ("ark-agent-plan", "video", "doubao-seedance-2.0-mini", "ark-seedance-2"),
             ("ark", "video", "doubao-seedance-1-5-pro-251215", "ark-seedance-1"),
             ("ark", "video", "ep-20261104-opaque", "ark-seedance-2"),
+            # 百炼语音：qwen-audio-*-tts 走 SpeechSynthesizer，其余落回默认的 multimodal 端点
+            ("dashscope", "audio", "qwen-audio-3.1-tts-flash", "dashscope-speech-synthesizer"),
+            ("dashscope", "audio", "qwen-audio-3.0-tts-plus", "dashscope-speech-synthesizer"),
+            ("dashscope", "audio", "qwen3-tts-flash", "dashscope-tts"),
+            ("dashscope", "audio", "cosyvoice-v3", "dashscope-tts"),
+            ("gemini-aistudio", "video", "gemini-omni-1.1-flash", "gemini-interactions-video"),
+            ("gemini-vertex", "video", "gemini-omni-1.1-flash-preview", "gemini-vertex-interactions-video"),
+            ("gemini-aistudio", "video", "veo-3.1-fast-generate-001", "gemini-video"),
+            ("gemini-vertex", "video", "veo-3.1-generate-001", "gemini-vertex-video"),
         ],
     )
     def test_the_prefilled_endpoint_is_inferred_by_name_within_the_provider(
