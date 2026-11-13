@@ -17,6 +17,7 @@ import { formatCurrencyAmount } from "@/utils/cost-format";
 import { formatShortDateTime } from "@/utils/date-format";
 import { itemIdsInEpisodeText } from "@/utils/episode-display";
 import {
+  COMFYUI_EXPECTED_SUFFIXES,
   MEDIA_META,
   STATUS_LABEL_KEYS,
   STATUS_TEXT_CLASSES,
@@ -282,9 +283,19 @@ export function UsageRecordDetailModal({
 
   const media = detail ? MEDIA_META[detail.media_type] : null;
   const phraseKey = failurePhraseKey(detail?.error_code ?? null);
-  const domainKey = detail?.error_code && detail.error_params && i18n.exists(`errors:${detail.error_code}`)
-    ? `errors:${detail.error_code}`
-    : null;
+  const domainKey = detail?.error_code && detail.error_params
+    ? [`errors:${detail.error_code}`, `errors:task_fail_${detail.error_code}`].find((key) => i18n.exists(key))
+    : undefined;
+  const domainParams = { ...detail?.error_params };
+  const nested = domainParams.detail;
+  if (nested && typeof nested === "object" && "key" in nested && "params" in nested
+    && typeof nested.key === "string" && nested.params && typeof nested.params === "object") {
+    domainParams.detail = t(`errors:${nested.key}`, { ...nested.params });
+  }
+  if (detail?.error_code === "comfyui_output_type_mismatch" || detail?.error_code === "comfyui_output_container_mismatch") {
+    const mediaType = domainParams.media_type;
+    domainParams.expected = typeof mediaType === "string" ? COMFYUI_EXPECTED_SUFFIXES[mediaType] ?? "" : "";
+  }
   const retryAfter = detail?.error_params?.retry_after_seconds;
   const failureStatus = detail?.error_params?.status;
   const purpose = purposeKey(detail?.purpose ?? null);
@@ -353,7 +364,7 @@ export function UsageRecordDetailModal({
                         {phraseKey
                           ? t(`dashboard:${phraseKey}`)
                           : domainKey
-                            ? t(domainKey, { ...detail.error_params })
+                            ? t(domainKey, domainParams)
                             : (detail.error_message ?? t("dashboard:usage_detail_empty"))}
                       </p>
                       {phraseKey && detail.error_message && (

@@ -25,10 +25,15 @@ from typing import Any
 import httpx
 from openai import APITimeoutError
 
-from arcreel_market_core.video_backend_contract import VideoCapabilityError
 from lib.backends.http_status_errors import ArtifactDownloadError
-from lib.backends.image_errors import ImageCapabilityError
 from lib.infra.api_errors import ApiError
+from lib.infra.error_params import (
+    FAILURE_MESSAGE_LIMIT,
+    nested_detail_slots,
+    params_budget,
+    shrink_json_strings,
+    shrinkable_copy,
+)
 
 
 class CallErrorCode(StrEnum):
@@ -77,7 +82,7 @@ def classify_call_failure(exc: BaseException | str) -> CallFailure:
     顺序即优先级：产物下载失败先判——下载耗尽的根因常是一次超时或一个 HTTP 状态，但对用户而言
     它是「下载失败」（可重试取件），不是一次超时的生成。其余三类互不重叠，沿 ``__cause__`` 链
     逐层判：提交阶段的歧义态包装之类的外层异常自身不带可分类的信息，根因在它包住的那一层。
-    ``error_message`` 始终取最外层的原文。未命中供应商分类时，API 与图片、视频能力异常保留
+    ``error_message`` 始终取最外层的原文。未命中供应商分类时，领域异常保留
     自身的机器码与参数，供详情按当前语言渲染。
 
     也收失败原文：resume 补账的部分出口只拿得到一段文本而没有异常对象。分类依据全在异常的
@@ -93,10 +98,21 @@ def classify_call_failure(exc: BaseException | str) -> CallFailure:
         if classified is not None:
             code, params = classified
             return CallFailure(message, code, params)
-    if isinstance(exc, ApiError | ImageCapabilityError | VideoCapabilityError):
-        code = exc.key if isinstance(exc, ApiError) else exc.code
+    # params 区分本仓库领域错误与只带上游 code 的 SDK 异常；供应商分类仍优先。
+    code = exc.key if isinstance(exc, ApiError) else getattr(exc, "code", None)
+    raw_params = getattr(exc, "params", None)
+    if isinstance(code, str) and isinstance(raw_params, dict):
         try:
-            params = json.loads(json.dumps(exc.params, default=str, allow_nan=False))
+            params = json.loads(json.dumps(raw_params, default=str, allow_nan=False))
+            # 与任务侧的完整信封预算一致，虽分列落库也计入 code。
+            budget = params_budget(code, FAILURE_MESSAGE_LIMIT)
+            if len(json.dumps(params, ensure_ascii=False, sort_keys=True)) > budget:
+                # 与任务侧 bound_reason 同一口径：容器先转文本，嵌套诊断保留 key/params 信封，收窄最长字符串。
+                params = shrinkable_copy(params)
+                shrinkable = [(params, key) for key, value in params.items() if isinstance(value, str)]
+                shrinkable.extend(nested_detail_slots(params))
+                if not shrink_json_strings(params, shrinkable, budget):
+                    return CallFailure(message)
         except (TypeError, ValueError, RecursionError):
             return CallFailure(message)
         return CallFailure(message, code, params)

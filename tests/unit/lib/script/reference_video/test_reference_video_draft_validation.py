@@ -102,6 +102,7 @@ class TestUnitText:
                 ],
                 "reason": "character_and_narrator_mixed",
                 "action": "replan_unit",
+                "params": {"label": "unit E1U01", "location": "text:2, text:3"},
             }
         ]
         assert "character_and_narrator_mixed" in str(problem)
