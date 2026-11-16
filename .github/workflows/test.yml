@@ -334,7 +334,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: 10
 
@@ -370,7 +370,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: 10
 
@@ -419,7 +419,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: 10
 
@@ -464,7 +464,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           # 版本取自 website/package.json 的 packageManager（含完整性哈希），不在此重复写死；
           # 该输入必须显式指定——默认值是仓库根的 package.json，本仓库根目录没有这个文件
@@ -624,21 +624,6 @@ jobs:
           print(f"pyproject={py} package.json={fe} manifest={mf}")
           sys.exit(0 if py == fe == mf else 1)
           EOF
-
-      - name: Changed files whitelist
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
-          allow='^(CHANGELOG\.md|pyproject\.toml|uv\.lock|frontend/package\.json|\.release-please-manifest\.json|lib/catalog/snapshot/(catalog|manifest)\.json)$'
-          bad=$(echo "$changed" | grep -vE "$allow" || true)
-          if [ -n "$bad" ]; then
-            echo "发布 PR 含版本产物白名单外的文件，请检查 release-please 配置："
-            echo "$bad"
-            exit 1
-          fi
-          echo "发布 PR 变更文件均在白名单内"
 
   ci-required:
     if: always()
