@@ -193,7 +193,9 @@ _VIDU_PROFILES = {
     "viduq3-turbo": "q3-turbo",
     "viduq3-pro-fast": "q3-fast",
     "viduq3": "q3-reference",
-    "viduq3-mix": "q3-reference",
+    "viduq3-drama": "q3-drama",
+    "viduq3-mix": "q3-mix",
+    "viduq3-ad": "q3-ad",
     "viduq2": "q2",
     "viduq2-pro": "q2-pro",
     "viduq2-pro-fast": "q2-fast",
@@ -221,6 +223,9 @@ _VIDU_ENDPOINTS = (
     "vidu-video-q3-turbo",
     "vidu-video-q3-fast",
     "vidu-video-q3-reference",
+    "vidu-video-q3-drama",
+    "vidu-video-q3-mix",
+    "vidu-video-q3-ad",
     "vidu-video-q2",
     "vidu-video-q2-pro",
     "vidu-video-q2-fast",
@@ -663,6 +668,17 @@ _specs += [
     for by_backend_type in _GEMINI_VIDEO_ENDPOINTS.values()
 ]
 _specs += [_kling_spec("image"), _kling_spec("image", endpoint="kling-image-single")]
+# MiniMax 图片：image-01 走简单族登记的 minimax-image（registry 名 minimax），H3 图像系列另走 minimax-h3-image；
+# 新增模型的预填按名字规则推断（infer_endpoint），不经 image_endpoint_for_name。
+_specs.append(
+    ProviderSpec(
+        provider_id="minimax",
+        media_type="image",
+        registry_backend="minimax-h3-image",
+        build_backend=partial(_build_simple, media_type="image", registry_backend="minimax-h3-image"),
+        endpoint="minimax-h3-image",
+    )
+)
 _specs += [
     ProviderSpec(
         provider_id=provider,
@@ -781,6 +797,7 @@ _MULTI_ENDPOINT_DEFAULTS: Mapping[tuple[str, str], str] = {
     ("gemini-aistudio", "video"): "gemini-video",
     ("gemini-vertex", "video"): "gemini-vertex-video",
     ("agnes", "image"): "agnes-image-tier",
+    ("minimax", "image"): "minimax-image",
     ("minimax", "video"): "minimax-hailuo-v1",
     ("grok", "video"): "grok-video-classic",
     ("vidu", "video"): "vidu-video-q3-turbo",

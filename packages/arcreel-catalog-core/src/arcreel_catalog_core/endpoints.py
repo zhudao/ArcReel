@@ -18,10 +18,15 @@ from .vocabulary import MediaType
 
 @dataclass(frozen=True)
 class BuiltinEndpoint:
-    """一个内置调用端点。``since`` 是起始版本，即第一个带这个端点的应用版本；基线端点不带起始版本。"""
+    """一个内置调用端点。
+
+    ``since`` 是起始版本，即第一个带这个端点的应用版本；基线端点不带起始版本。
+    ``requires_output_token_rules`` 表示挂接它的图片模型按 ``image_output_tokens`` 计价时，条目须收录输出 token 估算规则。
+    """
 
     media_type: MediaType
     since: str | None = None
+    requires_output_token_rules: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,9 +64,9 @@ BUILTIN_ENDPOINTS: Final[Mapping[str, BuiltinEndpoint]] = MappingProxyType(
             "grok-image",
             "kling-image",
             "minimax-image",
-            "openai-images",
             "vidu-image",
         ),
+        "openai-images": BuiltinEndpoint("image", requires_output_token_rules=True),
         **_baseline(
             "video",
             "agnes-video-2",
@@ -108,6 +113,10 @@ BUILTIN_ENDPOINTS: Final[Mapping[str, BuiltinEndpoint]] = MappingProxyType(
         "vidu-video-q4": BuiltinEndpoint("video", since="0.35.1"),
         "grok-tts": BuiltinEndpoint("audio", since="0.35.1"),
         "ark-agent-plan-tts": BuiltinEndpoint("audio", since="0.36.1"),
+        "vidu-video-q3-drama": BuiltinEndpoint("video", since="0.37.1"),
+        "vidu-video-q3-mix": BuiltinEndpoint("video", since="0.37.1"),
+        "vidu-video-q3-ad": BuiltinEndpoint("video", since="0.37.1"),
+        "minimax-h3-image": BuiltinEndpoint("image", since="0.37.1"),
     }
 )
 
@@ -181,7 +190,7 @@ BUILTIN_PROVIDER_ENDPOINTS: Final[Mapping[str, Mapping[str, ProviderEndpointOpti
         },
         "minimax": {
             "text": _single("openai-chat"),
-            "image": _single("minimax-image"),
+            "image": ProviderEndpointOptions(("minimax-image", "minimax-h3-image"), "minimax-image"),
             "video": ProviderEndpointOptions(
                 ("minimax-hailuo-v1", "minimax-hailuo-v1-fast", "minimax-s2v-01", "minimax-h3"), "minimax-hailuo-v1"
             ),
@@ -201,6 +210,9 @@ BUILTIN_PROVIDER_ENDPOINTS: Final[Mapping[str, Mapping[str, ProviderEndpointOpti
                     "vidu-video-q3-turbo",
                     "vidu-video-q3-fast",
                     "vidu-video-q3-reference",
+                    "vidu-video-q3-drama",
+                    "vidu-video-q3-mix",
+                    "vidu-video-q3-ad",
                     "vidu-video-q2",
                     "vidu-video-q2-pro",
                     "vidu-video-q2-fast",
