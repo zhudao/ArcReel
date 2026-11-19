@@ -105,7 +105,7 @@ class VideoRequestFacts:
     """一次视频请求的执行事实。
 
     ``resolution`` 为 None 表示请求不携带分辨率参数。``supported_durations`` 是模型声明的全集，
-    ``allowed_durations`` 是按请求分辨率与参考图收窄后的档位，``excluded_durations`` 给出全集中
+    ``allowed_durations`` 是按请求分辨率、参考图与尾帧收窄后的档位，``excluded_durations`` 给出全集中
     每个被排除秒数的成因。时长由端点固定时（``docs/adr/0082``）三者都是合法空集。
 
     音轨四项：``requested_generate_audio`` 是用户的音频开关，``generate_audio`` 是计价口径的
@@ -198,6 +198,7 @@ class VideoRequestFactsFailure:
     code: str
     params: tuple[tuple[str, object], ...] = ()
     action: str = CONFIGURE_VIDEO_MODEL_ACTION
+    excluded_durations: tuple[tuple[int, DurationExclusionReason], ...] = ()
 
     def parameters(self) -> dict[str, object]:
         return dict(self.params)
@@ -276,19 +277,6 @@ def audio_switch_conflict(facts: VideoRequestFacts) -> VideoRequestFactsFailure 
     return None
 
 
-def video_audio_model_facts(audio_track: str | None, *, voice_consistency: str) -> tuple[bool, bool]:
-    """按该桶的成片音轨形态返回 ``(has_audio_track, audio_switch_controllable)`` 的模型级事实。
-
-    音轨形态按执行子路径分叉，须按落入的桶取值（可灵 v3-omni 这类「图生可控、参考生无开关」的
-    型号），见 :meth:`ConfigResolver.video_audio_track`。没有信号（``None``：未登记模型、没有覆盖音轨形态的
-    自定义供应商模型）时按无信号不收紧。
-    """
-
-    if audio_track is None:
-        return voice_consistency != "none", True
-    return audio_track != "always_off", audio_track == "controllable"
-
-
 async def evaluate_video_request_facts(
     project: dict,
     *,
@@ -298,6 +286,7 @@ async def evaluate_video_request_facts(
     resolver: ConfigResolver,
     resolution_override: ResolutionOverride | None = None,
     builtin_endpoint: str | None = None,
+    uses_end_frame: bool = False,
 ) -> VideoRequestFacts | VideoRequestFactsFailure:
     """对一次视频请求求值执行事实；解析不出时返回带类型的失败，不抛出、不回退。
 
@@ -367,33 +356,51 @@ async def evaluate_video_request_facts(
             constraints,
             resolution=resolution,
             uses_reference_images=uses_reference_images,
+            uses_end_frame=uses_end_frame,
         )
     )
-    if supported and not allowed:
-        return VideoRequestFactsFailure(
-            codes["incompatible"],
-            (*identity_params, ("resolution", resolution), ("capability", generation_type)),
-        )
-    # 两条约束都排除同一秒数时报参考图：改分辨率救不回它。
+    # 输入路径约束优先于分辨率：只改分辨率救不回它。
     reference_allowed = (
         apply_duration_constraints(list(supported), constraints, uses_reference_images=True)
         if uses_reference_images
         else list(supported)
     )
-    excluded: tuple[tuple[int, DurationExclusionReason], ...] = tuple(
-        (d, "reference" if d not in reference_allowed else "resolution") for d in supported if d not in allowed
+    end_frame_allowed = (
+        apply_duration_constraints(list(supported), constraints, uses_end_frame=True)
+        if uses_end_frame
+        else list(supported)
     )
+    excluded: tuple[tuple[int, DurationExclusionReason], ...] = tuple(
+        (d, "end_frame" if d not in end_frame_allowed else "reference" if d not in reference_allowed else "resolution")
+        for d in supported
+        if d not in allowed
+    )
+
+    if supported and not allowed:
+        if uses_end_frame and apply_duration_constraints(
+            list(supported), constraints, resolution=resolution, uses_reference_images=uses_reference_images
+        ):
+            return VideoRequestFactsFailure(
+                "video_end_frame_durations_incompatible",
+                identity_params,
+                action="fix_input",
+                excluded_durations=excluded,
+            )
+        return VideoRequestFactsFailure(
+            codes["incompatible"],
+            (*identity_params, ("resolution", resolution), ("capability", generation_type)),
+            excluded_durations=excluded,
+        )
 
     voice_consistency: VoiceConsistency = caps.get("voice_consistency") or "soft"
     try:
-        audio_track = await resolver.video_audio_track(
+        audio = await resolver.video_audio_facts(
             provider_id, model_id, generation_type=generation_type, builtin_endpoint=builtin_endpoint
         )
     except SQLAlchemyError:
         return VideoRequestFactsFailure(codes["unavailable"], (("capability", generation_type), *identity_params))
-    has_audio_track, audio_switch_controllable = video_audio_model_facts(
-        audio_track, voice_consistency=voice_consistency
-    )
+    has_audio_track = audio.has_audio_track if audio is not None else voice_consistency != "none"
+    audio_switch_controllable = audio.audio_switch_controllable if audio is not None else True
     max_reference_images = caps.get("max_reference_images")
     return VideoRequestFacts(
         route=route,
@@ -423,3 +430,20 @@ def _optional_count(value: object) -> int | None:
     if value is None:
         return None
     return int(value) if isinstance(value, int | float) and not isinstance(value, bool) else 0
+
+
+def end_frame_duration_failure(facts: VideoRequestFacts, duration: object) -> VideoRequestFactsFailure | None:
+    """已选秒数被尾帧约束剔除时明确拒绝；不替用户改秒数。"""
+    if not isinstance(duration, int | float | str) or isinstance(duration, bool):
+        return None
+    try:
+        seconds = float(duration)
+    except ValueError:
+        return None
+    if not seconds.is_integer() or dict(facts.excluded_durations).get(int(seconds)) != "end_frame":
+        return None
+    return VideoRequestFactsFailure(
+        "video_duration_end_frame_not_supported",
+        (("duration", int(seconds)), ("supported", ", ".join(str(d) for d in facts.allowed_durations))),
+        action="fix_input",
+    )

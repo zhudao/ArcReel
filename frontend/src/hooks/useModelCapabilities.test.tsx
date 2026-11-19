@@ -368,9 +368,38 @@ describe("durationOutOfRangeReason", () => {
     expect(durationOutOfRangeReason(6, capsIn)).toBe("reference");
   });
 
-  it("未越界 / 值缺失 / 能力未知一律 null", () => {
+  it("未越界 / 值缺失 / 能力未知 / 模型无声明档位一律 null", () => {
     expect(durationOutOfRangeReason(8, capsIn)).toBeNull();
     expect(durationOutOfRangeReason(null, capsIn)).toBeNull();
     expect(durationOutOfRangeReason(4, { ...capsIn, supportedDurations: null })).toBeNull();
+    expect(durationOutOfRangeReason(4, { rawDurations: null, supportedDurations: [], excludedDurations: {} })).toBeNull();
   });
+
+  it("尾帧与当前配置交集为空时保留逐档剔除成因", () => {
+    const emptyIntersection = {
+      rawDurations: [4, 6, 8],
+      supportedDurations: [] as number[],
+      excludedDurations: { "4": "resolution" as const, "6": "resolution" as const, "8": "end_frame" as const },
+    };
+    expect(durationOutOfRangeReason(8, emptyIntersection)).toBe("end_frame");
+    expect(durationOutOfRangeReason(4, emptyIntersection)).toBe("resolution");
+  });
+});
+
+
+it("带尾帧时读取服务端首尾帧档位，规划保留无尾帧全集", async () => {
+  vi.spyOn(API, "getVideoCapabilities").mockResolvedValue(caps({
+    end_frame_unit_durations: {
+      without_end_frame: [4, 6, 8], with_end_frame: [4, 6], excluded: { "8": "end_frame" }, problem: null,
+    },
+  }));
+  const { result, rerender } = renderHook(
+    (usesEndFrame: boolean) => useModelCapabilities({ projectName: PROJECT, usesEndFrame }),
+    { initialProps: false },
+  );
+  await waitFor(() => expect(result.current.supportedDurations).toEqual([4, 6, 8]));
+  rerender(true);
+  expect(result.current.supportedDurations).toEqual([4, 6]);
+  expect(result.current.planningDurations).toEqual([4, 6, 8]);
+  expect(durationOutOfRangeReason(8, result.current)).toBe("end_frame");
 });

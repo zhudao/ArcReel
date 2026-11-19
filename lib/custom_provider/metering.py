@@ -122,10 +122,26 @@ def custom_video_usage(
     """
     if metering is not None:
         try:
-            return metering(model, request, result, entry=entry)
+            usage = metering(model, request, result, entry=entry)
+            return _with_video_audio(usage, request, result)
         except (ValueError, KeyError):
             logger.debug("调用通道不认得模型 %s 的计量，改按通用口径上报", model, exc_info=True)
-    return generic_video_usage(request, result)
+    return _with_video_audio(generic_video_usage(request, result), request, result)
+
+
+def _with_video_audio(usage: Usage, request: VideoGenerationRequest, result: VideoGenerationResult | None) -> Usage:
+    """模型确定无声时按无声，其余保留通道档位与实际回报；未携带能力时保留通道口径。"""
+    caps = request.video_capabilities
+    if caps is None:
+        return usage
+    mode = caps.audio_track_for_route("r2v" if request.reference_images else "i2v")
+    audio = mode.output_audio(request.generate_audio)
+    channel_audio = usage.dimensions.get("audio")
+    if mode.has_audio_track and mode.audio_switch_controllable and isinstance(channel_audio, bool):
+        audio = channel_audio
+    if mode.has_audio_track and result is not None and result.generate_audio is not None:
+        audio = result.generate_audio
+    return replace(usage, dimensions={**usage.dimensions, "audio": audio})
 
 
 def custom_image_estimate(metering_backend: object | None, facts: ImageRequestFacts) -> Usage:

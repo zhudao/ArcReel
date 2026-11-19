@@ -333,3 +333,37 @@ class TestDurationConstraintsMatchRequestFacts:
         assert constraints["resolution"] == "720p"
         assert constraints["allowed"] == [4, 6, 8]
         assert constraints["excluded"] == {}
+
+
+@pytest.mark.parametrize("tiers", [(4, 6), (3,)])
+def test_capabilities_expose_planning_and_end_frame_tiers(tmp_path, db_engine, monkeypatch, tiers):
+    from arcreel_catalog_core import DurationConstraints
+    from lib.catalog.query import catalog_data
+    from tests.catalog_support import install_catalog, with_entry_facts
+
+    install_catalog(
+        monkeypatch,
+        with_entry_facts(
+            catalog_data(),
+            "gemini-vertex",
+            "veo-3.1-generate-001",
+            duration_constraints=DurationConstraints(with_end_frame=tiers),
+        ),
+    )
+    pm = _FakePM(tmp_path)
+    pm.project_data["ready"].update(video_provider_i2v="gemini-vertex/veo-3.1-generate-001")
+    with build_projects_client(
+        monkeypatch, pm, session_factory=async_sessionmaker(db_engine, expire_on_commit=False)
+    ) as client:
+        response = client.get("/api/v1/projects/ready/video-capabilities")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["duration_constraints"]["allowed"] == [4, 6, 8]
+    assert body["end_frame_unit_durations"] == {
+        "without_end_frame": [4, 6, 8],
+        "with_end_frame": [d for d in [4, 6, 8] if d in tiers],
+        "excluded": {str(d): "end_frame" for d in [4, 6, 8] if d not in tiers},
+        "problem": body["end_frame_unit_durations"]["problem"] if tiers == (3,) else None,
+    }
+    if tiers == (3,):
+        assert body["end_frame_unit_durations"]["problem"]["code"] == "video_end_frame_durations_incompatible"

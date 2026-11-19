@@ -231,6 +231,7 @@ class TestCustomVideoBackend:
             duration_seconds=5,
         )
         delegate = AsyncMock()
+        delegate.video_capabilities = VideoCapabilities()
         delegate.generate = AsyncMock(return_value=expected_result)
 
         backend = CustomVideoBackend(provider_id="custom-vid", delegate=delegate, model="wan-pro")
@@ -243,6 +244,7 @@ class TestCustomVideoBackend:
     async def test_generate_passes_request_unchanged(self, tmp_path: Path):
         output_path = tmp_path / "vid.mp4"
         delegate = AsyncMock()
+        delegate.video_capabilities = VideoCapabilities()
         delegate.generate = AsyncMock(
             return_value=VideoGenerationResult(video_path=output_path, provider="x", model="y", duration_seconds=5)
         )
@@ -261,6 +263,7 @@ class TestCustomVideoBackend:
         """
         output_path = tmp_path / "vid.mp4"
         delegate = AsyncMock()
+        delegate.video_capabilities = VideoCapabilities()
         delegate.generate = AsyncMock(
             return_value=VideoGenerationResult(video_path=output_path, provider="x", model="y", duration_seconds=5)
         )
@@ -333,6 +336,36 @@ class TestCustomVideoBackend:
         assert result.last_frame is True
         assert result.max_reference_images == 0
         delegate.video_capabilities_for_tier.assert_called_once_with("pro", resolution=None)
+
+    def test_video_capabilities_for_tier_uses_endpoint_switch_not_tier_narrowed_track(self, tmp_path: Path):
+        """KlingProAudio 在 std/720p 档位下基底为 ALWAYS_OFF，但端点仍声明有开关；覆盖为 controllable 时不能投影成 ALWAYS_ON。"""
+        from arcreel_market_core.video_backend_contract import VideoAudioMode
+        from lib.backends.video_backends.kling import KlingProAudioVideoBackend
+
+        delegate = KlingProAudioVideoBackend(access_key="ak", secret_key="sk", model="kling-v2-6")
+        backend = CustomVideoBackend(
+            provider_id="custom-1", delegate=delegate, model="kling-v2-6"
+        ).with_video_capabilities(delegate.video_capabilities, overrides={"audio_track": "controllable"})
+
+        std_caps = backend.video_capabilities_for_tier("std", resolution="720p")
+        pro_caps = backend.video_capabilities_for_tier("pro", resolution="1080p")
+        assert std_caps.audio_track is VideoAudioMode.CONTROLLABLE
+        assert pro_caps.audio_track is VideoAudioMode.CONTROLLABLE
+
+        first_frame = tmp_path / "start.png"
+        first_frame.write_bytes(b"\x89PNG\r\n\x1a\n")
+        muted_req = VideoGenerationRequest(
+            prompt="p",
+            output_path=tmp_path / "out.mp4",
+            start_image=first_frame,
+            service_tier="std",
+            resolution="720p",
+            generate_audio=False,
+            video_capabilities=std_caps,
+        )
+        assert KlingProAudioVideoBackend._effective_audio_for("kling-v2-6", muted_req, subpath="image2video") is False
+        usage = backend.metered_usage("kling-v2-6", muted_req)
+        assert usage.dimensions["audio"] is False
 
 
 # ---------------------------------------------------------------------------
