@@ -7,7 +7,7 @@ import { useAppStore } from "@/stores/app-store";
 import { isResourceBusy, useActiveResourceIds } from "@/stores/tasks-store";
 import { groupBySegmentBreak, computeGridSize, matchGridsForGroup } from "@/utils/grid-layout";
 import { GridPreviewPanel } from "./GridPreviewPanel";
-import type { GridGeneration } from "@/types/grid";
+import type { GridCapability, GridGeneration } from "@/types/grid";
 import type { NarrationSegment, DramaScene } from "@/types";
 
 type Segment = NarrationSegment | DramaScene;
@@ -36,6 +36,7 @@ function GridGroupCard({
   rows,
   cols,
   gridIds,
+  referenceInputs,
   submitting,
   canGenerate,
   onGenerate,
@@ -47,6 +48,7 @@ function GridGroupCard({
   rows: number;
   cols: number;
   gridIds: string[];
+  referenceInputs: NonNullable<GridCapability["reference_inputs"]>;
   submitting: boolean;
   canGenerate: boolean;
   onGenerate: () => void;
@@ -88,6 +90,13 @@ function GridGroupCard({
           </Button>
         )}
       </div>
+      {referenceInputs.map((input) => (
+        <p key={input.scene_ids[0]} className="px-4 py-1 text-xs text-muted-foreground">
+          {referenceInputs.length > 1 && `${input.scene_ids[0]}–${input.scene_ids.at(-1)} · `}
+          {input.message || t("storyboard_reference_count", { count: input.count })}
+          {!input.message && input.limit != null && ` / ${input.limit}`}
+        </p>
+      ))}
       <GridPreviewPanel
         projectName={projectName}
         gridIds={gridIds}
@@ -115,20 +124,24 @@ export function GridPreviewView({
   const [generatingGroups, setGeneratingGroups] = useState<Set<string>>(new Set());
   // 单张宫格的格数上限由后端给：4×4 / 5×5 的 4K 门控要经供应商解析才能定，前端自行推导
   // 必然与入队口径漂移。取不到时 computeGridSize 用保守默认值。
-  const [maxCellCount, setMaxCellCount] = useState<number | undefined>(undefined);
+  // 结果连同它所属的项目与剧本一起保存：切到另一集后旧结论整体作废，新作用域取不到时不沿用。
+  const scope = JSON.stringify([projectName, episode, scriptFile ?? null]);
+  const [loaded, setLoaded] = useState<{ scope: string; capability: GridCapability } | null>(null);
+  const capability = loaded?.scope === scope ? loaded.capability : null;
+  const maxCellCount = capability?.max_cell_count;
 
   const groups = useMemo(() => groupBySegmentBreak(segments), [segments]);
 
   useEffect(() => {
     if (!projectName) return;
     const controller = new AbortController();
-    API.getGridCapability(projectName, { signal: controller.signal })
+    API.getGridCapability(projectName, { signal: controller.signal, episode, scriptFile })
       .then((cap) => {
-        if (!controller.signal.aborted) setMaxCellCount(cap.max_cell_count);
+        if (!controller.signal.aborted) setLoaded({ scope, capability: cap });
       })
       .catch(() => {});
     return () => controller.abort();
-  }, [projectName]);
+  }, [projectName, episode, scriptFile, scope, segments, gridsRevision]);
 
   // 宫格列表随全局失效信号重拉：生成、上传、还原之后都经 invalidateGrids 触发
   useEffect(() => {
@@ -197,6 +210,7 @@ export function GridPreviewView({
         <p className="text-sm text-muted-foreground">{t("grid_preview_summary", stats)}</p>
         {groups.map((group, idx) => {
           const sceneIds = group.map((s) => getSegmentId(s, contentMode));
+          const sceneIdSet = new Set(sceneIds);
           const layout = computeGridSize(group.length, maxCellCount);
           const gridIds = matchGridsForGroup(grids, sceneIds, episode, maxCellCount).map((g) => g.id);
           const groupKey = [...sceneIds].sort().join(",");
@@ -209,6 +223,7 @@ export function GridPreviewView({
               rows={layout.rows}
               cols={layout.cols}
               gridIds={gridIds}
+              referenceInputs={(capability?.reference_inputs ?? []).filter((chunk) => sceneIdSet.has(chunk.scene_ids[0]))}
               submitting={generatingGroups.has(groupKey)}
               canGenerate={canGenerate}
               onGenerate={() => void handleGenerateGroup(groupKey, group)}

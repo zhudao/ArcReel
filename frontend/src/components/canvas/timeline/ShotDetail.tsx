@@ -88,6 +88,8 @@ interface ShotDetailProps {
   episode?: number;
   /** 当前剧集剧本文件名，分镜图/视频自主上传需要它定位剧本条目 */
   scriptFile?: string;
+  /** 上一分镜的当前分镜图路径；存在且未设章节切分点时，标出本分镜会参考它 */
+  previousStoryboardPath?: string | null;
   /** Total shot count for "1/N" indicator */
   selectedIndex: number;
   totalCount: number;
@@ -456,6 +458,7 @@ export function ShotDetail({
   projectName,
   episode,
   scriptFile,
+  previousStoryboardPath,
   selectedIndex,
   totalCount,
   onPrev,
@@ -691,6 +694,20 @@ export function ShotDetail({
     );
   };
 
+  const [previousReference, setPreviousReference] = useState<{ segment: Segment; path: string; id: string } | null>(null);
+  useEffect(() => {
+    if (!previousStoryboardPath || !scriptFile || fields.segment_break) return;
+    const controller = new AbortController();
+    void API.previewScriptItemPrompts(projectName, segmentId, scriptFile, { signal: controller.signal })
+      .then(({ storyboard_image }) => {
+        if (!controller.signal.aborted) {
+          const id = storyboard_image.previous_storyboard;
+          setPreviousReference(id ? { segment, path: previousStoryboardPath, id } : null);
+        }
+      })
+      .catch(() => { if (!controller.signal.aborted) setPreviousReference(null); });
+    return () => controller.abort();
+  }, [projectName, segmentId, segment, scriptFile, previousStoryboardPath, fields.segment_break]);
   // 预览与生成共用已保存剧本；未保存修改必须先保存并刷新成功。
   const renderPromptPreview = (side: PromptSide) => {
     if (!scriptFile) return null;
@@ -701,6 +718,9 @@ export function ShotDetail({
         load={async (signal) =>
           (await API.previewScriptItemPrompts(projectName, segmentId, scriptFile, { signal }))[previewSide]
         }
+        renderExtra={side === "image" ? (preview) => preview.reference_count != null && (
+          <span className="text-xs text-muted-foreground">{t("storyboard_reference_count", { count: preview.reference_count })}{preview.max_reference_images != null && ` / ${preview.max_reference_images}`}</span>
+        ) : undefined}
         beforeOpen={preparePreview}
         saveFirst={dirty}
         disabled={editBusy || refreshPending}
@@ -1104,6 +1124,9 @@ export function ShotDetail({
             busy={durationBusy}
           />
           <StatusBadge status={status} />
+          {!fields.segment_break && previousReference?.segment === segment && previousReference.path === previousStoryboardPath && (
+            <span className="text-xs text-muted-foreground">{t("storyboard_previous_reference", { id: previousReference.id })}</span>
+          )}
           {(isNarration || isDrama) && !readOnly && (
             <SegmentBreakToggle
               checked={fields.segment_break === true}

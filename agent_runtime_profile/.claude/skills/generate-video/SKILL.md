@@ -80,10 +80,12 @@ description: 为分镜或自包含视频单元生成视频。当用户要求生�
 
 视频整批请求是**全有或全无**：准入 `admitted` 时整批入队，`blocked` 或 `confirmation_required` 时
 **一个任务都不入队**。Web 与 Agent 走同一套准入与同一套请求选择语义，没有 Agent 专属的宽松通道。
+唯一例外是参考生视频单元的参考图超限（`video_reference_images_exceeded`）：该单元单独列为 `blocked`
+并附调整原因，不连带其余目标；剩下的目标仍按全有或全无判定。
 
 参考生视频按视频单元的引用状态选择生效档位，把编排时长投影到模型支持的申请档位。申请档位不同于编排时长时
 预检返回 `reference_duration_confirmation_required`，逐档位向用户说明涉及的视频单元、编排秒数、申请秒数
-与变长/变短；确认后经 `confirmed_request_durations`（按 unit_id 记档位）让**原目标集合仍作为一批重发**：
+与变长/变短；确认后经 `confirmed_request_durations`（按 unit_id 记档位）让**原目标集合仍作为一批重发**（参考图超限的单元会再次被单独剔除）：
 
 ```text
 mcp__arcreel__generate_videos({"script": "episode_1.json", "target": {"scope": "episode", "episode_id": 1},
@@ -133,5 +135,5 @@ stale 产物照常可预览、可导出、可参与成片，服务端会复用�
 
 - storyboard：每个目标分镜都有可用分镜图，动作与发声内容可执行。
 - 参考生视频：每个目标视频单元有非空正文、合法编排时长、单一发声归属，且未标记 `needs_replan`。
-- reference：参考图由服务端在执行期从正文 `@[名称]` 的首次提及顺序解析；未登记的提及只产生警告、不阻断入队，让服务端按 `max_reference_images` 裁剪。
+- reference：参考图由服务端在执行期从正文 `@[名称]` 的首次提及顺序解析；未登记的提及只产生警告、不阻断入队，已装配参考图超过 `get_video_capabilities.max_reference_images` 时会在付费前拒绝。请减少 @ 引用、拆分视频单元或换模型后再提交。
 - reference：输出路径为 `reference_videos/{unit_id}.mp4`。

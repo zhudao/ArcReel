@@ -6,14 +6,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from collections.abc import Generator
+from io import BytesIO
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -31,9 +34,9 @@ from server.error_handlers import register_error_handlers
 from server.routers import custom_endpoints
 from server.routers.endpoint_tests import get_config_resolver, get_trial_run_manager
 from tests.auth_deps import AUTH_DEPENDENCIES
-from tests.factories import comfyui_endpoint_definition, custom_endpoint_definition
+from tests.factories import comfyui_endpoint_definition, custom_endpoint_definition, image_bytes
 from tests.fakes import MP4_BYTES, PNG_BYTES, bounded_poll_clock
-from tests.http_capture import capture_http
+from tests.http_capture import capture_http, only_request, request_json
 
 PARAMETERS = {"model": "video-x", "prompt": "纸船顺流而下", "duration_seconds": 5}
 INLINE_CREDENTIALS = {"base_url": "https://relay.test", "api_key": "sk-secret-key-1234"}
@@ -277,6 +280,25 @@ class TestPreviewRequest:
 
 
 class TestComfyuiPreviewAudio:
+    def test_image_workflow_refuses_an_uploaded_reference_without_a_slot(self, client: TestClient):
+        response = client.post(
+            "/api/v1/custom-endpoints/preview-request",
+            data={
+                "payload": json.dumps(
+                    {
+                        "definition": _comfyui_image_definition(),
+                        "parameters": PARAMETERS,
+                        "credentials": COMFYUI_CREDENTIALS,
+                    }
+                )
+            },
+            files={"reference_images": ("ref.png", image_bytes(), "image/png")},
+        )
+        assert response.status_code == 400, response.text
+        # 有效图片才把槽位检查与图片可读性分开：报的是 0 个槽位的超限，而不是读不出 #1。
+        assert "最多接受 0 张参考图" in response.text
+        assert "#1" in response.text
+
     def test_audio_the_workflow_cannot_take_is_a_400(self, client: TestClient):
         resp = client.post(
             "/api/v1/custom-endpoints/preview-request",
@@ -416,6 +438,64 @@ class TestSharedValidation:
 
 
 class TestTrialRuns:
+    def test_unreadable_start_image_reports_the_uploaded_basename(
+        self, client: TestClient, trial_runs: TrialRunManager
+    ):
+        with capture_http() as outbound:
+            created = client.post(
+                "/api/v1/custom-endpoints/trial-runs",
+                data={
+                    "payload": json.dumps(
+                        {
+                            "definition": custom_endpoint_definition(),
+                            "parameters": PARAMETERS,
+                            "credentials": INLINE_CREDENTIALS,
+                        }
+                    )
+                },
+                files={"start_image": ("upload/坏图.png", b"invalid png", "image/png")},
+            )
+            assert created.status_code == 201, created.text
+            run_id = created.json()["id"]
+            _drain(client, trial_runs, run_id)
+
+        fetched = client.get(f"/api/v1/custom-endpoints/trial-runs/{run_id}").json()
+        assert fetched["error_code"] == "video_start_image_unreadable"
+        assert "坏图.png" in fetched["error"]
+        assert "upload/" not in fetched["error"]
+        assert not outbound.calls
+
+    def test_comfyui_overflow_reports_only_the_excess_upload(self, client: TestClient, trial_runs: TrialRunManager):
+        definition = _comfyui_image_definition()
+        definition["workflow"]["20"] = {"class_type": "LoadImage", "inputs": {"image": "placeholder.png"}}
+        definition["bindings"]["reference_images"] = [{"node": "20", "input": "image", "class_type": "LoadImage"}]
+        with capture_http() as outbound:
+            created = client.post(
+                "/api/v1/custom-endpoints/trial-runs",
+                data={
+                    "payload": json.dumps(
+                        {
+                            "definition": definition,
+                            "parameters": PARAMETERS,
+                            "credentials": COMFYUI_CREDENTIALS,
+                        }
+                    )
+                },
+                files=[
+                    ("reference_images", ("accepted.png", PNG_BYTES, "image/png")),
+                    ("reference_images", ("excess.png", PNG_BYTES, "image/png")),
+                ],
+            )
+            assert created.status_code == 201, created.text
+            run_id = created.json()["id"]
+            _drain(client, trial_runs, run_id)
+
+        fetched = client.get(f"/api/v1/custom-endpoints/trial-runs/{run_id}").json()
+        assert fetched["error_code"] == "image_reference_images_exceeded"
+        assert "excess.png" in fetched["error"]
+        assert "accepted.png" not in fetched["error"]
+        assert not outbound.calls
+
     def test_runs_to_a_terminal_state_and_serves_the_artifact(self, client: TestClient, trial_runs: TrialRunManager):
         with capture_http() as router, bounded_poll_clock():
             _mock_successful_run(router)
@@ -1400,7 +1480,7 @@ class TestComfyuiEndpoints:
                         }
                     )
                 },
-                files={"reference_images": ("ref.png", PNG_BYTES, "image/png")},
+                files={"reference_images": ("ref.png", image_bytes(), "image/png")},
             )
             assert created.status_code == 201, created.text
             run_id = created.json()["id"]
@@ -1471,6 +1551,56 @@ async def stored_comfyui_image_model_row(file_db_engine) -> dict[str, Any]:
         )
         await session.commit()
         return {"provider_id": make_provider_id(provider.id), "model_id": "flux-workflow"}
+
+
+@pytest.fixture
+async def stored_gemini_image_model_row(file_db_factory) -> dict[str, str]:
+    async with file_db_factory() as session:
+        provider = await CustomProviderRepository(session).create_provider(
+            display_name="Gemini relay",
+            discovery_format="openai",
+            base_url="https://relay.test",
+            api_key="trial-key",
+            models=[
+                {
+                    "model_id": "gemini-3.1-flash-image",
+                    "display_name": "Gemini Flash Image",
+                    "endpoint": "gemini-image",
+                    "is_enabled": True,
+                    "is_default": True,
+                    # 路径覆盖会向 SDK 注入 httpx，供出站 HTTP 替身捕获。
+                    "path_overrides": {"generate": "/gemini/trial"},
+                }
+            ],
+        )
+        await session.commit()
+        return {"provider_id": make_provider_id(provider.id), "model_id": "gemini-3.1-flash-image"}
+
+
+def test_gemini_trial_run_sends_a_gif_reference_as_png(
+    client: TestClient, trial_runs: TrialRunManager, stored_gemini_image_model_row: dict[str, str]
+):
+    with capture_http() as router:
+        image = {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(PNG_BYTES).decode()}}
+        submitted = router.post("https://relay.test/gemini/trial").mock(
+            return_value=httpx.Response(200, json={"candidates": [{"content": {"parts": [image]}}]})
+        )
+        created = client.post(
+            "/api/v1/custom-endpoints/trial-runs",
+            data={"payload": json.dumps({"model_ref": stored_gemini_image_model_row, "parameters": PARAMETERS})},
+            files={"reference_images": ("ref.gif", image_bytes(127, fmt="GIF"), "image/gif")},
+        )
+        assert created.status_code == 201, created.text
+        run_id = created.json()["id"]
+        _drain(client, trial_runs, run_id)
+
+    parts = request_json(only_request(submitted))["contents"][0]["parts"]
+    reference = parts[0]["inlineData"]
+    assert reference["mime_type"] == "image/png"
+    with Image.open(BytesIO(base64.b64decode(reference["data"]))) as sent:
+        assert sent.format == "PNG"
+        assert sent.convert("RGB").getpixel((0, 0)) == (127, 0, 0)
+    assert client.get(f"/api/v1/custom-endpoints/trial-runs/{run_id}").json()["status"] == "succeeded"
 
 
 @pytest.fixture

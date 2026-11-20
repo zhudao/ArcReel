@@ -46,6 +46,7 @@ from lib.backends.image_backends.base import (
     ReferenceImage,
 )
 from lib.backends.image_capabilities import gate_image_request
+from lib.backends.input_limits import reference_image_sources
 from lib.backends.providers import CALL_TYPE_IMAGE, CALL_TYPE_VIDEO, CallPurpose
 from lib.backends.video_frame_slots import resolve_first_frame_aspect_ratio, resolve_video_capabilities
 from lib.billing.ledger import Ledger
@@ -321,6 +322,7 @@ class TrialRunManager:
         *,
         user_id: str = DEFAULT_USER_ID,
         assets: Mapping[str, Path | list[Path] | None] | None = None,
+        asset_sources: Mapping[Path, Path] | None = None,
         staging: Path | None = None,
         request_preview: dict[str, Any] | None = None,
     ) -> TrialRun:
@@ -350,7 +352,8 @@ class TrialRunManager:
         # 占位也必须在第一次 await 之前：并发闸靠的是「查 busy」与「占位」之间没有让出点。
         try:
             run_dir = await run_sync_transaction(self._prepare_run_dir, run_id, frozenset(self._runs))
-            task = asyncio.create_task(self._execute(run, run_dir, target, parameters, assets or {}))
+            with reference_image_sources(asset_sources or {}):
+                task = asyncio.create_task(self._execute(run, run_dir, target, parameters, assets or {}))
         except BaseException:
             await run_sync_transaction(self._discard, run_id, self._release(run_id))
             raise
@@ -461,8 +464,10 @@ class TrialRunManager:
             # 测试连接跑的是生产那条路，闸也一致。免闸的目标见 ``TrialRunTarget.gate_capabilities``。
             if target.gate_capabilities:
                 if video_caps is None:
+                    refs = assets.get("reference_images")
+                    paths = refs if isinstance(refs, list) else []
                     await gate_image_request(
-                        backend, provider_id=target.provider, reference_count=_reference_image_count(assets)
+                        backend, provider_id=target.provider, reference_count=len(paths), reference_paths=paths
                     )
                 else:
                     await _gate_trial_video_request(video_caps, target, parameters, assets)
@@ -822,11 +827,6 @@ def provider_from_base_url(base_url: str) -> str:
 
 def _definition_host(definition: Mapping[str, Any]) -> str:
     return urlsplit(str(definition.get("submit", {}).get("url", ""))).hostname or ""
-
-
-def _reference_image_count(assets: Mapping[str, Path | list[Path] | None]) -> int:
-    reference_images = assets.get("reference_images")
-    return len(reference_images) if isinstance(reference_images, list) else 0
 
 
 def _single(value: Path | list[Path] | None) -> Path | None:

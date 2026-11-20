@@ -65,6 +65,8 @@ Providers' specific models, parameters, regional availability, and pricing chang
 
 The built-in OpenAI provider offers text and image capabilities. OpenAI-compatible video and TTS are connected through a Custom Provider's call endpoints.
 
+Volcengine Ark Agent Plan uses the subscription quota first. By default, ArcReel does not estimate the cost of these calls. If you enable overage postpaid billing for a supported model in the Ark console, Ark bills calls beyond the plan quota separately. Check your Ark bill for the actual charges. See Ark's [overage postpaid billing guide](https://docs.volcengine.com/docs/ark/agent-plan-personal-over-quota-postpaid-management?lang=zh).
+
 ## 3. Configuration Layers {#configuration-layers}
 
 ArcReel supports:
@@ -474,7 +476,7 @@ A mapped model also follows the catalog's [retiring and discontinued](#enable-mo
 
 Each video call endpoint decides first/last frame, reference image, and reference audio support from the model name. When the name maps to a known model in the model catalog, the endpoint uses that model's official name and aliases. A video model the endpoint does not recognize supports only text-to-video and first-frame generation; last frame, reference images, and reference audio are unavailable. For image models, text-to-image and image-to-image are available only where both the model catalog entry and the call endpoint support them; a model that maps to no known model follows the call endpoint alone.
 
-To use image models through OpenRouter, change the call endpoint to "OpenRouter Images API" in [model settings](#model-settings). OpenRouter does not provide OpenAI's `/images/edits` endpoint, so models attached to "OpenAI Images API" cannot do image-to-image. With "OpenRouter Images API", both text-to-image and image-to-image go through `/images`, and the aspect ratio, resolution, and reference image limit follow the parameters OpenRouter declares for that model. When there are more reference images than the model allows, only the first ones are sent and the task result shows a notice; if any reference image cannot be read, generation fails right away instead of continuing with fewer reference images.
+To use image models through OpenRouter, change the call endpoint to "OpenRouter Images API" in [model settings](#model-settings). OpenRouter does not provide OpenAI's `/images/edits` endpoint, so models attached to "OpenAI Images API" cannot do image-to-image. With "OpenRouter Images API", both text-to-image and image-to-image go through `/images`, and the aspect ratio, resolution, and reference image limit follow the parameters OpenRouter declares for that model. When there are more reference images than the model allows, generation is rejected before submission, and the error lists the limit, the actual count, and the excess reference images. If any reference image cannot be read, generation also fails right away. In neither case does generation continue with fewer reference images.
 
 To use Volcengine Ark Seedream through a custom provider, use the "Volcengine Ark (Seedream)" call endpoint. Models whose names contain `seedream` are inferred to this endpoint by default. Both text-to-image and generation with reference images reuse the preset Volcengine Ark provider's reference image handling, size calculation, and usage metering. See the official [Image Generation API documentation](https://www.volcengine.com/docs/82379/1666946) for each model's limits. Seedream models saved with "OpenAI Images API" keep their selected endpoint. If the provider does not support the current reference image interface, the failed generation prompts you to change the endpoint. Select "Volcengine Ark (Seedream)" in [model settings](#model-settings) and try again.
 
@@ -727,8 +729,9 @@ Image generation through a declarative endpoint or a ComfyUI endpoint does not r
 
 Each provider can have a multiplier that applies to the cost of all its calls, to reflect top-up discounts or relay price differences.
 Models of custom providers, and models you added yourself under a built-in provider, can also have their own multiplier, so the final cost = official price × provider multiplier × model multiplier. For example, if a relay charges 80% of the official price across the board, set the provider multiplier to 0.8; if one model there costs 1.5× the official price, set that model's multiplier to 1.875 (0.8 × 1.875 = 1.5).
-The multiplier defaults to 1; Volcengine Ark Agent Plan is billed by subscription and ComfyUI providers run on your own hardware, so their multipliers default to 0 and no cost is computed. Changing a multiplier only affects later calls;
-costs already recorded are not recalculated.
+The multiplier defaults to 1. Volcengine Ark Agent Plan and ComfyUI providers default to a multiplier of 0, so ArcReel does not estimate the cost of their calls. If you enable overage postpaid billing for a supported model in the Ark console, Ark bills calls beyond the plan quota separately. Check your Ark bill for the actual charges. See Ark's [overage postpaid billing guide](https://docs.volcengine.com/docs/ark/agent-plan-personal-over-quota-postpaid-management?lang=zh).
+
+Provider calls use the multiplier in effect at settlement, including changes made while a call is in progress. Previously recorded costs are not recalculated.
 
 Agent session costs are computed from the same model catalog; the cost reported by the Claude Agent SDK is not used:
 

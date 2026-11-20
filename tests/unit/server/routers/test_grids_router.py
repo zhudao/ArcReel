@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from lib.artifacts.artifact_activation import register_current_resource_artifact
+from lib.config.resolver import ImageBucketCapabilityError
 from lib.i18n import _ as i18n_message
 from lib.project.project_change_hints import get_project_change_source
 from lib.project.project_manager import ProjectManager
@@ -23,7 +24,8 @@ from server.error_handlers import register_error_handlers
 from server.routers import grids
 from server.routers import versions as versions_router
 from tests.auth_deps import AUTH_DEPENDENCIES
-from tests.fakes import use_project_manager
+from tests.factories import image_bytes
+from tests.fakes import use_image_admission_context, use_project_manager
 
 
 def _narration_script(count: int = 4):
@@ -815,6 +817,70 @@ def test_grid_capability_reports_gate(monkeypatch, tmp_path):
         assert resp.json() == {"large_grid_allowed": True, "max_cell_count": 25}
 
 
+@pytest.fixture
+def grid_with_character(tmp_path):
+    class WithCharacter(_FakePMGenerate):
+        def load_project(self, name):
+            return {
+                **super().load_project(name),
+                "characters": {"小林": {"description": "林", "character_sheet": "characters/lin.png"}},
+            }
+
+        def load_script(self, name, script_file):
+            script = super().load_script(name, script_file)
+            for item in script["segments"]:
+                item["characters_in_segment"] = ["小林"]
+            return script
+
+    pm = WithCharacter(tmp_path)
+    path = pm.get_project_path("demo")
+    (path / "characters").mkdir()
+    (path / "characters/lin.png").write_bytes(image_bytes())
+    assert register_current_resource_artifact(path, resource_type="characters", resource_id="小林")
+
+    return pm
+
+
+@pytest.mark.parametrize("limit", [0, 1])
+def test_grid_capability_reports_real_chunk_counts_and_overflow(monkeypatch, grid_with_character, limit):
+    pm = grid_with_character
+
+    async def image_limit(*_args):
+        return limit, "local"
+
+    client = _client(monkeypatch, get_project_manager=lambda: pm, reference_image_limit=image_limit)
+    with client:
+        response = client.get("/api/v1/projects/demo/grid-capability?episode=1&script_file=episode_1.json")
+    assert response.status_code == 200, response.text
+    (chunk,) = response.json()["reference_inputs"]
+    assert chunk["scene_ids"] == ["E1S01", "E1S02", "E1S03", "E1S04"]
+    assert (chunk["count"], chunk["limit"]) == (1, limit)
+    if limit == 0:
+        assert "小林" in chunk["message"]
+    else:
+        assert not chunk.get("message")
+
+
+def test_grid_submission_reports_the_blocker_when_no_group_can_generate(monkeypatch, grid_with_character):
+    async def no_reference_input(*_args, **_kwargs):
+        raise ImageBucketCapabilityError(generation_type="i2i", provider_id="openai", model_id="local")
+
+    use_image_admission_context(monkeypatch, no_reference_input)
+    queue = _FakeQueue()
+    with _client(
+        monkeypatch, get_project_manager=lambda: grid_with_character, get_generation_queue=lambda: queue
+    ) as client:
+        response = client.post("/api/v1/projects/demo/generate/grid/1", json={"script_file": "episode_1.json"})
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert not result["success"]
+    assert result["task_ids"] == []
+    assert {item["code"] for item in result["blocked"]} == {"image_reference_images_exceeded"}
+    assert result["message"].splitlines() == [f"{item['scene_id']} · {item['message']}" for item in result["blocked"]]
+    assert queue.calls == []
+
+
 def test_grid_capability_gated_max_cell_count(monkeypatch, tmp_path):
     async def _gate(_project):
         return False
@@ -958,7 +1024,7 @@ def test_regenerate_grid_success(monkeypatch, tmp_path):
     grid = GridGeneration.create(
         episode=1,
         script_file="episode_1.json",
-        scene_ids=["a", "b", "c", "d"],
+        scene_ids=["E1S01", "E1S02", "E1S03", "E1S04"],
         rows=2,
         cols=2,
         grid_size="grid_4",
@@ -995,7 +1061,7 @@ def test_regenerate_replaces_an_orphan_with_an_active_task(monkeypatch, tmp_path
     grid = GridGeneration.create(
         episode=1,
         script_file="episode_1.json",
-        scene_ids=["a", "b", "c", "d"],
+        scene_ids=["E1S01", "E1S02", "E1S03", "E1S04"],
         rows=2,
         cols=2,
         grid_size="grid_4",
@@ -1102,7 +1168,7 @@ def _regenerate_with_frozen_ratio(monkeypatch, tmp_path, frozen: str | None) -> 
     grid = GridGeneration.create(
         episode=1,
         script_file="episode_1.json",
-        scene_ids=["a", "b", "c", "d"],
+        scene_ids=["E1S01", "E1S02", "E1S03", "E1S04"],
         rows=2,
         cols=2,
         grid_size="grid_4",
