@@ -11,7 +11,6 @@ import { API, ApiRequestError } from "@/api";
 import { useProjectsStore } from "@/stores/projects-store";
 import { useAppStore } from "@/stores/app-store";
 
-// Mock wouter navigation
 const navigateMock = vi.fn();
 vi.mock("wouter", () => ({
   useLocation: () => ["/app/projects", navigateMock],
@@ -128,14 +127,12 @@ function installStubs(name = "demo-proj") {
 const nextButton = () => screen.getByRole("button", { name: /^(下一步|Next)$/ });
 const clickNext = () => fireEvent.click(nextButton());
 
-/** 填好第一步的必填项：标题、创作类型、生成方式。 */
 function fillBasics({ mode = "旁白/解说", route = "分镜图生视频" }: { mode?: string; route?: string } = {}) {
   fireEvent.change(screen.getByRole("textbox", { name: "项目标题" }), { target: { value: "demo" } });
   fireEvent.click(screen.getByRole("radio", { name: new RegExp(mode) }));
   fireEvent.click(screen.getByRole("radio", { name: new RegExp(route) }));
 }
 
-/** 从第一步走到第三步，停在「创建项目」可点的状态。 */
 async function walkToStyle() {
   clickNext();
   await waitFor(() => expect(nextButton()).toBeEnabled());
@@ -143,7 +140,6 @@ async function walkToStyle() {
   return screen.findByRole("button", { name: "创建项目" });
 }
 
-/** 在第三步切到「自定义」并选中一张风格参考图，返回选中的文件。 */
 function pickCustomStyleFile() {
   fireEvent.click(screen.getByRole("tab", { name: "自定义" }));
   const file = new File(["content"], "style.png", { type: "image/png" });
@@ -321,7 +317,6 @@ describe("CreateProjectModal", () => {
     render(<CreateProjectModal />);
     fillBasics();
     fireEvent.click(screen.getByRole("switch", { name: "多宫格分镜" }));
-    // 切到参考生视频清空开关，切回来时保持关闭
     fireEvent.click(screen.getByRole("radio", { name: /参考生视频/ }));
     expect(screen.queryByRole("switch", { name: "多宫格分镜" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("radio", { name: /分镜图生视频/ }));
@@ -423,7 +418,6 @@ describe("CreateProjectModal", () => {
     render(<CreateProjectModal />);
     fillBasics();
     clickNext();
-    // 第二步按 i2v 执行模型（veo-3）列时长与分辨率
     fireEvent.click(await screen.findByRole("radio", { name: "4 秒" }));
     fireEvent.change(screen.getByRole("combobox", { name: /分辨率/ }), { target: { value: "1080p" } });
     fireEvent.click(screen.getByRole("button", { name: "上一步" }));
@@ -474,6 +468,163 @@ describe("CreateProjectModal", () => {
     await waitFor(() => expect(API.createProject).toHaveBeenCalled());
     const payload = vi.mocked(API.createProject).mock.calls[0][0] as { model_settings?: Record<string, unknown> };
     expect(payload.model_settings).toEqual({ "openai/gpt-image-2": { quality: "high" } });
+  });
+
+  it("lets step 2 pick independent t2i and i2i image resolutions when global defaults use different models", async () => {
+    vi.spyOn(API, "getSystemConfig").mockResolvedValue({
+      ...mockSysConfig,
+      settings: {
+        ...mockSysConfig.settings,
+        default_image_backend_t2i: "gemini-aistudio/nano-banana",
+        default_image_backend_i2i: "openai/gpt-image-2",
+      },
+      options: {
+        ...mockSysConfig.options,
+        image_backends: ["gemini-aistudio/nano-banana", "openai/gpt-image-2"],
+        provider_names: { "gemini-aistudio": "Gemini AI Studio", openai: "OpenAI" },
+      },
+    } as never);
+    vi.spyOn(API, "getProviders").mockResolvedValue({
+      providers: [
+        {
+          ...mockProviders.providers[0],
+          models: {
+            ...mockProviders.providers[0].models,
+            "nano-banana": {
+              display_name: "Nano Banana",
+              media_type: "image",
+              capabilities: [],
+              default: true,
+              supported_durations: [],
+              resolutions: ["1K", "2K", "4K"],
+              qualities: [],
+            },
+          },
+        },
+        {
+          id: "openai",
+          display_name: "OpenAI",
+          description: "",
+          status: "ready" as const,
+          media_types: ["image"],
+          capabilities: [],
+          credential_count: 0,
+          models: {
+            "gpt-image-2": {
+              display_name: "GPT Image 2",
+              media_type: "image",
+              capabilities: [],
+              default: true,
+              supported_durations: [],
+              resolutions: ["1K", "2K"],
+              qualities: [],
+            },
+          },
+        },
+      ],
+    } as never);
+
+    const user = userEvent.setup();
+    render(<CreateProjectModal />);
+    fillBasics();
+    clickNext();
+
+    const t2iPicker = await screen.findByRole("combobox", { name: "文生图 · 分辨率" });
+    const i2iPicker = screen.getByRole("combobox", { name: "图生图 · 分辨率" });
+    await user.click(t2iPicker);
+    await user.click(await screen.findByRole("option", { name: "4K" }));
+    await user.click(i2iPicker);
+    expect(screen.queryByRole("option", { name: "4K" })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole("option", { name: "2K" }));
+
+    clickNext();
+    fireEvent.click(await screen.findByRole("button", { name: "创建项目" }));
+
+    await waitFor(() => expect(API.createProject).toHaveBeenCalled());
+    const payload = vi.mocked(API.createProject).mock.calls[0][0] as { model_settings?: Record<string, unknown> };
+    expect(payload.model_settings).toEqual({
+      "gemini-aistudio/nano-banana": { resolution: "4K" },
+      "openai/gpt-image-2": { resolution: "2K" },
+    });
+  });
+
+  it("collapses split image resolutions into one picker when step 2 overrides the project default image model", async () => {
+    vi.spyOn(API, "getSystemConfig").mockResolvedValue({
+      ...mockSysConfig,
+      settings: {
+        ...mockSysConfig.settings,
+        default_image_backend_t2i: "gemini-aistudio/nano-banana",
+        default_image_backend_i2i: "openai/gpt-image-2",
+      },
+      options: {
+        ...mockSysConfig.options,
+        image_backends: ["gemini-aistudio/nano-banana", "openai/gpt-image-2"],
+        provider_names: { "gemini-aistudio": "Gemini AI Studio", openai: "OpenAI" },
+      },
+    } as never);
+    vi.spyOn(API, "getProviders").mockResolvedValue({
+      providers: [
+        {
+          ...mockProviders.providers[0],
+          models: {
+            ...mockProviders.providers[0].models,
+            "nano-banana": {
+              display_name: "Nano Banana",
+              media_type: "image",
+              capabilities: [],
+              default: true,
+              supported_durations: [],
+              resolutions: ["1K", "2K", "4K"],
+              qualities: [],
+            },
+          },
+        },
+        {
+          id: "openai",
+          display_name: "OpenAI",
+          description: "",
+          status: "ready" as const,
+          media_types: ["image"],
+          capabilities: [],
+          credential_count: 0,
+          models: {
+            "gpt-image-2": {
+              display_name: "GPT Image 2",
+              media_type: "image",
+              capabilities: [],
+              default: true,
+              supported_durations: [],
+              resolutions: ["1K", "2K"],
+              qualities: [],
+            },
+          },
+        },
+      ],
+    } as never);
+
+    const user = userEvent.setup();
+    render(<CreateProjectModal />);
+    fillBasics();
+    clickNext();
+
+    await user.click(await screen.findByRole("combobox", { name: "图生图 · 分辨率" }));
+    await user.click(await screen.findByRole("option", { name: "2K" }));
+    await user.click(screen.getByRole("combobox", { name: "默认图片模型" }));
+    await user.click(await screen.findByRole("option", { name: /nano-banana/ }));
+
+    expect(screen.queryByRole("combobox", { name: "文生图 · 分辨率" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "图生图 · 分辨率" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("combobox", { name: "分辨率" }));
+    await user.click(await screen.findByRole("option", { name: "4K" }));
+
+    clickNext();
+    fireEvent.click(await screen.findByRole("button", { name: "创建项目" }));
+
+    await waitFor(() => expect(API.createProject).toHaveBeenCalled());
+    const payload = vi.mocked(API.createProject).mock.calls[0][0] as { model_settings?: Record<string, unknown> };
+    expect(payload.model_settings).toEqual({
+      "gemini-aistudio/nano-banana": { resolution: "4K" },
+    });
   });
 
   it("shows an error toast and stays on step 3 when createProject fails", async () => {
@@ -560,7 +711,6 @@ describe("CreateProjectModal", () => {
     const shown = preview();
     expect(shown).not.toBeNull();
     expect(revoked).not.toHaveBeenCalledWith(shown);
-    // 不再显示的预览地址都已收回，同一时刻只有正在显示的那一个
     const stale = created.mock.results.map((r) => r.value as string).filter((url) => url !== shown);
     expect(revoked.mock.calls.map(([url]) => url).sort()).toEqual(stale.sort());
     created.mockRestore();
@@ -690,7 +840,6 @@ describe("CreateProjectModal language switch", () => {
       await i18n.changeLanguage("en");
     });
 
-    // 重取未完成时既有 step2 数据不被清空，向导仍显示旧目录而不是 loading
     expect(screen.getAllByText(/Gemini AI Studio（中文）/).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: /Next|下一步/ })).toBeEnabled();
 

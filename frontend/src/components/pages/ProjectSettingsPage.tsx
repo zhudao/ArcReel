@@ -16,7 +16,7 @@ import { ProjectMemoryFiles } from "@/components/agent-memory/ProjectMemoryFiles
 import { SaveBar } from "@/components/shared/edit-unit/SaveBar";
 import { PartialSaveError, useEditUnit } from "@/components/shared/edit-unit/useEditUnit";
 import { isValidEpisodeTargetDuration } from "@/components/shared/episode-target-duration";
-import { executingVideoModel } from "@/components/shared/model-layers";
+import { executingImageModel, executingVideoModel } from "@/components/shared/model-layers";
 import { countModelOverrides } from "@/components/shared/model-overrides";
 import { ModelConfigSection, type ModelConfigValue } from "@/components/shared/ModelConfigSection";
 import { narrationDeliveryProblem } from "@/components/shared/narration-delivery";
@@ -30,6 +30,7 @@ import { useCapabilitiesStore } from "@/stores/capabilities-store";
 import type { CustomProviderInfo, NarrationDefaultsResponse, ProviderInfo } from "@/types";
 import { errMsg, voidCall } from "@/utils/async";
 import { normalizeRoute } from "@/utils/generation-mode";
+import { styleUploadFailureReason } from "@/utils/style-upload-error";
 import { getProjectDisplayName } from "@/utils/project-display";
 import { getCustomProviderModels, getProviderModels } from "@/utils/provider-models";
 
@@ -42,6 +43,7 @@ import {
   isFormTab,
   keepSavedStylePreview,
   pendingStyleUpload,
+  storedImageQuality,
   styleImageUrl,
   tabDirty,
   type GlobalModelDefaults,
@@ -204,7 +206,6 @@ function ProjectSettingsView({ projectName }: { projectName: string }) {
   );
 }
 
-/** 外壳：顶栏「返回」回到项目工作台，侧栏分页记在 `?tab=`。 */
 function SettingsShell({
   projectName,
   title,
@@ -212,7 +213,6 @@ function SettingsShell({
   children,
 }: {
   projectName: string;
-  /** 项目显示名，加载完成前不显示。 */
   title?: string;
   badges?: Partial<Record<ProjectSettingsTab, ReactNode>>;
   children: ReactNode;
@@ -283,7 +283,7 @@ function basicsInvalid(value: ProjectSettingsForm, facts: ProjectFacts): boolean
 }
 
 function LoadedProjectSettings({ projectName, loaded }: { projectName: string; loaded: LoadedSettings }) {
-  const { t } = useTranslation("dashboard");
+  const { t, i18n } = useTranslation("dashboard");
   const tab = parseTab(useSearch());
   const { facts, globals } = loaded;
 
@@ -325,7 +325,11 @@ function LoadedProjectSettings({ projectName, loaded }: { projectName: string; l
       try {
         uploaded = await API.uploadStyleImage(projectName, file);
       } catch (error) {
-        throw new PartialSaveError(t("project_settings_style_upload_failed", { message: errMsg(error) }), {
+        const detail = styleUploadFailureReason(error, i18n.t("errors:upload_failed"));
+        const message = detail
+          ? t("project_settings_style_upload_failed_with_reason", { message: detail })
+          : t("project_settings_style_upload_failed");
+        throw new PartialSaveError(message, {
           saved: next,
           value: { ...next, style: value.style },
           cause: error,
@@ -336,7 +340,7 @@ function LoadedProjectSettings({ projectName, loaded }: { projectName: string; l
       const preview = styleImageUrl(projectName, uploaded.style_image, Date.now());
       return { ...next, style: { kind: "image", preview, description: uploaded.style_description, file: null } };
     },
-    [projectName, facts, globals, t],
+    [projectName, facts, globals, t, i18n],
   );
 
   // 四个表单分页之间切换不卸载编辑单元，不拦截；切到项目记忆、Agent 配置或离开本页时拦截
@@ -371,9 +375,13 @@ function LoadedProjectSettings({ projectName, loaded }: { projectName: string; l
   };
 
   const usesReferenceImages = facts.generationRoute === "reference_video";
+  const t2iModel = executingImageModel(value.models, globals, "t2i");
   const modelValue: ModelConfigValue = {
     ...value.models,
-    videoResolution: value.models.videoResolutions?.[executingVideoModel(value.models, globals, usesReferenceImages)] ?? null,
+    videoResolution: value.models.modelResolutions[executingVideoModel(value.models, globals, usesReferenceImages)] ?? null,
+    videoResolutions: value.models.modelResolutions,
+    imageResolution: value.models.modelResolutions[t2iModel] ?? null,
+    imageResolutions: value.models.modelResolutions,
   };
 
   let content: ReactNode;
@@ -391,9 +399,30 @@ function LoadedProjectSettings({ projectName, loaded }: { projectName: string; l
           <ModelConfigSection
             projectName={projectName}
             value={modelValue}
-            onChange={({ videoResolution: _videoResolution, ...next }) =>
-              setValue((prev) => ({ ...prev, models: { ...prev.models, ...next } }))
-            }
+            onChange={({
+              videoResolution: _videoResolution,
+              videoResolutions,
+              imageResolution: _imageResolution,
+              imageResolutions,
+              ...next
+            }) => {
+              const nextT2iModel = executingImageModel(next, globals, "t2i");
+              const nextResolutions =
+                videoResolutions !== modelValue.videoResolutions
+                  ? videoResolutions
+                  : imageResolutions !== modelValue.imageResolutions
+                    ? imageResolutions
+                    : value.models.modelResolutions;
+              setValue((prev) => ({
+                ...prev,
+                models: {
+                  ...prev.models,
+                  ...next,
+                  imageQuality: nextT2iModel === t2iModel ? next.imageQuality : storedImageQuality(prev.modelSettings, nextT2iModel),
+                  modelResolutions: nextResolutions ?? prev.models.modelResolutions,
+                },
+              }));
+            }}
             providers={loaded.providers}
             customProviders={loaded.customProviders}
             options={{

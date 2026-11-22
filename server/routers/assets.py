@@ -248,6 +248,16 @@ async def list_assets(
     }
 
 
+@router.get("/by-name")
+async def find_asset_by_name(type: str, name: str, _t: Translator):
+    if type not in GLOBAL_LIBRARY_ASSET_TYPES:
+        raise HTTPException(status_code=400, detail=_t("asset_invalid_type"))
+    asset_name = _validate_asset_name(name, _t)
+    async with async_session_factory() as s:
+        asset = await AssetRepository(s).get_by_type_name(type, asset_name)
+    return {"asset": {"id": asset.id, "type": asset.type, "name": asset.name} if asset is not None else None}
+
+
 @router.get("/{asset_id}")
 async def get_asset(asset_id: str, _t: Translator):
     async with async_session_factory() as s:
@@ -321,7 +331,7 @@ async def update_asset(
     patch = {k: v for k, v in req.model_dump().items() if v is not None}
     if "name" in patch:
         patch["name"] = _validate_asset_name(patch["name"], _t)
-    async with async_session_factory() as s:
+    async with library_entry_lock(asset_id), async_session_factory() as s:
         repo = AssetRepository(s)
         a = await repo.get_by_id(asset_id)
         if not a:
@@ -371,7 +381,6 @@ async def replace_image(
 ):
     # 同一条目的换图串行：在锁内读取被换下的旧图，提交后撤下的正是它
     async with library_entry_lock(asset_id):
-        # 1) 先取资产并校验存在
         async with async_session_factory() as s:
             repo = AssetRepository(s)
             a = await repo.get_by_id(asset_id)
@@ -401,7 +410,6 @@ async def replace_image(
                 await _discard(writer)
                 raise
 
-        # 4) DB 更新成功后才撤下旧图的引用、删除旧文件
         await _forget_after_commit(holder, [old_image])
         if old_image is not None and old_image.path != new_image.path:
             await _delete_global_asset_files([old_image.path])
@@ -415,6 +423,7 @@ class FromProjectRequest(BaseModel):
     resource_id: str
     override_name: str | None = None
     overwrite: bool = False
+    overwrite_asset_id: str | None = None
 
 
 @router.post("/from-project")
@@ -422,11 +431,9 @@ async def from_project(
     req: FromProjectRequest,
     _t: Translator,
 ):
-    # 1) 类型合法性
     if req.resource_type not in GLOBAL_LIBRARY_ASSET_TYPES:
         raise HTTPException(status_code=400, detail=_t("asset_invalid_type"))
 
-    # 2) 加载项目
     try:
         project = await asyncio.to_thread(get_project_manager().load_project, req.project_name)
     except FileNotFoundError as exc:
@@ -435,7 +442,6 @@ async def from_project(
         logger.exception("Failed to load project '%s' for from-project", req.project_name)
         raise HTTPException(status_code=500, detail=_t("asset_load_project_failed")) from exc
 
-    # 3) 从对应 bucket 中读取资源
     bucket_key = BUCKET_KEY[req.resource_type]
     bucket = project.get(bucket_key) or {}
     # 存量 key 与请求名可能是 NFC/NFD 中的任一形态，按坐标系解析
@@ -592,6 +598,9 @@ async def _store_from_project(
     located: tuple[_Source, list[tuple[str, str, _Source]], Path | None],
 ) -> dict:
     asset_name = _validate_asset_name(req.override_name or req.resource_id, _t)
+    if req.overwrite and req.overwrite_asset_id is not None:
+        async with library_entry_lock(req.overwrite_asset_id):
+            return await _write_from_project(req, _t, resource, located, asset_name)
     async with async_session_factory() as s:
         found = await AssetRepository(s).get_by_type_name(req.resource_type, asset_name)
     if found is None:
@@ -599,6 +608,10 @@ async def _store_from_project(
     # 覆盖已有条目与换图串行：锁内重新读取条目，提交后撤下的是这次真正换下的图片
     async with library_entry_lock(found.id):
         return await _write_from_project(req, _t, resource, located, asset_name)
+
+
+def _from_project_conflict(message: str, existing: dict | None) -> HTTPException:
+    return HTTPException(status_code=409, detail={"message": message, "existing": existing})
 
 
 async def _write_from_project(
@@ -618,15 +631,19 @@ async def _write_from_project(
         existing = await repo.get_by_type_name(req.resource_type, asset_name)
         # overwrite 会整表换掉衍生行；旧行的图片在 commit 成功后才删，故先取出。
         stale_derivatives = await repo.list_derivatives(existing.id) if existing is not None else []
-        conflict_payload = await _serialize_one(repo, existing) if existing is not None else None
-
-    if conflict_payload is not None and not req.overwrite:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": _t("asset_already_exists", name=asset_name),
-                "existing": conflict_payload,
-            },
+    if existing is not None and not req.overwrite:
+        raise _from_project_conflict(
+            _t("asset_already_exists", name=asset_name),
+            _serialize(existing, stale_derivatives),
+        )
+    if (
+        req.overwrite
+        and req.overwrite_asset_id is not None
+        and (existing is None or existing.id != req.overwrite_asset_id)
+    ):
+        raise _from_project_conflict(
+            _t("asset_overwrite_target_changed", name=asset_name),
+            _serialize(existing, stale_derivatives) if existing is not None else None,
         )
 
     # 5) 把源图、衍生图存进库（按全局设置写本地或对象存储），参考音频拷到 global_assets/{type}/{uuid}.{ext}。
@@ -664,7 +681,6 @@ async def _write_from_project(
                 derivative_fields[derivative_name] = columns
             await writer.hold()
 
-            # 6) 写 DB：条目、衍生与复制的关联在同一个事务里提交
             try:
                 payload, stale_images = await _write_library_entry(
                     req,
@@ -682,6 +698,15 @@ async def _write_from_project(
                     derivative_images=derivative_images,
                 )
             except IntegrityError as exc:
+                if existing is None:
+                    async with async_session_factory() as s:
+                        repo = AssetRepository(s)
+                        concurrent = await repo.get_by_type_name(req.resource_type, asset_name)
+                        if concurrent is not None:
+                            raise _from_project_conflict(
+                                _t("asset_already_exists", name=asset_name),
+                                await _serialize_one(repo, concurrent),
+                            ) from exc
                 raise HTTPException(status_code=409, detail=_t("asset_already_exists", name=asset_name)) from exc
         except BaseException:
             await _discard(writer)
@@ -792,7 +817,7 @@ def _applied_sheet_version(resource_type: str, resource_id: str, sheet_file: Pat
 class ApplyToProjectRequest(BaseModel):
     asset_ids: list[str]
     target_project: str
-    conflict_policy: str = "skip"  # 'skip' | 'overwrite' | 'rename'
+    conflict_policy: str = "skip"
 
 
 def _rejected_by_existing_name(project: dict, asset: Asset, conflict_policy: str) -> bool:
@@ -820,7 +845,6 @@ async def apply_to_project(
         raise HTTPException(status_code=400, detail=_t("asset_invalid_conflict_policy"))
     asset_ids = list(dict.fromkeys(req.asset_ids))
 
-    # 2) 校验目标项目存在
     project_manager = get_project_manager()
     try:
         project = await asyncio.to_thread(project_manager.load_project, req.target_project)
@@ -833,7 +857,6 @@ async def apply_to_project(
     skipped: list[dict] = []
     failed: list[dict] = []
 
-    # 3) 批量读取所有请求的 asset，缺失的直接归入 failed
     async with async_session_factory() as s:
         repo = AssetRepository(s)
         assets = await repo.get_by_ids(asset_ids)
@@ -886,7 +909,7 @@ async def apply_to_project(
         for asset_id in asset_ids:
             a = assets_by_id.get(asset_id)
             if a is None:
-                continue  # 已在 failed
+                continue
 
             bucket_key = BUCKET_KEY[a.type]
             sheet_key = SHEET_KEY[a.type]
@@ -911,9 +934,7 @@ async def apply_to_project(
                 elif not same_entry:
                     failed.append({"id": a.id, "reason": "project_name_conflict"})
                     continue
-                # overwrite 只能覆盖同类型的同名条目。
 
-            # 规划图片拷贝
             target_sheet: str | None = None
             copy_src: Path | None = None
             copy_dst: Path | None = None
@@ -1193,7 +1214,6 @@ async def apply_to_project(
                 VersionManager(project_dir).commit_installed_versions(commits, on_commit=_after_versions_committed)
 
             try:
-                # 应用后的图片是目标项目的新内容版本，按全局设置保存在本地或对象存储
                 async with formal_commit(req.target_project):
                     with project_change_source("webui"):
                         await run_noninterruptible_async(

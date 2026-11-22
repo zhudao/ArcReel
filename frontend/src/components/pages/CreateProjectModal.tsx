@@ -2,12 +2,13 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import { useTranslation } from "react-i18next";
 import { Loader2 } from "lucide-react";
-import { API, ApiRequestError } from "@/api";
+import { API } from "@/api";
 import type { ModelSettingEntry } from "@/types";
 import { useProjectsStore } from "@/stores/projects-store";
 import { useAppStore } from "@/stores/app-store";
 import { DEFAULT_TEMPLATE_ID } from "@/data/style-templates";
 import { errMsg, voidCall, voidPromise } from "@/utils/async";
+import { styleUploadFailureReason } from "@/utils/style-upload-error";
 import { formatNameList } from "@/utils/list-format";
 import { catalogDisplayNames, catalogDurations } from "@/utils/provider-models";
 import { Button } from "@/components/ui/button";
@@ -39,6 +40,7 @@ const EMPTY_MODELS: ModelConfigValue = {
   defaultDuration: null,
   videoResolution: null,
   imageResolution: null,
+  imageResolutions: {},
   imageQuality: null,
 };
 
@@ -82,23 +84,6 @@ async function loadGenerationData(signal: AbortSignal) {
   return { data, narrationDefaults };
 }
 
-/**
- * 风格图上传失败时服务端给出的可操作原因（未设文本默认模型、模型不支持图像输入等，均为 4xx）。
- * 网络错误、5xx 与网关错误、或服务端没给详情只剩传输层兜底文案时返回空串，调用方据此回落到通用提示。
- * 末尾句号去掉，由提示文案自己断句。
- */
-function styleUploadFailureReason(err: unknown, transportFallback: string): string {
-  if (!(err instanceof ApiRequestError) || err.status === undefined || err.status < 400 || err.status >= 500) {
-    return "";
-  }
-  const reason = err.message.trim().replace(/[。．.]+$/u, "");
-  return reason === transportFallback ? "" : reason;
-}
-
-/**
- * 新建项目向导：基础信息、生成设置、风格三步，走完三步才能创建。
- * 由项目大厅在 `useProjectsStore().showCreateModal` 为 true 时挂载，关闭时把它置回 false。
- */
 export function CreateProjectModal() {
   const { t, i18n } = useTranslation(["dashboard", "common", "templates"]);
   const [, navigate] = useLocation();
@@ -195,7 +180,6 @@ export function CreateProjectModal() {
 
   const isAd = basics.contentMode === "ad";
 
-  // 当前步骤还缺的必填项与需要修正的字段，按界面上的顺序列出
   const missing: string[] = [];
   const invalid: string[] = [];
   if (step === 1) {
@@ -223,7 +207,6 @@ export function CreateProjectModal() {
 
   const goTo = (next: WizardStep) => {
     setStep(next);
-    // 三步共用一个滚动区，进入新步骤时从顶部开始
     if (bodyRef.current) bodyRef.current.scrollTop = 0;
   };
 
@@ -240,18 +223,25 @@ export function CreateProjectModal() {
         videoR2V: "",
         image: "",
         imageT2I: "",
+        imageI2I: "",
       };
       const executingVideo = executingVideoModel(models, globals, generationRoute === "reference_video");
-      const executingImage = executingImageModel(models, globals);
+      const executingImage = executingImageModel(models, globals, "t2i");
+      const executingImageI2I = executingImageModel(models, globals, "i2i");
+      const t2iResolution = models.imageResolutions?.[executingImage] ?? null;
+      const i2iResolution = models.imageResolutions?.[executingImageI2I] ?? null;
       const modelSettings: Record<string, ModelSettingEntry> = {};
       if (executingVideo && models.videoResolution) {
         modelSettings[executingVideo] = { resolution: models.videoResolution };
       }
-      if (executingImage && (models.imageResolution || models.imageQuality)) {
+      if (executingImage && (t2iResolution || models.imageQuality)) {
         modelSettings[executingImage] = {
-          ...(models.imageResolution ? { resolution: models.imageResolution } : {}),
+          ...(t2iResolution ? { resolution: t2iResolution } : {}),
           ...(models.imageQuality ? { quality: models.imageQuality } : {}),
         };
+      }
+      if (executingImageI2I && executingImageI2I !== executingImage && i2iResolution) {
+        modelSettings[executingImageI2I] = { resolution: i2iResolution };
       }
 
       const resp = await API.createProject({
@@ -327,7 +317,6 @@ export function CreateProjectModal() {
     <Dialog
       open
       onOpenChange={(open) => {
-        // 创建请求在途时忽略关闭请求（Esc、关闭按钮、点击遮罩）
         if (!open && !creating) close();
       }}
     >

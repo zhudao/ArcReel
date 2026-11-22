@@ -15,6 +15,7 @@ import type {
 } from "@/types/edit-timeline";
 import { stubMediaElementPlayback } from "@/test/media-element";
 
+import { ClipInspector } from "./EditTimelineDetails";
 import { EditTimelineView } from "./EditTimelineView";
 
 function summary(id: string, name: string, updatedAt: string, revision = 1): EditTimelineSummary {
@@ -84,7 +85,6 @@ const SCRIPT = { episode: 1, video_units: [{ unit_id: "E1U1" }, { unit_id: "E1U3
 
 const NO_TIMELINE = () => <p>no timeline</p>;
 
-/** 播放器显示的当前时间（秒），即播放头的位置。 */
 function playheadSeconds(): number {
   const [minutes, seconds] = (screen.getByTestId("edit-playback-clock").textContent ?? "").split(":");
   return Number(minutes) * 60 + Number(seconds);
@@ -102,6 +102,37 @@ function renderView(ttsNarration = true) {
     />,
   );
 }
+
+describe("ClipInspector", () => {
+  function renderInspector(transition: EditClip["transition_to_next"]) {
+    render(
+      <ClipInspector
+        projectName="demo"
+        clip={clip({ id: "c1", unit_id: "E1U1", start: 0, duration: 5, transition_to_next: transition })}
+        trimIgnored={false}
+        thumbnail={undefined}
+        positions={new Map()}
+      />,
+    );
+  }
+
+  it("shows the export hint beside the transition type and duration", () => {
+    renderInspector({ type: "fade_white", duration: 0.5 });
+
+    expect(screen.getByText(/^闪白 0\.5.*s$/)).toBeVisible();
+    expect(screen.getByText("转场效果以导出为准")).toBeVisible();
+  });
+
+  it.each([null, { type: "cut", duration: 0.5 }, { type: "none", duration: 0.5 }])(
+    "omits the export hint for %j",
+    (transition) => {
+      renderInspector(transition);
+
+      expect(screen.getByText("转场")).toBeVisible();
+      expect(screen.queryByText("转场效果以导出为准")).not.toBeInTheDocument();
+    },
+  );
+});
 
 describe("EditTimelineView", () => {
   beforeEach(() => {
@@ -145,7 +176,6 @@ describe("EditTimelineView", () => {
     const [current, idle] = [screen.getByTestId("edit-player-video-0"), screen.getByTestId("edit-player-video-1")];
     expect(current).toHaveAttribute("src", "/api/v1/files/demo/reference_videos/E1U1.mp4?v=1");
     expect(current).toHaveAttribute("preload", "metadata");
-    // 播放之前不预载下一段
     expect(idle).not.toHaveAttribute("src");
 
     fireEvent.click(screen.getByRole("button", { name: "播放" }));
@@ -208,7 +238,6 @@ describe("EditTimelineView", () => {
     await waitFor(() => {
       expect((screen.getByTestId("edit-player-video-0") as HTMLVideoElement).volume).toBe(0);
     });
-    // 下一段在开始播放后才装进空闲元素
     fireEvent.click(screen.getByRole("button", { name: "播放" }));
     expect((screen.getByTestId("edit-player-video-1") as HTMLVideoElement).volume).toBe(0.5);
   });
@@ -530,7 +559,6 @@ describe("EditTimelineView", () => {
   });
 
   it("shows narration over the clips it runs across, subtitles that can be hidden, and BGM once there is any", async () => {
-    // c1 的旁白 4.5s，越过 c1 的出点延伸到 c3 上；c1 → c3 叠化
     const narrated: EditTimelineReadout = {
       ...INITIAL_CUT,
       clips: [
@@ -711,7 +739,6 @@ describe("EditTimelineView", () => {
     expect(playheadSeconds()).toBe(0);
 
     fireEvent.pointerDown(tracks, { button: 0, clientX: 390 });
-    // 点在轨道正中：7.8s 的一半
     await waitFor(() => expect(playheadSeconds()).toBeCloseTo(3.9, 1));
   });
 

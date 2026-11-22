@@ -11,28 +11,17 @@ import type {
 
 const CUSTOM_PREFIX = "custom-";
 
-// ---------------------------------------------------------------------------
-// Provider fetchers
-//
-// 供应商配置可变（用户在设置页改模型 supported_durations / 启用状态等），前端不持久缓存它：
-// 每次消费都直拉后端，避免长生命周期副本与后端单一真相源漂移（ADR 0035，能力来源见 ADR 0104）。
-// ---------------------------------------------------------------------------
 
-/** Fetch the built-in provider list (including models) fresh on every call. */
 export async function getProviderModels(options: { signal?: AbortSignal } = {}): Promise<ProviderInfo[]> {
   const res = await API.getProviders(options);
   return res.providers;
 }
 
-/** Fetch the custom provider list fresh on every call. */
 export async function getCustomProviderModels(options: { signal?: AbortSignal } = {}): Promise<CustomProviderInfo[]> {
   const res = await API.listCustomProviders(options);
   return res.providers;
 }
 
-// ---------------------------------------------------------------------------
-// Lookup
-// ---------------------------------------------------------------------------
 
 /** 目录里的供应商名与模型名（"provider/model" 为键），均已按 Accept-Language 成文。 */
 export interface CatalogDisplayNames {
@@ -84,7 +73,6 @@ export function lookupSupportedDurations(
   const providerId = videoBackend.slice(0, slashIdx);
   const modelId = videoBackend.slice(slashIdx + 1);
 
-  // Custom provider: "custom-{db_id}/{model_id}"
   if (providerId.startsWith(CUSTOM_PREFIX) && customProviders) {
     const dbId = parseInt(providerId.slice(CUSTOM_PREFIX.length), 10);
     const cp = customProviders.find((p) => p.id === dbId);
@@ -95,7 +83,6 @@ export function lookupSupportedDurations(
     return durations?.length ? durations : undefined;
   }
 
-  // Built-in provider
   const provider = providers.find((p) => p.id === providerId);
   const model = provider?.models?.[modelId];
   return model?.supported_durations?.length
@@ -186,9 +173,6 @@ export function lookupVideoAudioControl(
   return route === "r2v" ? model.reference_route_audio_track : model.audio_track;
 }
 
-// ---------------------------------------------------------------------------
-// Resolution lookup
-// ---------------------------------------------------------------------------
 
 // 自定义供应商的候选只是提示，输入框仍可自由填写；512px 低于 GPT Image 等模型的总像素下限，不作建议。
 export const IMAGE_STANDARD_RESOLUTIONS = ["1K", "2K", "4K"];
@@ -202,9 +186,9 @@ export function lookupResolutions(
   backend: string,
   customProviders?: CustomProviderInfo[],
   endpointToMediaType?: Record<string, MediaType>,
-): { options: string[]; isCustom: boolean } {
+): { options: string[]; isCustom: boolean; isKnown: boolean } {
   const slashIdx = backend.indexOf("/");
-  if (slashIdx === -1) return { options: [], isCustom: false };
+  if (slashIdx === -1) return { options: [], isCustom: false, isKnown: false };
   const providerId = backend.slice(0, slashIdx);
   const modelId = backend.slice(slashIdx + 1);
 
@@ -212,7 +196,7 @@ export function lookupResolutions(
     const dbId = parseInt(providerId.slice(CUSTOM_PREFIX.length), 10);
     const cp = customProviders.find((p) => p.id === dbId);
     const model = cp?.models?.find((m) => m.model_id === modelId);
-    if (!model) return { options: [], isCustom: true };
+    if (!model) return { options: [], isCustom: true, isKnown: false };
     const media = endpointToMediaType?.[model.endpoint];
     const standard =
       media === "image"
@@ -220,12 +204,12 @@ export function lookupResolutions(
         : media === "video"
           ? VIDEO_STANDARD_RESOLUTIONS
           : [];
-    return { options: standard, isCustom: true };
+    return { options: standard, isCustom: true, isKnown: true };
   }
 
   const provider = providers.find((p) => p.id === providerId);
   const model = provider?.models?.[modelId];
-  return { options: model?.resolutions ?? [], isCustom: false };
+  return { options: model?.resolutions ?? [], isCustom: false, isKnown: !!model };
 }
 
 /** 该 (provider, model) 的有效画质可选值，内置与自定义供应商都取模型信息上的 `qualities`。

@@ -2,6 +2,7 @@ import { beforeEach, describe, it, expect, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
+import { createDeferred } from "@/test/deferred";
 import {
   defaultTaskStats,
   isActiveStatus,
@@ -133,7 +134,6 @@ describe("taskResourceKind", () => {
 
 describe("selectActiveResourceIds with image_edit", () => {
   it("counts an in-flight edit toward its resource kind's occupancy set", () => {
-    // 角色 A 有一条运行中的编辑任务：应落入 character 占用集，与生成任务同槽互斥
     const tasks = [
       task({
         task_id: "edit-A",
@@ -152,7 +152,6 @@ describe("selectActiveResourceIds with image_edit", () => {
       }),
     ];
     expect([...selectActiveResourceIds(tasks, "character", "proj")].sort()).toEqual(["A", "B"]);
-    // 分镜编辑不串到 character 槽
     const sbEdit = [
       task({
         task_id: "edit-S",
@@ -190,7 +189,6 @@ describe("selectActiveResourceIds with image_edit", () => {
   });
 
   it("does not let a newer terminal generation hide a still-running edit task for the same resource", () => {
-    // 反向对称场景：编辑任务 running（较旧）+ 生成任务 succeeded（较新），编辑仍占用中
     const tasks = [
       task({
         task_id: "edit-A",
@@ -214,13 +212,11 @@ describe("selectActiveResourceIds with image_edit", () => {
 
 describe("selectActiveResourceIds optimistic occupancy", () => {
   it("counts a resource active via an in-flight marker when no real task row exists yet", () => {
-    // 请求已发出、后端 task_id 未知的往返窗口：仅凭在途标记也应判定占用
     const key = pendingKey("character", "A", "image_edit");
     expect(selectActiveResourceIds([], "character", "proj", new Set([key])).has("A")).toBe(true);
   });
 
   it("lets the marker's own task row supersede it regardless of that row's status", () => {
-    // 本次提交的任务行一旦出现（哪怕已是终态），占用判定就交回真实数据
     const key = settledKey("character", "A", "image_edit", ["edit-A"]);
     const tasks = [
       task({
@@ -440,7 +436,6 @@ describe("useTasksStore.setTasks prunes stale optimistic markers", () => {
   });
 
   it("never drops an in-flight marker, even on a poll that carries newer unrelated rows", () => {
-    // 晚到轮询不覆盖较新的乐观标记：请求往返期间任何写回都不足以判定资源已空闲
     const key = pendingKey("character", "A", "image_edit");
     useTasksStore.setState({ tasks: [], optimisticActive: new Set([key]) });
 
@@ -547,7 +542,6 @@ describe("selectHasActiveTaskForScriptFile", () => {
 
   describe("optimistic occupancy", () => {
     it("counts the scriptFile active via an in-flight marker when no real grid row exists yet", () => {
-      // 宫格请求发出到轮询写回新 grid 任务行之间的空窗：仅凭乐观标记也应判定本集占用中
       const key = pendingScriptFileKey("grid", "episode_1.json");
       expect(
         selectHasActiveTaskForScriptFile([], "grid", "episode_1.json", "proj", new Set([key])),
@@ -585,7 +579,7 @@ describe("selectHasActiveTaskForScriptFile", () => {
       ];
       expect(
         selectHasActiveTaskForScriptFile(landedOne, "grid", "episode_1.json", "proj", new Set([key])),
-      ).toBe(true); // 仅一条落地且已终态，标记继续守住剩余那条
+      ).toBe(true);
 
       const landedAll = [
         ...landedOne,
@@ -599,7 +593,7 @@ describe("selectHasActiveTaskForScriptFile", () => {
       ];
       expect(
         selectHasActiveTaskForScriptFile(landedAll, "grid", "episode_1.json", "proj", new Set([key])),
-      ).toBe(false); // 全部落地且均已终态，标记让位
+      ).toBe(false);
     });
 
     it("does not let another submission's grid row supersede the marker", () => {
@@ -653,7 +647,6 @@ describe("useTasksStore.beginOptimisticActiveForScriptFile", () => {
 
     useTasksStore.getState().beginOptimisticActiveForScriptFile("proj", "grid", "scripts/episode_1.json");
 
-    // 带前缀打的标记，用裸文件名查询也要命中
     expect(scriptFileActive("episode_1.json")).toBe(true);
   });
 
@@ -668,7 +661,6 @@ describe("useTasksStore.beginOptimisticActiveForScriptFile", () => {
   });
 
   it("treats settling with no task ids as a rollback", () => {
-    // 宫格按 scene_ids 过滤后无匹配分组时后端不建任务行，标记不能留下
     useTasksStore.setState({ tasks: [], optimisticActiveScriptFile: new Set() });
 
     const mark = useTasksStore.getState().beginOptimisticActiveForScriptFile("proj", "grid", "episode_1.json");
@@ -738,7 +730,6 @@ describe("useTasksStore.setTasks prunes stale optimisticActiveScriptFile markers
         updated_at: "2026-07-16T00:00:00Z",
       });
 
-    // 第一轮只看得到 grid-1：扣除它，标记继续守住 grid-2
     useTasksStore.getState().setTasks([row("grid-1", "grid-abc")]);
     const afterFirst = [...useTasksStore.getState().optimisticActiveScriptFile];
     expect(afterFirst).toHaveLength(1);
@@ -752,7 +743,6 @@ describe("useTasksStore.setTasks prunes stale optimisticActiveScriptFile markers
       ),
     ).toBe(true);
 
-    // 第二轮 grid-1 已被挤出窗口、只剩 grid-2：扣完，标记让位
     useTasksStore.getState().setTasks([row("grid-2", "grid-def")]);
     expect([...useTasksStore.getState().optimisticActiveScriptFile]).toEqual([]);
   });
@@ -866,7 +856,6 @@ describe("selectActiveResourceIds", () => {
   });
 
   it("reports a retry active when its newest row is running despite an older failed row", () => {
-    // 旧 failed + 新 running：重试不被旧失败行遮挡
     const tasks = [
       task({ task_id: "old", resource_id: "u1", status: "failed", updated_at: "2026-07-16T00:00:00Z" }),
       task({ task_id: "new", resource_id: "u1", status: "running", updated_at: "2026-07-16T01:00:00Z" }),
@@ -1019,7 +1008,6 @@ describe("refreshTasks（多入口共享刷新的在途合并）", () => {
     await useTasksStore.getState().refreshTasks();
     expect(useAppStore.getState().referenceVideoUnitsRevision).toBe(1);
 
-    // 同一条任务在后续轮次里已是终态，不再重复失效。
     await useTasksStore.getState().refreshTasks();
     expect(useAppStore.getState().referenceVideoUnitsRevision).toBe(1);
   });
@@ -1111,7 +1099,6 @@ describe("refreshTasks（多入口共享刷新的在途合并）", () => {
     expect(listSpy).toHaveBeenCalledTimes(1);
 
     releases[0]();
-    // 首轮落定后合并轮才发第二次请求——两个排队调用方合并成这一轮，不是各发一次。
     await vi.waitFor(() => expect(releases).toHaveLength(2));
     releases[1]();
     await Promise.all([first, second, third]);
@@ -1141,12 +1128,68 @@ describe("refreshTasks（多入口共享刷新的在途合并）", () => {
 
     const pending = useTasksStore.getState().refreshTasks();
     await Promise.resolve();
-    // 切项目：旧项目的在途响应此刻才回来，不能盖住接管方的数据。
     useTasksStore.getState().setRefreshScope({ projectName: "new-project" });
     releases[0]([task({ task_id: "stale" })]);
     await pending;
 
     expect(useTasksStore.getState().tasks).toEqual([]);
+  });
+
+  it("discards an old refresh after leaving and returning to the same project", async () => {
+    const fresh = task({ task_id: "fresh" });
+    const stale = task({ task_id: "stale" });
+    const oldList = createDeferred<Awaited<ReturnType<typeof API.listTasks>>>();
+    mockFetch([fresh]).mockReturnValueOnce(oldList.promise);
+    const lookup = vi.spyOn(API, "getTask").mockResolvedValue(
+      task({ task_id: "sample", task_type: "voice_sample", resource_id: "A", status: "succeeded" }),
+    );
+    const { beginOptimisticActive, refreshTasks, setRefreshScope } = useTasksStore.getState();
+    beginOptimisticActive("proj", "character", "A", "voice_sample").settle(["sample"]);
+    const snapshots: string[][] = [];
+    const unsubscribe = useTasksStore.subscribe(({ tasks }, previous) => {
+      if (tasks !== previous.tasks) snapshots.push(tasks.map(({ task_id }) => task_id));
+    });
+
+    setRefreshScope({ projectName: "proj" });
+    const previous = refreshTasks();
+    setRefreshScope({ projectName: "other" });
+    setRefreshScope({ projectName: "proj" });
+    const next = refreshTasks();
+    oldList.resolve({ items: [stale], total: 1, page: 1, page_size: 200 });
+    try {
+      await Promise.all([previous, next]);
+      expect(snapshots.filter((ids) => ids.includes(stale.task_id))).toEqual([]);
+      expect(useTasksStore.getState().tasks).toEqual([fresh]);
+      expect(lookup).toHaveBeenCalledOnce();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("releases a settled voice sample while another lookup is still pending", async () => {
+    mockFetch();
+    const ready = task({ task_id: "ready", task_type: "voice_sample", resource_id: "A", status: "succeeded" });
+    const slow = task({ task_id: "slow", task_type: "voice_sample", resource_id: "B", status: "running" });
+    const pending = createDeferred<TaskItem>();
+    vi.spyOn(API, "getTask").mockImplementation(
+      (taskId) => taskId === ready.task_id ? Promise.resolve(ready) : pending.promise,
+    );
+    const { beginOptimisticActive, refreshTasks, setRefreshScope } = useTasksStore.getState();
+    beginOptimisticActive("proj", "character", "A", "voice_sample").settle([ready.task_id]);
+    beginOptimisticActive("proj", "character", "B", "voice_sample").settle([slow.task_id]);
+    setRefreshScope({ projectName: "proj" });
+
+    vi.useFakeTimers();
+    const refresh = refreshTasks();
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(isResourceBusy("character", "proj", "A")).toBe(false);
+      expect(isResourceBusy("character", "proj", "B")).toBe(true);
+    } finally {
+      pending.resolve(slow);
+      await refresh;
+      vi.useRealTimers();
+    }
   });
 
   it("请求失败时置 connected=false 并留旧数据", async () => {
@@ -1159,6 +1202,129 @@ describe("refreshTasks（多入口共享刷新的在途合并）", () => {
 
     expect(useTasksStore.getState().connected).toBe(false);
     expect(useTasksStore.getState().tasks).toHaveLength(1);
+  });
+
+  it("clears snapshot occupancy for ordinary tasks and untracked voice samples when the list empties", async () => {
+    const listSpy = mockFetch([
+      task({ task_id: "image-1", task_type: "character", resource_id: "A", status: "running" }),
+      task({ task_id: "sample-1", task_type: "voice_sample", resource_id: "B", status: "running" }),
+    ]);
+    const lookup = vi.spyOn(API, "getTask");
+    const { beginOptimisticActive, refreshTasks, setRefreshScope } = useTasksStore.getState();
+    beginOptimisticActive("proj", "character", "A", "character").settle(["image-1"]);
+    setRefreshScope({ projectName: "proj" });
+    await refreshTasks();
+    expect(isResourceBusy("character", "proj", "A")).toBe(true);
+    expect(isResourceBusy("character", "proj", "B")).toBe(true);
+
+    listSpy.mockResolvedValue({ items: [], total: 0, page: 1, page_size: 200 });
+    await refreshTasks();
+    expect(isResourceBusy("character", "proj", "A")).toBe(false);
+    expect(isResourceBusy("character", "proj", "B")).toBe(false);
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it.each(["switches projects", "resets the scope"])(
+    "cancels a stalled reconciliation before refreshing the next project when it %s",
+    async (transition) => {
+      const oldSample = task({
+        task_id: "old-sample", task_type: "voice_sample", resource_id: "A", status: "running",
+      });
+      const newTask = task({ task_id: "new-task", project_name: "next", status: "succeeded" });
+      const list = mockFetch();
+      list.mockResolvedValueOnce({ items: [], total: 0, page: 1, page_size: 200 });
+      list.mockResolvedValue({ items: [newTask], total: 1, page: 1, page_size: 200 });
+      const stats = { ...defaultTaskStats, succeeded: 1, total: 1 };
+      vi.mocked(API.getTaskStats).mockResolvedValueOnce({ stats: defaultTaskStats });
+      vi.mocked(API.getTaskStats).mockResolvedValue({ stats });
+      const stalled = createDeferred<TaskItem>();
+      const started = createDeferred<AbortSignal | undefined>();
+      const lookup = vi.spyOn(API, "getTask").mockImplementation((_id, options) => {
+        started.resolve(options?.signal);
+        return stalled.promise;
+      });
+      const { beginOptimisticActive, refreshTasks, setRefreshScope, setTasks, setStats, setConnected } =
+        useTasksStore.getState();
+      beginOptimisticActive("proj", "character", "A", "voice_sample").settle([oldSample.task_id]);
+      setRefreshScope({ projectName: "proj" });
+
+      vi.useFakeTimers();
+      const previous = refreshTasks();
+      let next: Promise<void> | undefined;
+      try {
+        const signal = await started.promise;
+        setRefreshScope({ projectName: "proj" });
+        expect(signal?.aborted).toBe(false);
+        const resetsScope = transition === "resets the scope";
+        if (resetsScope) {
+          setRefreshScope(null);
+          setTasks([]);
+          setStats(defaultTaskStats);
+          setConnected(false);
+        }
+        expect(signal?.aborted).toBe(resetsScope);
+        setRefreshScope({ projectName: "next" });
+        next = refreshTasks();
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(signal?.aborted).toBe(true);
+        expect(useTasksStore.getState().tasks).toEqual([newTask]);
+        expect(useTasksStore.getState().stats).toEqual(stats);
+        expect(useTasksStore.getState().connected).toBe(true);
+        await Promise.all([previous, next]);
+        expect(lookup).toHaveBeenCalledOnce();
+
+        stalled.resolve({ ...oldSample, status: "succeeded" });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(isResourceBusy("character", "proj", "A")).toBe(true);
+      } finally {
+        stalled.resolve(oldSample);
+        await Promise.all([previous, next]);
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("continues refreshing after a missing voice sample lookup times out", async () => {
+    const running = task({
+      task_id: "sample-1",
+      task_type: "voice_sample",
+      media_type: "audio",
+      resource_id: "A",
+      status: "running",
+    });
+    const newer = task({ task_id: "newer", status: "succeeded" });
+    const listSpy = mockFetch();
+    listSpy.mockResolvedValueOnce({ items: [], total: 0, page: 1, page_size: 200 });
+    listSpy.mockResolvedValueOnce({ items: [newer], total: 1, page: 1, page_size: 200 });
+    const pending = createDeferred<TaskItem>();
+    const lookup = vi.spyOn(API, "getTask")
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValue(running);
+    const { beginOptimisticActive, refreshTasks, setRefreshScope } = useTasksStore.getState();
+    beginOptimisticActive("proj", "character", "A", "voice_sample").settle([running.task_id]);
+    setRefreshScope({ projectName: "proj" });
+
+    vi.useFakeTimers();
+    const first = refreshTasks();
+    const queued = refreshTasks();
+    try {
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(listSpy).toHaveBeenCalledTimes(2);
+      await Promise.all([first, queued]);
+      expect(lookup.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+      expect(lookup.mock.calls.map(([id]) => id)).toEqual([running.task_id, running.task_id]);
+      expect(useTasksStore.getState().tasks).toEqual([newer]);
+      expect(useTasksStore.getState().connected).toBe(true);
+
+      pending.resolve({ ...running, status: "succeeded" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(isResourceBusy("character", "proj", "A")).toBe(true);
+    } finally {
+      pending.resolve(running);
+      await Promise.all([first, queued]);
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -53,6 +53,7 @@ export interface ModelConfigValue {
   videoResolution: string | null;
   videoResolutions?: Record<string, string | null>;
   imageResolution: string | null;
+  imageResolutions?: Record<string, string | null>;
   /** 图片执行模型的画质；null 即未选择，后端按分辨率档位推出画质。存值原样保留，不在这里去空白。 */
   imageQuality: string | null;
 }
@@ -123,10 +124,6 @@ export interface ModelConfigSectionProps {
    * 时长选项据此过滤——该模式由所在页面持有，故从外部传入而非在本组件推断。
    */
   usesReferenceImages?: boolean;
-  /**
-   * 标出各通道的来源（项目设置用）：顶部说明本项目覆盖了几项全局默认，并可全部恢复；每个通道标题行
-   * 显示「本项目」与「恢复全局」，或「跟随全局 · 全局默认模型名」。
-   */
   showOverrideSources?: boolean;
   enable?: {
     video?: boolean;
@@ -148,7 +145,6 @@ function ChannelCard({ title, source, children }: { title: string; source?: Reac
   );
 }
 
-/** 通道内的字段小标题：本地化常规字，不用等宽大写。 */
 function FieldTitle({ children }: { children: React.ReactNode }) {
   return <div className="text-xs font-medium text-muted-foreground">{children}</div>;
 }
@@ -191,7 +187,8 @@ export function ModelConfigSection({
   // 它不是默认层那个模型，拿默认层去查会把用户引到执行时并不支持的时长与分辨率上。
   const executingVideo = executingVideoModel(value, globalDefaults, usesReferenceImages);
   const executingI2V = executingVideoModel(value, globalDefaults, false);
-  const executingImage = executingImageModel(value, globalDefaults);
+  const executingImage = executingImageModel(value, globalDefaults, "t2i");
+  const executingImageI2I = executingImageModel(value, globalDefaults, "i2i");
 
   // 穿透演算（docs/adr/0054，项目优先）：细分项留空 → 项目默认模型 → 全局同名细分 → 全局默认模型。
   const mediaCandidates = showSubFields ? candidates : null;
@@ -217,16 +214,19 @@ export function ModelConfigSection({
 
   const withImageLayer = (base: ModelConfigValue, patch: Partial<ModelConfigValue>): ModelConfigValue => {
     const next = { ...base, ...patch };
-    const nextExecuting = executingImageModel(next, globalDefaults);
-    return nextExecuting === executingImageModel(base, globalDefaults)
+    const nextExecuting = executingImageModel(next, globalDefaults, "t2i");
+    return nextExecuting === executingImageModel(base, globalDefaults, "t2i")
       ? next
-      : { ...next, imageResolution: null, imageQuality: null };
+      : {
+          ...next,
+          imageResolution: base.imageResolutions ? (base.imageResolutions[nextExecuting] ?? null) : null,
+          imageQuality: null,
+        };
   };
 
   const applyVideoLayer = (patch: Partial<ModelConfigValue>) => onChange(withVideoLayer(value, patch));
   const applyImageLayer = (patch: Partial<ModelConfigValue>) => onChange(withImageLayer(value, patch));
 
-  // 恢复全局：清空通道的模型字段，经与下拉相同的路径校正时长与分辨率；视频通道连同「生成有声视频」。
   const clearedFields = (channel: ModelChannel): Partial<ModelConfigValue> =>
     Object.fromEntries(CHANNEL_MODEL_FIELDS[channel].map((field) => [field, ""]));
   const resetChannel = (channel: ModelChannel) => {
@@ -359,7 +359,6 @@ export function ModelConfigSection({
           : "dashboard:audio_switch_locked_always_off",
       )
     : null;
-  // 按生效值判矛盾：项目级 null 表示跟随全局，全局为「关闭」时同样落在恒有声模型上。
   const audioConflict =
     audioControl === "always_on" && (videoGenerateAudio ?? globalVideoGenerateAudio) === false;
 
@@ -421,26 +420,28 @@ export function ModelConfigSection({
     flagStale = false,
   ) => {
     const res = lookupResolutions(providers, backend, customProviders, endpointToMediaType);
-    if (res.options.length === 0) return null;
+    const hasOptions = res.options.length > 0;
+    const stale = flagStale && res.isKnown && !res.isCustom && resolutionStale(resolution, res.options);
+    if (!hasOptions && !stale) return null;
     // 尺寸被 workflow 固定时选择器只展示不接受选择：比例与分辨率对该模型行无效，照收再丢弃
     // 只会让用户以为自己选的档位生效了。
     const constraints = lookupEndpointConstraints(backend, customProviders, endpointConstraints);
     const sizeFixed = constraints?.sizeFixed ?? false;
-    // 失效存值只在下拉形态下提示：输入框形态允许自由填写，候选之外的值是用户有意为之。
-    const stale = flagStale && !res.isCustom && resolutionStale(resolution, res.options);
     return (
       <div className="flex flex-col gap-1">
         <div className="flex items-center gap-2">
           <span className="text-xs font-medium text-muted-foreground">{label}</span>
-          <ResolutionPicker
-            mode={res.isCustom ? "combobox" : "select"}
-            options={res.options}
-            value={resolution}
-            onChange={onResolutionChange}
-            placeholder={resolutionPlaceholder(constraints, t)}
-            aria-label={label}
-            disabled={sizeFixed}
-          />
+          {hasOptions && (
+            <ResolutionPicker
+              mode={res.isCustom ? "combobox" : "select"}
+              options={res.options}
+              value={resolution}
+              onChange={onResolutionChange}
+              placeholder={resolutionPlaceholder(constraints, t)}
+              aria-label={label}
+              disabled={sizeFixed}
+            />
+          )}
         </div>
         {/* 禁用原因必须有一行可见说明：title 对键盘与触屏不可达。 */}
         {sizeFixed && <p className="text-xs text-muted-foreground">{t("resolution_fixed_hint")}</p>}
@@ -539,6 +540,29 @@ export function ModelConfigSection({
       </div>
     );
   };
+
+  const splitImageResolution = Boolean(
+    value.imageResolutions &&
+      executingImage &&
+      executingImageI2I &&
+      executingImage !== executingImageI2I,
+  );
+  const t2iResolution = value.imageResolutions
+    ? (value.imageResolutions[executingImage] ?? null)
+    : value.imageResolution;
+  const i2iResolution = value.imageResolutions
+    ? (value.imageResolutions[executingImageI2I] ?? null)
+    : null;
+  const setImageResolution = (model: string, next: string | null) =>
+    onChange(
+      value.imageResolutions
+        ? {
+            ...value,
+            imageResolution: model === executingImage ? next : value.imageResolution,
+            imageResolutions: { ...value.imageResolutions, [model]: next },
+          }
+        : { ...value, imageResolution: next },
+    );
 
   return (
     <div className="flex flex-col gap-4">
@@ -712,12 +736,41 @@ export function ModelConfigSection({
             subFieldsError={mediaCandidatesError}
             lifecycle={candidates?.lifecycle}
           >
-            {renderResolutionField(
-              executingImage,
-              value.imageResolution,
-              (v) => onChange({ ...value, imageResolution: v }),
-              t("resolution_label"),
-              true,
+            {splitImageResolution ? (
+              <>
+                {renderResolutionField(
+                  executingImage,
+                  t2iResolution,
+                  (v) => setImageResolution(executingImage, v),
+                  `${bucketLabels.t2i.label} · ${t("resolution_label")}`,
+                  true,
+                )}
+                {renderResolutionField(
+                  executingImageI2I,
+                  i2iResolution,
+                  (v) => setImageResolution(executingImageI2I, v),
+                  `${bucketLabels.i2i.label} · ${t("resolution_label")}`,
+                  true,
+                )}
+              </>
+            ) : executingImage ? (
+              renderResolutionField(
+                executingImage,
+                t2iResolution,
+                (v) => setImageResolution(executingImage, v),
+                t("resolution_label"),
+                true,
+              )
+            ) : (
+              value.imageResolutions &&
+              executingImageI2I &&
+              renderResolutionField(
+                executingImageI2I,
+                i2iResolution,
+                (v) => setImageResolution(executingImageI2I, v),
+                `${bucketLabels.i2i.label} · ${t("resolution_label")}`,
+                true,
+              )
             )}
             {renderImageQualityField()}
           </LayeredModelFields>
@@ -770,9 +823,6 @@ export function ModelConfigSection({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Stale stored values
-// ---------------------------------------------------------------------------
 
 /** 未选择：null 与纯空白都按未设置读，与后端读取存值的清洗一致。 */
 function storedValue(stored: string | null): string | null {
@@ -790,9 +840,6 @@ function resolutionStale(stored: string | null, options: readonly string[]): boo
 }
 
 
-// ---------------------------------------------------------------------------
-// Duration sub-components
-// ---------------------------------------------------------------------------
 
 /**
  * 时长档位的单选项：选中项用 secondary 底色。过期上下文下用 aria-disabled 而不是 disabled，
@@ -897,7 +944,6 @@ function DurationSlider({
   onChange: (next: number | null) => void;
   ariaLabel: string;
   autoLabel: string;
-  /** 同 {@link DurationButtonGroup}：过期上下文下只展示、不接受选择。 */
   disabled?: boolean;
 }) {
   const { t } = useTranslation("dashboard");

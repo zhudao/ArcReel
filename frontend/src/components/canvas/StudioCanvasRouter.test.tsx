@@ -344,7 +344,6 @@ function makeDramaScript(): EpisodeScript {
   };
 }
 
-/** 在集页页头改集标题：点铅笔、输入、回车保存。 */
 async function renameEpisode(title: string) {
   fireEvent.click(await screen.findByRole("button", { name: "编辑分集标题" }));
   const input = screen.getByRole("textbox", { name: "编辑分集标题" });
@@ -490,7 +489,6 @@ describe("StudioCanvasRouter", () => {
     view.navigate(`/${DEMO_PROJECT_NAME}/episodes/1`);
 
     await waitFor(() => {
-      // 缓存已清空：真实项目遗留的后端能力不再参与时长兼容性比对
       expect(screen.getByTestId("timeline-duration-options")).toHaveTextContent("");
     });
   });
@@ -555,8 +553,6 @@ describe("StudioCanvasRouter", () => {
     expect(capabilitiesSpy).not.toHaveBeenCalledWith(DEMO_PROJECT_NAME, expect.anything());
   });
 
-  // script_status 的三个取值来自项目摘要（由 script_plan 与正式脚本的产物态派生），
-  // 路由据此决定该集去源文审阅页还是画布——三种情况各钉一条。
   it("sends an episode with no script_plan and no script to the source review", () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
@@ -696,7 +692,6 @@ describe("StudioCanvasRouter", () => {
     });
 
     renderAt("/episodes/1?view=board");
-    // 只有脚本规划中间稿时分镜还不可选，停在脚本规划
     expect(screen.getByRole("tab", { name: "分镜" })).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByRole("tab", { name: "脚本规划" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("timeline-canvas")).toHaveAttribute("data-view", "plan");
@@ -754,7 +749,6 @@ describe("StudioCanvasRouter", () => {
     const dialog = await screen.findByRole("alertdialog", { name: "删除「EP1」" });
     await user.click(within(dialog).getByRole("button", { name: "移入项目回收站" }));
 
-    // 删掉的是正在看的这一集，回到分集列表
     await waitFor(() => expect(history.at(-1)).toBe("/episodes"));
     expect(remove).toHaveBeenLastCalledWith("demo", 1, "rev-1");
   });
@@ -947,7 +941,6 @@ describe("StudioCanvasRouter", () => {
         script_file: "episode_1.json",
         image_prompt: "new prompt",
       });
-      // 保存失败如实抛给分镜详情，由提示条显示，不另弹全局提示
       expect(screen.getByText("update-prompt")).toHaveAttribute("data-error", "update failed");
     });
     expect(useAppStore.getState().toast).toBeNull();
@@ -991,7 +984,7 @@ describe("StudioCanvasRouter", () => {
       scripts: { "episode_1.json": makeScript() },
     });
     let resolveUpdate: (result: { success: boolean }) => void = () => {};
-    vi.spyOn(API, "updateSegment").mockReturnValue(
+    const updateSegment = vi.spyOn(API, "updateSegment").mockReturnValue(
       new Promise((resolve) => {
         resolveUpdate = resolve;
       }),
@@ -999,12 +992,10 @@ describe("StudioCanvasRouter", () => {
 
     renderAt("/episodes/1");
 
-    fireEvent.click(screen.getByText("update-prompt-await"));
-
-    // 放几轮微任务/宏任务过去：底层 PATCH 仍未落地，回调不能提前 resolve——
-    // 若用 voidPromise 包一层，包装函数会在这里已经 resolve，暴露不出真正的 bug。
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    await act(async () => {
+      fireEvent.click(screen.getByText("update-prompt-await"));
+    });
+    expect(updateSegment).toHaveBeenCalledTimes(1);
     expect(screen.getByText("update-prompt-await")).toHaveAttribute("data-update-pending", "true");
 
     resolveUpdate({ success: true });
@@ -1056,7 +1047,6 @@ describe("StudioCanvasRouter", () => {
 
     fireEvent.click(screen.getByText("generate-video"));
     await waitFor(() => {
-      // duration 取分镜自身 duration_seconds(5),不回退默认值 4
       expect(API.generateVideo).toHaveBeenCalledWith(
         "demo",
         "SEG-1",
@@ -1122,7 +1112,6 @@ describe("StudioCanvasRouter", () => {
     await waitFor(() => {
       expect(moveSpy).toHaveBeenCalledWith("demo", "episode_1.json", "SEG-1", "SEG-2");
     });
-    // 重排 + 本地刷新都成功 → 报告移动成功
     await waitFor(() => {
       expect(screen.getByText("move-shot-later")).toHaveAttribute("data-move-result", "true");
     });
@@ -1251,7 +1240,6 @@ describe("StudioCanvasRouter", () => {
     expect(canvas).toHaveAttribute("data-has-script", "yes");
     expect(canvas).toHaveAttribute("data-preprocess", "no");
     expect(canvas).toHaveAttribute("data-free-duration", "yes");
-    // 分镜编辑画布在该路径下不再渲染
     expect(screen.queryByTestId("timeline-canvas")).not.toBeInTheDocument();
     // 广告/短片没有脚本规划，「分镜」称作「视频单元」；恒单集，不给删除
     expect(screen.queryByRole("tab", { name: "脚本规划" })).not.toBeInTheDocument();
@@ -1459,7 +1447,6 @@ describe("StudioCanvasRouter", () => {
       expect(API.updateEpisode).toHaveBeenCalledWith("demo", 1, { title: "新标题" });
       expect(API.getProject).toHaveBeenCalled();
     });
-    // 即时生效的修改成功不提示，标题回到展示态
     await waitFor(() => expect(screen.queryByRole("textbox", { name: "编辑分集标题" })).not.toBeInTheDocument());
     expect(useAppStore.getState().toast).toBeNull();
   });
@@ -1479,7 +1466,6 @@ describe("StudioCanvasRouter", () => {
     await waitFor(() =>
       expect(useAppStore.getState().toast).toMatchObject({ text: REFRESH_FAILED, tone: "warning" }),
     );
-    // 标题已保存，不停在编辑态引人重复提交
     await waitFor(() => expect(screen.queryByRole("textbox", { name: "编辑分集标题" })).not.toBeInTheDocument());
   });
 
@@ -1548,7 +1534,6 @@ describe("StudioCanvasRouter", () => {
       expect(useAppStore.getState().toast?.text).toContain("更新分集标题失败");
       expect(useAppStore.getState().toast?.tone).toBe("error");
     });
-    // 失败时保持编辑态，输入不丢
     expect(screen.getByRole("textbox", { name: "编辑分集标题" })).toHaveValue("新标题");
   });
 

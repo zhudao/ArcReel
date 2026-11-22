@@ -22,7 +22,6 @@ from lib.artifacts.artifact_activation import (
     resolve_usable_storyboard_video_inputs,
 )
 from lib.artifacts.artifact_manifest import ArtifactKey
-from lib.artifacts.generation_input import project_input_observation, storyboard_image_input
 from lib.backends.image_errors import ImageCapabilityError
 from lib.catalog.errors import ModelNotInCatalogError
 from lib.config.resolver import ConfigResolver, NoAvailableProviderError, video_bucket_for_generation_mode
@@ -42,7 +41,6 @@ from lib.project.asset_derivatives import DERIVATIVE_TASK_TYPE, DerivativeSheetS
 from lib.project.asset_types import ASSET_SPECS, resolve_asset_key, validate_asset_name
 from lib.project.project_change_hints import build_change_label, emit_project_change_batch, project_change_source
 from lib.project.project_manager import get_project_manager, is_reference_video_project
-from lib.prompts.reference_image_numbering import require_reference_image_limit
 from lib.script.script_editor import resolve_items
 from lib.script.script_models import get_generated_assets
 from lib.script.script_skeleton import resolve_script_kind
@@ -58,7 +56,12 @@ from lib.speech.speech_composition import SpeechMode, admit_script_unit
 from server.auth import CurrentUser
 from server.i18n import Translator
 from server.routers._validators import require_audio_switch_supported, require_video_bucket_capability
-from server.services.admission.image_references import check_asset_image_limit, reference_image_limit
+from server.services.admission.image_references import (
+    check_asset_image_limit,
+    check_storyboard_image_limit,
+    planned_previous_storyboard_id,
+    reference_image_limit,
+)
 from server.services.admission.reference_admission import require_admitted_storyboard_references
 from server.services.tasks.derivative_sheet_tasks import build_derivative_sheet_instruction
 from server.services.tasks.generation_context import AudioLaneRequest, resolve_generation_context
@@ -85,9 +88,6 @@ def _resolve_request_artifact_episode(
             script=script,
             script_filename=script_file,
         )
-
-
-# ==================== 请求模型 ====================
 
 
 class GenerateStoryboardRequest(BaseModel):
@@ -125,9 +125,6 @@ class EditImageRequest(BaseModel):
     script_file: str | None = None
 
 
-# ==================== 分镜图生成 ====================
-
-
 @router.post("/projects/{project_name}/generate/storyboard/{segment_id}")
 async def generate_storyboard(
     project_name: str,
@@ -155,21 +152,44 @@ async def generate_storyboard(
         if resolved[0].get("image_prompt") is None:
             raise ConflictError("script_prompt_pending", segment_id=segment_id)
         require_admitted_storyboard_references(project, [resolved[0]])
+        previous_id = planned_previous_storyboard_id(items, id_field, resolved[1])
 
-        return project, script, episode, pm_local.get_project_path(project_name)
+        return project, script, episode, pm_local.get_project_path(project_name), previous_id
 
-    project, script, episode, path = await run_sync_transaction(_sync)
+    project, script, episode, path, previous_id = await run_sync_transaction(_sync)
+    queue = get_generation_queue()
     maximum, model = await reference_image_limit(project_name, project, path)
     if maximum is not None:
-
-        def check_limit():
-            assembled = storyboard_image_input(
-                project, script, episode=episode, resource_id=segment_id, observation=project_input_observation(path)
+        pending_previous_id: str | None = None
+        if previous_id is not None:
+            active_previous = await queue.get_active_tasks_for_resources(
+                project_name=project_name,
+                task_type="storyboard",
+                resource_ids=[previous_id],
+                script_file=req.script_file,
+                user_id=user.id,
             )
-            require_reference_image_limit([ref.visual for ref in assembled.references], maximum, model=model)
+            if any(str(task.get("resource_id") or "") == previous_id for task in active_previous):
+                pending_previous_id = previous_id
+
+        def check_limit() -> None:
+            current_script = (
+                get_project_manager().load_script(project_name, req.script_file)
+                if previous_id is not None and pending_previous_id is None
+                else script
+            )
+            check_storyboard_image_limit(
+                project,
+                current_script,
+                path,
+                episode=episode,
+                resource_id=segment_id,
+                limit=(maximum, model),
+                pending_previous_id=pending_previous_id,
+            )
 
         try:
-            await asyncio.to_thread(check_limit)
+            await run_sync_transaction(check_limit)
         except ImageCapabilityError as exc:
             raise BadRequestError(exc.code, **exc.params).with_diagnostic(
                 {"code": exc.code, "params": exc.params}
@@ -185,8 +205,6 @@ async def generate_storyboard(
         script_file=req.script_file,
     )
 
-    # 入队
-    queue = get_generation_queue()
     result = await queue.enqueue_task(
         project_name=project_name,
         task_type=spec.task_type,
@@ -204,9 +222,6 @@ async def generate_storyboard(
         "deduped": result.get("deduped", False),
         "message": _t("storyboard_task_submitted", segment_id=segment_id),
     }
-
-
-# ==================== 视频生成 ====================
 
 
 @router.post("/projects/{project_name}/generate/video/{segment_id}")
@@ -336,9 +351,6 @@ async def generate_video(
         "deduped": result.get("deduped", False),
         "message": _t("video_task_submitted", segment_id=segment_id),
     }
-
-
-# ==================== 旁白配音（TTS）生成 ====================
 
 
 async def _require_audio_provider_configured(project: dict) -> str:
@@ -522,8 +534,6 @@ async def generate_tts_batch(
         "message": message,
     }
 
-
-# ==================== 角色参考音频：TTS 试听样本 ====================
 
 # 试听文案长度粗护栏（与前端 VOICE_SAMPLE_TEXT_MAX_LENGTH 同值）。参考音频要求 2-10 秒，
 # 而「多少字合成出几秒」随语种与音色而变、提交前无法精确判定；此处只挡住整段粘贴导致的
@@ -714,9 +724,6 @@ async def confirm_character_voice_sample(
         "path": saved["path"],
         "url": f"/api/v1/files/{project_name}/{saved['path']}",
     }
-
-
-# ==================== 资产图生成（character / scene / prop / product 共用） ====================
 
 
 # i18n key 命名差异：scene 用历史前缀 "project_scene_*"
@@ -913,9 +920,6 @@ async def generate_product(
         user_id=user.id,
         _t=_t,
     )
-
-
-# ==================== 图片指令式编辑（image edit） ====================
 
 
 async def _require_i2i_image_provider_configured(project: dict) -> str:

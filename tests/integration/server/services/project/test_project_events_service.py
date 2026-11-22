@@ -281,7 +281,6 @@ class TestProjectEventService:
                 emit_project_change_batch("demo", [_terminal_task_change("task-1")], source="worker")
                 await asyncio.wait_for(first_read_done.wait(), timeout=5.0)
 
-                # 首次读盘之后落盘一个新角色：直接改写 project.json，不发 hint
                 project_json = pm.get_project_path("demo") / "project.json"
                 data = json.loads(project_json.read_text(encoding="utf-8"))
                 data.setdefault("characters", {})["新角色"] = {"name": "新角色", "description": "d"}
@@ -423,7 +422,6 @@ class TestProjectEventService:
                 event_name, _snapshot = await anext(stream)
                 assert event_name == "snapshot"
 
-                # worker 次序：先落盘资产，再发对应的完成事件
                 script["segments"][0]["generated_assets"]["storyboard_image"] = "storyboards/E1S01.png"
                 script_path = pm.get_project_path("demo") / "scripts" / "episode_1.json"
                 script_path.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
@@ -648,7 +646,6 @@ class TestProjectEventService:
 
                 reader.hook = _read_holding_first
 
-                # 批次 A：与分镜无关的终态事件，只为触发重建
                 emit_project_change_batch("demo", [_terminal_task_change("task-a")], source="worker")
                 await asyncio.wait_for(first_read_done.wait(), timeout=5.0)
 
@@ -804,10 +801,7 @@ class TestProjectEventService:
                 assert event_name == "snapshot"
 
                 channel = service._channels["demo"]
-                # 订阅时的首轮扫描会清空标记，等它落定再预置，否则重建捕获到的是空集合
-                await asyncio.sleep(0.1)
                 assert channel.pending_sources == set()
-                # 重建发起前已在册的标记
                 channel.pending_sources.add("webui")
 
                 read_started = asyncio.Event()
@@ -823,7 +817,6 @@ class TestProjectEventService:
                 emit_project_change_batch("demo", [_terminal_task_change("task-1")], source="worker")
                 await asyncio.wait_for(read_started.wait(), timeout=5.0)
 
-                # 读盘窗口内同一来源再次 hint
                 channel.pending_sources.add("webui")
                 release_read.set()
 
@@ -961,28 +954,37 @@ class TestProjectEventService:
         service = ProjectEventService(tmp_path, poll_interval=0.05)
         await service.start()
 
-        # 模拟首次扫描卡住:watch task 永不 set ready_event,_subscribe 会 park 在 wait()。
+        watch_started = asyncio.Event()
+
         async def _never_ready(project_name, channel):
-            await asyncio.sleep(3600)
+            watch_started.set()
+            await asyncio.Future()
 
         monkeypatch.setattr(service, "_watch_project", _never_ready)
 
-        task = asyncio.create_task(service._subscribe("demo"))
-        await asyncio.sleep(0.05)  # 让 _subscribe 注册 queue 并 park
-        channel = service._channels["demo"]
-        assert channel.sse.has_subscribers  # 已注册
-        watch_task = channel.task
+        async def subscribe():
+            async with service.stream_events("demo"):
+                pytest.fail("首次扫描完成前，订阅不应返回")
 
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        task = asyncio.create_task(subscribe())
+        try:
+            await asyncio.wait_for(watch_started.wait(), timeout=5)
+            channel = service._channels["demo"]
+            assert channel.sse.has_subscribers
+            watch_task = channel.task
+            assert watch_task is not None
 
-        # 取消后:订阅者被清理、channel 被弹出、watch task 被取消(不泄漏)。
-        assert "demo" not in service._channels
-        await asyncio.sleep(0)  # 让 watch task 的取消落定
-        assert watch_task.cancelled() or watch_task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
-        await service.shutdown()
+            assert "demo" not in service._channels
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(watch_task, timeout=5)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await service.shutdown()
 
     @pytest.mark.asyncio
     async def test_new_subscriber_entering_during_stop_watch_stays_registered(self, tmp_path, monkeypatch):
@@ -1013,27 +1015,21 @@ class TestProjectEventService:
 
             monkeypatch.setattr(service, "_watch_project", _controlled_watch)
 
-            # 订阅者 A 拉起旧通道与旧 watch task。
             _sse_a, queue_a, _snap_a = await service._subscribe("demo")
             old_channel = service._channels["demo"]
             old_watch_task = old_channel.task
 
-            # A 退订触发末订阅者钩子；钩子停在等已取消 watch task 退出的收尾点。
             stop_task = asyncio.create_task(service._unsubscribe("demo", queue_a))
             await asyncio.wait_for(entered_cancel.wait(), timeout=1.0)
 
-            # 窗口内新订阅者 B 进入。
             _sse_b, queue_b, _snap_b = await service._subscribe("demo")
 
-            # 放行旧 watch task，让末订阅者钩子跑完收尾。
             allow_exit.set()
             await asyncio.wait_for(stop_task, timeout=1.0)
 
-            # B 归属注册表中的现行通道，旧通道已退役。
             assert "demo" in service._channels
             assert service._channels["demo"] is not old_channel
 
-            # 经注册表路由的 hint 广播抵达 B。
             service._apply_emitted_batch(
                 "demo",
                 "worker",
@@ -1052,7 +1048,6 @@ class TestProjectEventService:
             event_name, _payload = queue_b.get_nowait()
             assert event_name == "changes"
 
-            # 旧 watch task 退役，未脱离注册表继续运行。
             assert old_watch_task.done()
         finally:
             # 断言或 wait_for 提前失败时，被刻意挂起的 watch/stop task 仍需释放，
@@ -1113,7 +1108,7 @@ class TestProjectEventService:
                 (pm.get_project_path("demo") / ProjectManager.PROJECT_FILE).unlink()
                 # 等至少一个轮询周期，让扫描命中缺失的 project.json。
                 await asyncio.sleep(0.3)
-                assert "demo" in service._channels  # 通道未终止，仍在注册表中
+                assert "demo" in service._channels
 
         assert any(record.levelno >= logging.ERROR for record in caplog.records)
         assert not any("已被删除" in record.message for record in caplog.records)

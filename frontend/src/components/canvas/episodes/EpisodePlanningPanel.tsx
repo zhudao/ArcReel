@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Bot, CheckCircle2, Loader2, Sparkles } from "lucide-react";
 
@@ -24,16 +24,11 @@ import { PlanningFailureNote } from "./PlanningFailureNote";
 interface Props {
   projectName: string;
   view: EpisodesView;
-  /** 本项目有分集规划在排队或执行。 */
   active: boolean;
   /** 已提交规划或交给 Agent：调用方据此收起弹层。 */
   onStarted?: () => void;
 }
 
-/**
- * 「分集」视图页头「AI 规划分集」弹层的内容：附加指令、「交给 Agent」与直接调用，进行中显示进度与停止，
- * 上一次规划失败时给出原因与出路，整本规划完后给出体量统计。
- */
 export function EpisodePlanningPanel({ projectName, view, active, onStarted }: Props) {
   const { t } = useTranslation(["dashboard", "common"]);
   const [instruction, setInstruction] = useState(() => lastInstruction(projectName));
@@ -44,19 +39,6 @@ export function EpisodePlanningPanel({ projectName, view, active, onStarted }: P
   const tasks = useTasksStore((s) => s.tasks);
   const targetSeconds = useProjectsStore((s) => s.currentProjectData?.episode_target_duration ?? null);
   const failure = useMemo(() => (active ? null : lastPlanningFailure(tasks, projectName)), [active, tasks, projectName]);
-  const queuedWindow = tasks.some(
-    (task) =>
-      task.project_name === projectName &&
-      task.task_type === "text_episode_plan" &&
-      task.status === "queued" &&
-      (EPISODE_PLANNING_SLOTS as readonly string[]).includes(task.resource_id),
-  );
-
-  // 停止的时机：执行中的那一窗在请求模型前才把下一窗排进队列，停止若落在这之前就取消不到它；
-  // 停止请求未了结时，再看到排队的窗口就再停一次。
-  useEffect(() => {
-    if (active && stopRequested && queuedWindow) void API.stopEpisodePlanning(projectName).catch(() => undefined);
-  }, [active, stopRequested, queuedWindow, projectName]);
   // 规划结束即了结停止请求，下一次规划从头开始
   if (!active && (stopRequested || finishingWindow)) {
     setStopRequested(false);
