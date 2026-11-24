@@ -22,7 +22,9 @@ paths:
 | `integration` | 真实 DB、运行时文件系统读写（数据根、用户目录等）、随包 ffmpeg 子进程 |
 | `e2e` | 真实外部服务（远程 API、大模型调用）；CI 默认跳过 |
 
-档位目录缺失，或者 unit 档用例使用了 `tests/conftest.py` 的数据库 fixture（被注入 `uses_db`），收集期就会拒绝；不经这些 fixture 自行连接真实 DB、拉起子进程和访问网络都没有机械校验，由审查判断。unit 档的用例拉起子进程（git、ffmpeg）或访问网络时，`-m unit` 快速循环会变慢，还会开始依赖本机环境；反过来，什么都不触达的用例放在 integration 档，会被挤出快速循环，也会落进错误的 CI 分片。读取仓库内已提交的文件（prompt 规则、技能文本、文档等）既快，又随 checkout 确定存在，不会拖慢快速循环，也不依赖本机环境，因此留在 unit 档。
+档位目录缺失，或者 unit 档用例使用了 `tests/conftest.py` 的数据库 fixture（被注入 `uses_db`），收集期就会拒绝。用例自行连接真实 DB、拉起子进程等行为仍由审查判断。unit 档的用例拉起子进程（git、ffmpeg）或访问网络时，`-m unit` 快速循环会变慢，还会开始依赖本机环境；反过来，什么都不触达的用例放在 integration 档，会被挤出快速循环，也会落进错误的 CI 分片。读取仓库内已提交的文件（prompt 规则、技能文本、文档等）既快，又随 checkout 确定存在，不会拖慢快速循环，也不依赖本机环境，因此留在 unit 档。
+
+`tests/conftest.py` 在 unit 和 integration 用例的执行期间拦截 Python socket 的非回环出站连接和外部 DNS 查询，放行回环地址（含 `localhost`）和 Unix domain socket。出现 `Non-loopback network blocked` 时，为请求补上网络替身，或按用例档位使用回环测试服务。访问真实外部服务的用例放在 `tests/e2e/`，该档位保留正常的网络连接和 DNS 解析。
 
 位置约定：alembic 迁移测试每个迁移脚本一个文件，放在 `tests/integration/lib/db/migrations/`，继续用 SQLite；workspace 子包的测试放在 `packages/<子包>/tests/`，按子包源码的目录结构排布、不分档位；断言子包输出渲染成自然语言之后的结果的用例，放在主仓 `tests/unit/lib/i18n/`。
 
@@ -39,10 +41,6 @@ paths:
 ### 需要控制内部行为时加 seam，seam 是带生产默认值的显式参数
 
 seam 指带有生产默认值、且不改变生产行为的构造参数或关键字参数，例如 `retry_async(operation, *, clock=..., jitter=...)`。它适用于轮询时钟、间隔、退避、HTTP 探测客户端、文件系统与子进程。模块级的可替换全局变量不算 seam，因为它会让测试之间共享可变状态。可测性改造同样不得改变生产行为，前端仅允许抽取纯函数及进行 hook 级的结构性拆分。
-
-### 进程级缓存的重置钩子是公开函数 `reset_for_tests()` / `reset_<名称>_for_tests()`
-
-生产模块用 `functools.cache` 这类进程级缓存时，暴露公开的重置钩子（如 `lib.infra.app_data_dir.reset_for_tests`），只清缓存、不改生产行为。这是过渡形态：新代码优先把缓存依赖做成参数注入。
 
 ### 出站 HTTP 用 respx 拦截，FastAPI 依赖用 `dependency_overrides`
 

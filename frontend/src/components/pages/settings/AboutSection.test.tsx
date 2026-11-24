@@ -1,7 +1,9 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { API } from "@/api";
+import { BRAND } from "@/branding";
+import i18n from "@/i18n";
 import { AboutSection } from "./AboutSection";
 import type { GetSystemVersionResponse } from "@/types/system";
 
@@ -45,7 +47,6 @@ describe("AboutSection diagnostics download", () => {
       }
 
       expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
-      // click() 触发下载后不应同步回收，否则部分浏览器下载会静默失败
       expect(URL.revokeObjectURL).not.toHaveBeenCalled();
 
       await vi.advanceTimersByTimeAsync(0);
@@ -75,9 +76,6 @@ describe("AboutSection diagnostics download", () => {
     const button = await screen.findByRole("button", { name: "下载诊断日志" });
     await user.click(button);
 
-    // 遍历全部被创建的 <a> 标签查找下载锚点，不依赖「单一可变引用最后一次写入即为目标」
-    // 的假设——组件恒渲染的 GitHub 署名锚点先于下载锚点创建；用数组可避免未来若有更多
-    // <a> 创建（例如重渲染顺序变化）时单一引用被覆盖导致测试失真。
     await waitFor(() => {
       const target = createdAnchors.find((a) => a.download === "custom-diagnostics.zip");
       expect(target).toBeDefined();
@@ -108,11 +106,47 @@ describe("AboutSection release notes", () => {
 
     await user.click(toggle);
 
-    // 正文可能从纯文本替换为 Markdown；同步查询并断言可见，不依赖子组件加载时序。
     await waitFor(() => expect(screen.getByText(/faster exports/)).toBeVisible());
     expect(await screen.findByRole("link", { name: /打开 GitHub Release/ })).toHaveAttribute(
       "href",
       "https://github.com/example/ArcReel/releases/tag/v1.1.0",
     );
+  });
+});
+
+describe("AboutSection documentation link", () => {
+  beforeEach(() => {
+    vi.spyOn(API, "getSystemVersion").mockResolvedValue(VERSION_RESPONSE);
+  });
+
+  afterEach(async () => {
+    if (i18n.language !== "zh") {
+      await i18n.changeLanguage("zh");
+    }
+  });
+
+  it("renders the documentation external link for Chinese UI", async () => {
+    render(<AboutSection />);
+
+    const link = await screen.findByRole("link", { name: "打开使用文档" });
+    expect(link).toBeVisible();
+    expect(link).toHaveAttribute("href", `${BRAND.docsUrl}/`);
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it.each([
+    ["en", "Open Documentation"],
+    ["vi", "Mở tài liệu hướng dẫn"],
+    ["ru", "Открыть документацию"],
+  ] as const)("points to /en/ when UI language is %s", async (lang, linkName) => {
+    await i18n.changeLanguage(lang);
+    render(<AboutSection />);
+
+    const link = await screen.findByRole("link", { name: linkName });
+    expect(link).toBeVisible();
+    expect(link).toHaveAttribute("href", `${BRAND.docsUrl}/en/`);
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
   });
 });

@@ -33,7 +33,11 @@ from server.media_tools.context import (
     generation_result_outcome,
     tool_error,
 )
-from server.services.admission.image_references import reference_image_limit
+from server.services.admission.image_references import (
+    active_storyboard_ids,
+    planned_previous_storyboard_ids,
+    reference_image_limit,
+)
 from server.services.admission.storyboard_batch import (
     STORYBOARD_BATCH_OPERATION,
     plan_storyboard_image_batch,
@@ -105,20 +109,13 @@ async def generate_storyboards(
             try:
                 project_data = services.projects.load_project(scope.project_name)
             except FileNotFoundError:
-                # project.json 缺失时允许降级到空 dict（style 走默认值）；
-                # JSON 损坏 / 权限错误等其他异常应该让外层 tool_error 暴露出来，
-                # 否则会用空 style 静默继续入队，丢掉了配置。
                 project_data = {}
 
             if project_data:
-                # 失配剧本在此被拒：按分镜图生视频该读的数组不在剧本里，继续走下去
-                # 会落进空结果的假成功，把成因埋掉。project.json 缺失时无生成模式可依，
-                # 沿用上面的降级放行。
                 ensure_route_skeleton(
                     script, resolve_content_mode(script, project_data), project_data.get("generation_mode")
                 )
 
-            resolver = active_artifact_currency_resolver(project_dir, project_data)
             episode = (
                 resolve_artifact_episode(
                     project=project_data,
@@ -127,21 +124,38 @@ async def generate_storyboards(
                 )
                 or 1
             )
-            return project_dir, resolver, project_data, script, episode
+            return project_dir, project_data, script, episode
 
-        project_dir, resolver, project_data, script, episode = await run_sync_transaction(load_inputs)
+        project_dir, project_data, script, episode = await run_sync_transaction(load_inputs)
         image_limit = await reference_image_limit(scope.project_name, project_data, project_dir)
-        plan = await asyncio.to_thread(
-            plan_storyboard_image_batch,
-            project=project_data,
-            script=script,
+        previous_ids = planned_previous_storyboard_ids(script, segment_ids) if image_limit[0] is not None else []
+        active_ids = await active_storyboard_ids(
+            services.queue,
+            project_name=scope.project_name,
             script_file=script_filename,
-            episode=episode,
-            resolver=resolver,
-            requested_ids=segment_ids,
-            project_path=project_dir,
-            image_limit=image_limit,
+            resource_ids=previous_ids,
+            user_id=caller.user_id,
         )
+
+        def plan_batch():
+            current_script = (
+                services.projects.load_script(scope.project_name, script_filename) if previous_ids else script
+            )
+            resolver = active_artifact_currency_resolver(project_dir, project_data)
+            plan = plan_storyboard_image_batch(
+                project=project_data,
+                script=current_script,
+                script_file=script_filename,
+                episode=episode,
+                resolver=resolver,
+                requested_ids=segment_ids,
+                project_path=project_dir,
+                image_limit=image_limit,
+                active_ids=active_ids,
+            )
+            return plan, resolver
+
+        plan, resolver = await run_sync_transaction(plan_batch)
         by_id = plan.states
         specs = plan.task_specs(source=caller.source)
 
@@ -159,8 +173,6 @@ async def generate_storyboards(
             return generation_batch_submission_outcome(submitted.batch)
         if specs:
             recorder = _FailureRecorder(project_dir / "storyboards")
-            # narration → segment_id / drama → scene_id：``id_field`` 是脚本里
-            # 的规范字段名，``"segment"`` / ``"scene"`` 是对应的资源类型。
             resource_type = "segment" if plan.id_field == "segment_id" else "scene"
             for br in submitted.failures:
                 recorder.record(br.resource_id, resource_type, br.error or "unknown")

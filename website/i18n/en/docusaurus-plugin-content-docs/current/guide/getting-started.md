@@ -45,7 +45,7 @@ ArcReel uses two types of credentials for different purposes.
 
 The Agent drives project conversations, content understanding, episode planning, script planning (including asset identification), and workflow orchestration.
 
-You can use Anthropic's official service or a compatible service supported by ArcReel, and configure the Base URL and model name as needed.
+You can use Anthropic's official service or a compatible service supported by ArcReel, and configure the Base URL and model name as needed. The Agent only accepts Anthropic Messages-compatible endpoints; see [Provider and Model Configuration · Agent Providers](./providers.md#agent-protocol) for the protocol requirement and external gateway options.
 
 #### Media and Text Generation Credentials {#media-and-text-credentials}
 
@@ -176,6 +176,8 @@ For Storyboard to Video, write visual prompts for a few shots and produce their 
 ### 5.5 Video Clips {#video-clips}
 
 Generate a clip for one storyboard or video unit first. Storyboard to Video uses the selected storyboard image as the starting frame. Reference to Video uses images and other references from the script. Review motion, duration, and audio before submitting the remaining clips. See [Generation Routes](./workflows.md#video-production-routes) for grids and reference selection.
+
+Links to storyboards or video units in Agent replies can be opened in a new tab or pasted into the address bar. When the episode page loads, it selects the linked unit and scrolls it into view. If the link includes a timestamp, the preview seeks to that point.
 
 ### 5.6 Narration and TTS {#narration-and-tts}
 

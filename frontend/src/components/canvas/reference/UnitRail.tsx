@@ -8,7 +8,6 @@ export interface UnitRailProps {
   units: ReferenceVideoUnit[];
   selectedId: string | null;
   onSelect: (unitId: string) => void;
-  /** 展开完整列表（搜索、新增与排序都在完整列表里）。 */
   onExpand: () => void;
   statusMap?: Record<string, UnitStatus>;
   className?: string;
@@ -40,6 +39,7 @@ export function UnitRail({ units, selectedId, onSelect, onExpand, statusMap, cla
             <li key={u.unit_id}>
               <button
                 type="button"
+                data-reference-unit={u.unit_id}
                 onClick={() => onSelect(u.unit_id)}
                 aria-current={selected || undefined}
                 aria-label={`${t("common:item_position_unit", { position })} · ${t(conf.i18nKey)}`}

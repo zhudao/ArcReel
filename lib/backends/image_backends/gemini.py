@@ -12,6 +12,7 @@ from PIL import Image
 
 from lib.backends.backend_runtime import read_reference_images
 from lib.backends.gemini_shared import (
+    GEMINI_DEFAULT_IMAGE_MODEL,
     VERTEX_SCOPES,
     RateLimiter,
     gemini_http_options,
@@ -24,6 +25,7 @@ from lib.backends.image_backends.base import (
     ImageCapability,
     ImageGenerationRequest,
     ImageGenerationResult,
+    ImageOutputMissingError,
     ImageRequestFacts,
     per_image_usage,
 )
@@ -38,7 +40,7 @@ from lib.infra.logging_utils import format_kwargs_for_log
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"
+DEFAULT_IMAGE_MODEL = GEMINI_DEFAULT_IMAGE_MODEL
 _GEMINI_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"})
 
 
@@ -46,7 +48,6 @@ class GeminiImageBackend:
     """Gemini 图片生成后端，支持 AI Studio 和 Vertex AI。"""
 
     CHANNEL_CAPABILITIES: ClassVar[frozenset[ImageCapability]] = BOTH_IMAGE_CAPABILITIES
-    # 通道本身不限参考图张数：Gemini 各代图像模型的上限是模型事实，记在条目上。
     CHANNEL_REFERENCE_LIMIT: ClassVar[int | None] = None
 
     def __init__(
@@ -135,8 +136,6 @@ class GeminiImageBackend:
         if self._rate_limiter:
             await self._rate_limiter.acquire_async(self._image_model)
 
-        # 2. 构建 contents：参考图按数组序位排在前，prompt 置于末尾；
-        #    参考图的身份由 prompt 内的 Reference_Images 声明行按「图N」指认，图片之间不夹任何文本标签。
         contents = await asyncio.to_thread(self._reference_parts, request)
         contents.append(request.prompt)
 
@@ -160,9 +159,7 @@ class GeminiImageBackend:
             model=self._image_model, contents=contents, config=config
         )
 
-        # 5. 解析响应并保存
-        # 供应商已返回：解码与写盘不可被取消打断（docs/standards/backend.md「供应商返回之后的落账段不可中断」）
-        await run_noninterruptible_sync(self._process_image_response, response, request.output_path)
+        await run_noninterruptible_sync(self._process_image_response, response, request.output_path, self._image_model)
 
         return ImageGenerationResult(
             image_path=request.output_path,
@@ -176,19 +173,28 @@ class GeminiImageBackend:
         parts = []
         for image in images:
             content, mime = image.content, image.mime
-            # 端点试跑保留原图格式，补齐旧版 SDK 对 GIF 等格式的 PNG 转换。
             if mime not in _GEMINI_IMAGE_MIME_TYPES:
                 content, mime = convert_image_bytes_to_png(content), "image/png"
             parts.append(self._types.Part.from_bytes(data=content, mime_type=mime))
         return parts
 
     @staticmethod
-    def _process_image_response(response, output_path: Path) -> Image.Image:
+    def _process_image_response(response, output_path: Path, model: str) -> Image.Image:
         """解析图片生成响应并保存到文件。"""
-        for part in response.parts:
+        for part in response.parts or []:
             if part.inline_data is not None:
                 image = part.as_image()
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 image.save(output_path)
                 return image
-        raise RuntimeError("API 未返回图片")
+        feedback = getattr(response, "prompt_feedback", None)
+        candidate = (getattr(response, "candidates", None) or [None])[0]
+        logger.warning(
+            "Gemini 未返回图片 model=%s block_reason=%s finish_reason=%s finish_message=%s text=%.200s",
+            model,
+            getattr(feedback, "block_reason", None),
+            getattr(candidate, "finish_reason", None),
+            getattr(candidate, "finish_message", None),
+            (getattr(response, "text", None) if response.parts else None) or "",
+        )
+        raise ImageOutputMissingError(model=model)

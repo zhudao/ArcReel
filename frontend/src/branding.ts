@@ -1,20 +1,17 @@
-// Brand configuration — single source of truth for product naming.
-// Override at build time via Vite env vars
-// (VITE_BRAND_NAME / VITE_BRAND_TAGLINE / VITE_BRAND_DESCRIPTION).
-//
-// Source code references BRAND.name (or the [[brand]] placeholder in i18n
-// resources) so the displayed product name is not hardcoded across files.
-// Defaults preserve the upstream brand; downstream distributions can override
-// via frontend/.env without code changes.
 
 const env = import.meta.env as Record<string, string | undefined>;
 
+const DEFAULT_DOCS_URL = "https://docs.arc-reel.com";
+
 function fallback(value: string | undefined, defaultValue: string): string {
-  // Trim + empty check so VITE_BRAND_NAME="" (or whitespace) falls back to the
-  // default, matching the documented "Empty = upstream defaults" contract.
   if (typeof value !== "string") return defaultValue;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : defaultValue;
+}
+
+function normalizeBaseUrl(value: string | undefined, defaultValue: string): string {
+  const normalized = fallback(value, defaultValue).replace(/\/+$/, "");
+  return normalized.length > 0 ? normalized : defaultValue;
 }
 
 export const BRAND = {
@@ -24,7 +21,21 @@ export const BRAND = {
     env.VITE_BRAND_DESCRIPTION,
     "AI 视频创作工作台，统一管理项目、脚本、分镜、视频生成与 Agent 对话。",
   ),
+  docsUrl: normalizeBaseUrl(env.VITE_BRAND_DOCS_URL, DEFAULT_DOCS_URL),
 } as const;
 
 export const BRAND_DOCUMENT_TITLE = `${BRAND.name} · ${BRAND.tagline}`;
+
+export function getDocsUrl(language: string | undefined, baseUrl: string = BRAND.docsUrl): string {
+  const base = normalizeBaseUrl(baseUrl, DEFAULT_DOCS_URL);
+  const normalizedLanguage = (language ?? "").trim().toLowerCase();
+  if (
+    normalizedLanguage === "zh"
+    || normalizedLanguage.startsWith("zh-")
+    || normalizedLanguage.startsWith("zh_")
+  ) {
+    return `${base}/`;
+  }
+  return `${base}/en/`;
+}
 

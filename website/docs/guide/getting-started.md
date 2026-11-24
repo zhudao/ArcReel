@@ -45,7 +45,7 @@ ArcReel 中有两类凭据，职责不同。
 
 Agent（智能体）用于驱动项目对话、内容理解、分集规划、脚本规划（含资产识别）和工作流编排。
 
-可使用 Anthropic 官方服务或 ArcReel 支持的兼容服务，并按需配置 Base URL 和模型名称。
+可使用 Anthropic 官方服务或 ArcReel 支持的兼容服务，并按需配置 Base URL 和模型名称。Agent 只接受 Anthropic Messages 兼容接口，协议要求与外部网关接入见[供应商与模型配置 · Agent 供应商](./providers.md#agent-protocol)。
 
 #### 媒体与文本生成凭据 {#media-and-text-credentials}
 
@@ -176,6 +176,8 @@ http://localhost:1241
 ### 5.5 视频片段 {#video-clips}
 
 先为一个分镜或视频单元试生成视频：分镜图生视频会以选中的分镜图作为起始画面，参考生视频则会使用剧本引用的图片等素材。确认动作、时长和声音符合预期后，再从生成入口提交剩余片段。多宫格分镜和参考图选择见[生成模式](./workflows.md#video-production-routes)。
+
+Agent 回复中的分镜或视频单元链接可以在新标签页打开，也可以复制到地址栏。集页加载后会选中对应单元，并将列表滚动到该单元可见的位置。链接带有时间点时，视频预览会定位到该处。
 
 ### 5.6 旁白和 TTS {#narration-and-tts}
 

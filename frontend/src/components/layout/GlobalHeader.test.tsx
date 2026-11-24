@@ -1,9 +1,13 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Router } from "wouter";
 import { memoryLocation } from "wouter/memory-location";
 import { GlobalHeader } from "@/components/layout/GlobalHeader";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { API } from "@/api";
+import { BRAND } from "@/branding";
+import i18n from "@/i18n";
 import { useAppStore } from "@/stores/app-store";
 import { useAssistantStore } from "@/stores/assistant-store";
 import { useProjectsStore } from "@/stores/projects-store";
@@ -27,9 +31,11 @@ async function openExportScope(option: "current" | "full") {
 function renderHeader(path = "/characters") {
   const location = memoryLocation({ path, record: true });
   render(
-    <Router hook={location.hook}>
-      <GlobalHeader />
-    </Router>,
+    <TooltipProvider delay={0}>
+      <Router hook={location.hook}>
+        <GlobalHeader />
+      </Router>
+    </TooltipProvider>,
   );
   return location;
 }
@@ -39,7 +45,6 @@ const PROJECT_WITH_EPISODES = {
   content_mode: "narration",
   style: "Anime",
   episodes: [
-    // 集 ID 与播出顺序不同：ID 3 排第一，ID 1 排第二且没有标题
     { episode: 3, title: "开端", script_file: "scripts/episode_3.json" },
     { episode: 1, title: "", script_file: "scripts/episode_1.json" },
   ],
@@ -55,6 +60,12 @@ describe("GlobalHeader", () => {
     useAssistantStore.setState(useAssistantStore.getInitialState(), true);
     useTasksStore.setState(useTasksStore.getInitialState(), true);
     vi.restoreAllMocks();
+  });
+
+  afterEach(async () => {
+    if (i18n.language !== "zh") {
+      await i18n.changeLanguage("zh");
+    }
   });
 
   it("prefers the project title over the internal project name", async () => {
@@ -167,8 +178,6 @@ describe("GlobalHeader", () => {
     screen.getByRole("button", { name: "导出项目归档" }).click();
     expect(await screen.findByText("选择导出范围")).toBeInTheDocument();
 
-    // 浏览器前进/后退等场景会复用同一个 GlobalHeader 实例切到演示项目——已打开的
-    // 导出弹窗须随之关闭，不能继续展示可点击的导出操作
     useProjectsStore.setState({ currentProjectName: DEMO_PROJECT_NAME });
 
     await waitFor(() => {
@@ -183,8 +192,6 @@ describe("GlobalHeader", () => {
     screen.getByRole("button", { name: "导出项目归档" }).click();
     expect(await screen.findByText("选择导出范围")).toBeInTheDocument();
 
-    // 对话框打开时记下的是项目 A；经浏览器前进/后退复用同一个 GlobalHeader 切到项目 B 后，
-    // 弹窗须随之关闭，不能让选定范围后导出的仍是 A
     useProjectsStore.setState({ currentProjectName: "project-b", currentProjectData: PROJECT_WITH_EPISODES as never });
 
     await waitFor(() => {
@@ -216,7 +223,6 @@ describe("GlobalHeader", () => {
 
     const hint = "你正在查看一个示例项目。编辑、生成、上传和导出功能在演示中不可用。";
     const badge = screen.getByText("演示 · 只读");
-    // 说明写进徽标本身，读屏不依赖弹层；徽标可聚焦，聚焦时弹出同一段说明
     expect(badge).toHaveTextContent(hint);
     act(() => badge.focus());
     expect(badge).toHaveFocus();
@@ -230,7 +236,6 @@ describe("GlobalHeader", () => {
     expect(screen.queryByText("演示 · 只读")).not.toBeInTheDocument();
   });
 
-  // 项目设置在项目切换器里；齿轮在项目内也只通往全局设置
   it("links the gear to global settings and the back link to the lobby", () => {
     useProjectsStore.setState({ currentProjectName: "real-project" });
 
@@ -238,6 +243,45 @@ describe("GlobalHeader", () => {
 
     expect(screen.getByRole("link", { name: "全局设置" })).toHaveAttribute("href", "/app/settings");
     expect(screen.getByRole("link", { name: "项目" })).toHaveAttribute("href", "/app/projects");
+  });
+
+  it("renders the documentation external link immediately to the left of global settings with tooltip", async () => {
+    const user = userEvent.setup();
+    useProjectsStore.setState({ currentProjectName: "real-project" });
+
+    renderHeader();
+
+    const docsLink = screen.getByRole("link", { name: "使用文档" });
+    const settingsLink = screen.getByRole("link", { name: "全局设置" });
+
+    expect(docsLink).toHaveAttribute("href", `${BRAND.docsUrl}/`);
+    expect(docsLink).toHaveAttribute("target", "_blank");
+    expect(docsLink).toHaveAttribute("rel", "noopener noreferrer");
+
+    await user.hover(docsLink);
+    await waitFor(() => {
+      expect(screen.getByText("使用文档")).toBeVisible();
+    });
+
+    docsLink.focus();
+    await user.tab();
+    expect(settingsLink).toHaveFocus();
+  });
+
+  it.each([
+    ["en", "Documentation"],
+    ["vi", "Tài liệu hướng dẫn"],
+    ["ru", "Документация"],
+  ] as const)("points the header documentation link to /en/ when UI language is %s", async (lang, label) => {
+    await i18n.changeLanguage(lang);
+    useProjectsStore.setState({ currentProjectName: "real-project" });
+
+    renderHeader();
+
+    const docsLink = screen.getByRole("link", { name: label });
+    expect(docsLink).toHaveAttribute("href", `${BRAND.docsUrl}/en/`);
+    expect(docsLink).toHaveAttribute("target", "_blank");
+    expect(docsLink).toHaveAttribute("rel", "noopener noreferrer");
   });
 
   it("shows an error toast when exporting fails", async () => {
@@ -263,7 +307,6 @@ describe("GlobalHeader", () => {
     await waitFor(() => {
       expect(useAppStore.getState().toast?.text).toContain("导出失败");
     });
-    // 导出失败记入工作区通知，事后可在通知中心回看
     expect(useAppStore.getState().workspaceNotifications[0]?.text).toContain("导出失败");
   });
 });

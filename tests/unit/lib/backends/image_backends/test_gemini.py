@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from PIL import Image as PILImage
 
-from lib.backends.image_backends.base import ImageCapability, ImageGenerationRequest, ReferenceImage
+from lib.backends.image_backends.base import (
+    ImageCapability,
+    ImageGenerationRequest,
+    ImageOutputMissingError,
+    ReferenceImage,
+)
 from tests.unit.lib.backends.write_cancel_gate import WriteGate, cancel_during_write
 
 
@@ -76,8 +81,20 @@ class TestProperties:
     def test_name_vertex(self, backend_vertex):
         assert backend_vertex.name == "gemini-vertex"
 
-    def test_model_default(self, backend_aistudio):
-        assert "gemini" in backend_aistudio.model
+    @pytest.mark.parametrize(
+        ("configured_model", "expected_model"),
+        [(None, "gemini-nano-banana-2.1"), ("gemini-3.1-flash-image", "gemini-3.1-flash-image")],
+    )
+    def test_default_and_previously_default_models_keep_shared_limit(
+        self, patch_genai, configured_model, expected_model
+    ):
+        from lib.backends.gemini_shared import get_shared_rate_limiter
+        from lib.backends.image_backends.gemini import GeminiImageBackend
+
+        backend = GeminiImageBackend(backend_type="aistudio", api_key="fake-key", image_model=configured_model)
+
+        assert backend.model == expected_model
+        assert get_shared_rate_limiter().limits[backend.model] == 15
 
     def test_capabilities_include_t2i_and_i2i(self, backend_aistudio):
         caps = backend_aistudio.capabilities
@@ -86,7 +103,6 @@ class TestProperties:
 
     @pytest.mark.parametrize("model", ["gemini-3-pro-image-preview", "gemini-2.5-flash-image"])
     def test_channel_declares_no_reference_limit_by_model_name(self, fake_rate_limiter, patch_genai, model):
-        # 各代 Gemini 图像模型的参考图上限是模型事实，记在条目上；通道本身不限张数。
         from lib.backends.image_backends.gemini import GeminiImageBackend
 
         backend = GeminiImageBackend(
@@ -123,7 +139,6 @@ class TestGenerate:
         assert result.image_path == output_file
         assert result.provider == "gemini"
         assert output_file.exists()
-        # 没发 image_size：只报输出张数，不报分辨率（按价目表默认档计）
         assert result.usage is not None
         assert result.usage.quantities == {"output_images": 1}
         assert result.usage.dimensions == {}
@@ -208,7 +223,7 @@ class TestGenerate:
         assert contents[-1] == "merge"
 
     async def test_generate_raises_on_empty_response(self, backend_aistudio, tmp_path):
-        """generate() should raise RuntimeError when no image is returned."""
+        """generate() should raise ImageOutputMissingError when no image is returned."""
         output_file = tmp_path / "out.png"
 
         mock_response = MagicMock()
@@ -216,8 +231,26 @@ class TestGenerate:
         backend_aistudio._client.aio.models.generate_content = AsyncMock(return_value=mock_response)
 
         request = ImageGenerationRequest(prompt="test", output_path=output_file)
-        with pytest.raises(RuntimeError, match="未返回图片"):
+        with pytest.raises(ImageOutputMissingError) as exc_info:
             await backend_aistudio.generate(request)
+        assert exc_info.value.code == "image_output_missing"
+
+    async def test_blocked_response_without_parts_is_image_output_missing(self, backend_aistudio, tmp_path, caplog):
+        """内容被拦截时 parts 为 None：报 image_output_missing 而不是 TypeError，不重试，拦截原因写进日志。"""
+        mock_response = MagicMock()
+        mock_response.parts = None
+        mock_response.prompt_feedback.block_reason = "PROHIBITED_CONTENT"
+        mock_response.candidates = [MagicMock(finish_reason="IMAGE_SAFETY", finish_message=None)]
+        generate = AsyncMock(return_value=mock_response)
+        backend_aistudio._client.aio.models.generate_content = generate
+
+        request = ImageGenerationRequest(prompt="test", output_path=tmp_path / "out.png")
+        with pytest.raises(ImageOutputMissingError) as exc_info:
+            await backend_aistudio.generate(request)
+        assert exc_info.value.code == "image_output_missing"
+        assert generate.await_count == 1
+        assert "block_reason=PROHIBITED_CONTENT" in caplog.text
+        assert "finish_reason=IMAGE_SAFETY" in caplog.text
 
 
 async def test_corrupt_and_missing_references_are_reported_before_submission(tmp_path, backend_aistudio):

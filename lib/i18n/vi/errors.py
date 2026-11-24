@@ -75,7 +75,6 @@ MESSAGES = {
     "task_not_found": "Tác vụ '{id}' không tồn tại",
     "task_running_not_cancellable": "Tác vụ '{id}' đã bắt đầu chạy nên không thể hủy; tác vụ sẽ chạy đến khi hoàn tất và giữ lại kết quả",
     "task_retry_download_unavailable": "Tác vụ '{id}' hiện không thể thử tải lại",
-    # Lý do tác vụ thất bại (GenerationWorker lưu mã lỗi + tham số; tasks API kết xuất theo ngôn ngữ khi đọc)
     "task_fail_provider_unsupported_media": "Nhà cung cấp {provider_id} không hỗ trợ tạo {media_type}",
     "task_fail_provider_rejected": "Nhà cung cấp đã từ chối yêu cầu tạo này (HTTP {status})",
     "task_fail_dispatch_provider_requeue_failed": "Nhà cung cấp tác vụ đã đổi từ {claimed_provider_id} sang {actual_provider_id}, nhưng không thể đưa tác vụ trở lại hàng đợi để nhận khe mới; vui lòng thử lại",
@@ -517,7 +516,6 @@ MESSAGES = {
     "ref_too_many_images": "Số lượng ảnh tham chiếu {count} vượt giới hạn {max_count} của {model}, đã giữ {max_count} ảnh đầu tiên",
     "ref_payload_too_large": "Dữ liệu ảnh tham chiếu vượt giới hạn của nhà cung cấp, đã thử lại với mức nén bổ sung",
     "ref_payload_floor_exceeded": "Ảnh tham chiếu quá lớn hoặc quá nhiều; ngay cả khi nén ở mức chất lượng thấp nhất vẫn vượt giới hạn kích thước yêu cầu của nhà cung cấp. Vui lòng giảm số lượng ảnh tham chiếu hoặc độ phân giải rồi thử lại",
-    # 兼容键：只用于读取历史任务结果，新代码不再产出（改用 ref_single_ref_only）。
     "ref_sora_single_ref": "Mô hình này chỉ nhận một ảnh tham chiếu, đã dùng ảnh đầu tiên",
     "ref_single_ref_only": "{model} chỉ nhận một ảnh tham chiếu, đã dùng ảnh đầu tiên",
     "ref_episode_not_found": "Không tìm thấy tập (id={episode})",
@@ -679,9 +677,9 @@ MESSAGES = {
     "video_capability_missing_r2v": "{provider}/{model} không hỗ trợ tạo video theo tham chiếu; hãy chỉ định mô hình hỗ trợ tính năng này cho mục tạo video theo tham chiếu trong Cài đặt, hoặc đổi mô hình video mặc định",
     "video_capability_reference_unavailable": "Mô hình video đã cấu hình {provider}/{model} không còn khả dụng (mô hình bị xóa, năng lực đã thay đổi hoặc nhà cung cấp bị gỡ bỏ); hãy chọn lại mô hình video trong Cài đặt",
     "model_not_in_provider_catalog": "{provider}/{model}: mô hình này không có trong danh sách mô hình của nhà cung cấp; hãy chọn lại mô hình trong Cài đặt",
-    "model_discontinued": "{provider}/{model}: mô hình này đã ngừng hoạt động từ {shutdown_date}; mô hình thay thế chính thức là {successor}. Hãy chọn lại mô hình trong Cài đặt",
+    "model_discontinued": "{provider}/{model}: mô hình này đã ngừng hoạt động từ {shutdown_date}; mô hình thay thế được đề xuất là {successor}. Hãy chọn lại mô hình trong Cài đặt",
     "model_discontinued_no_successor": "{provider}/{model}: mô hình này đã ngừng hoạt động từ {shutdown_date}; hãy chọn lại mô hình trong Cài đặt",
-    "model_discontinued_undated": "{provider}/{model}: mô hình này đã ngừng hoạt động; mô hình thay thế chính thức là {successor}. Hãy chọn lại mô hình trong Cài đặt",
+    "model_discontinued_undated": "{provider}/{model}: mô hình này đã ngừng hoạt động; mô hình thay thế được đề xuất là {successor}. Hãy chọn lại mô hình trong Cài đặt",
     "model_discontinued_undated_no_successor": "{provider}/{model}: mô hình này đã ngừng hoạt động; hãy chọn lại mô hình trong Cài đặt",
     "video_resolution_not_supported": "Mô hình {model} không hỗ trợ độ phân giải {resolution} (chỉ hỗ trợ {supported}); hãy chọn một độ phân giải được hỗ trợ",
     "video_aspect_ratio_not_supported": "Mô hình {model} không hỗ trợ tỷ lệ khung hình {aspect_ratio} (chỉ hỗ trợ {supported}); hãy chọn một tỷ lệ được hỗ trợ",

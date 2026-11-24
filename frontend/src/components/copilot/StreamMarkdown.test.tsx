@@ -8,7 +8,6 @@ import { StreamMarkdown } from "./StreamMarkdown";
 const URL_ATTRS = ["href", "src", "xlink:href", "action", "formaction", "srcdoc", "data"];
 const ACTIVE_TAGS = ["script", "iframe", "object", "embed", "form", "svg", "math", "style", "base", "meta", "link"];
 
-// 按浏览器 URL 解析规则归一：去掉首尾 C0 控制符与空白、剔除中间的制表与换行后取协议。
 function urlScheme(value: string): string {
   let start = 0;
   let end = value.length;
@@ -42,7 +41,6 @@ function collectActiveContent(root: HTMLElement): string[] {
   return findings;
 }
 
-// 链接按钮不带 href，地址只保存在点击回调里，DOM 属性检查看不到；PAYLOADS 不含允许的链接，完整渲染后不应出现可点击元素。
 function clickableElements(root: HTMLElement): string[] {
   return Array.from(
     root.querySelectorAll('a, button, [data-streamdown="link"]'),
@@ -196,7 +194,7 @@ describe("StreamMarkdown 应用内链接", () => {
   afterEach(() => {
     window.history.replaceState(null, "", "/");
     useAppStore.setState({ scrollTarget: null, playbackStart: null });
-    useProjectsStore.setState({ currentProjectName: null, currentProjectData: null });
+    useProjectsStore.setState({ currentProjectName: null, currentProjectData: null, projectDetailLoading: false });
     vi.restoreAllMocks();
   });
 
@@ -238,14 +236,19 @@ describe("StreamMarkdown 应用内链接", () => {
   it("单元链接跳到该集、选中单元并请求从起始时间播放，一次性参数不留在地址栏", async () => {
     useProjectsStore.setState({ currentProjectName: "demo", currentProjectData: { generation_mode: "reference_video" } as never });
     const { container } = await renderLoaded("[E1U3 的问题](/app/projects/demo/episodes/2?unit=E1U3&t=4.5)");
+    const onPlaybackStart = vi.fn();
+    const unsubscribe = useAppStore.subscribe((state, previous) => {
+      if (state.playbackStart && state.playbackStart !== previous.playbackStart) onPlaybackStart(state.playbackStart);
+    });
     fireEvent.click(container.querySelector("a")!);
+    unsubscribe();
     expect(window.location.pathname + window.location.search).toBe("/app/projects/demo/episodes/2");
     expect(useAppStore.getState().scrollTarget).toMatchObject({ type: "reference_unit", id: "E1U3" });
-    expect(useAppStore.getState().playbackStart).toMatchObject({
+    expect(onPlaybackStart).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       resource_type: "reference_videos",
       resource_id: "E1U3",
       seconds: 4.5,
-    });
+    }));
   });
 
   it("不带时间点的单元链接只请求打开单元预览，不指定起始时间", async () => {
@@ -267,11 +270,11 @@ describe("StreamMarkdown 应用内链接", () => {
     expect(useAppStore.getState().playbackStart).toMatchObject({ resource_type: "videos", resource_id: "E1S02" });
   });
 
-  it("链接指向其他项目时只跳转，不按当前项目的生成模式发聚焦与起播请求", async () => {
+  it("链接指向其他项目时保留定位参数，等待目标项目消费", async () => {
     useProjectsStore.setState({ currentProjectName: "demo", currentProjectData: { generation_mode: "storyboard" } as never });
     const { container } = await renderLoaded("[问题](/app/projects/other/episodes/2?unit=E1U3&t=4.5)");
     fireEvent.click(container.querySelector("a")!);
-    expect(window.location.pathname + window.location.search).toBe("/app/projects/other/episodes/2");
+    expect(window.location.pathname + window.location.search).toBe("/app/projects/other/episodes/2?unit=E1U3&t=4.5");
     expect(useAppStore.getState().scrollTarget).toBeNull();
     expect(useAppStore.getState().playbackStart).toBeNull();
   });
@@ -283,10 +286,11 @@ describe("StreamMarkdown 应用内链接", () => {
     expect(useAppStore.getState().scrollTarget).toMatchObject({ type: "segment", id: "E1S02" });
   });
 
-  it("当前没有打开任何项目时只跳转", async () => {
+  it("当前项目的数据尚在加载时保留定位参数", async () => {
+    useProjectsStore.setState({ currentProjectName: "demo", currentProjectData: null, projectDetailLoading: true });
     const { container } = await renderLoaded("[问题](/app/projects/demo/episodes/1?unit=E1S02)");
     fireEvent.click(container.querySelector("a")!);
-    expect(window.location.pathname).toBe("/app/projects/demo/episodes/1");
+    expect(window.location.pathname + window.location.search).toBe("/app/projects/demo/episodes/1?unit=E1S02");
     expect(useAppStore.getState().scrollTarget).toBeNull();
     expect(useAppStore.getState().playbackStart).toBeNull();
   });
