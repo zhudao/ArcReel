@@ -11,6 +11,7 @@ import { useProjectsStore } from "@/stores/projects-store";
 import { useCostStore } from "@/stores/cost-store";
 import { useTasksStore } from "@/stores/tasks-store";
 import type { ProjectChange } from "@/types";
+import { makeTask } from "@/test/factories";
 import { createDeferred } from "@/test/deferred";
 import { FakeSseStream } from "@/test/fakeSseStream";
 
@@ -289,20 +290,96 @@ describe("useProjectEventsSSE", () => {
     expect(useAppStore.getState().scrollTarget).toBeNull();
   });
 
-  it("invalidates episode draft views when a reconnect snapshot shows missed changes", () => {
+  it("recovers active tasks on reconnect through the shared refresh", async () => {
+    const row = makeTask({ project_name: "demo" });
+    const snapshot = vi.spyOn(API, "getActiveTasks").mockResolvedValue({ items: [row], truncated: false });
+    vi.spyOn(API, "listTasks").mockResolvedValue({ items: [], total: 0, page: 1, page_size: 200 });
+    vi.spyOn(API, "getTaskStats").mockResolvedValue({ stats: useTasksStore.getInitialState().stats });
+    useTasksStore.getState().setRefreshScope({ projectName: "demo" });
+    const stream = mockProjectEventStream();
+    renderHarness();
+    const emit = () => stream.options?.onSnapshot?.({ project_name: "demo", fingerprint: "same" } as never);
+    act(emit);
+    expect(snapshot).not.toHaveBeenCalled();
+    await act(async () => { emit(); });
+    expect(useTasksStore.getState().activeTaskIds.has(row.task_id)).toBe(true);
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    useTasksStore.getState().setRefreshScope(null);
+  });
+
+  it("invalidates episode script plan views when a reconnect snapshot shows missed changes", () => {
     useProjectsStore.setState({
       currentProjectData: { ...makeGetProjectResult("Demo").project, episodes: [{ episode: 4, title: "雨夜" }] },
     } as never);
     const stream = mockProjectEventStream();
     renderHarness("/");
-    const revision = () => useAppStore.getState().getEntityRevision("draft:episode_4_script_plan");
+    const revision = () => useAppStore.getState().getEntityRevision("script_plan:episode_4");
 
     act(() => stream.options?.onSnapshot?.({ project_name: "demo", fingerprint: "fp-a" } as never));
     const before = revision();
     act(() => stream.options?.onSnapshot?.({ project_name: "demo", fingerprint: "fp-b" } as never));
 
     expect(revision()).toBeGreaterThan(before);
-    expect(useAppStore.getState().getEntityRevision("draft:episode_4_prompt_authoring")).toBeGreaterThan(0);
+  });
+
+  it("invalidates episode script_plan revisions when script_plan or dependency assets change", async () => {
+    useProjectsStore.setState({
+      currentProjectData: { ...makeGetProjectResult("Demo").project, episodes: [{ episode: 1, title: "第一集" }] },
+    } as never);
+    const stream = mockProjectEventStream();
+    renderHarness("/");
+    const rev = () => useAppStore.getState().getEntityRevision("script_plan:episode_1");
+    const initial = rev();
+
+    act(() => {
+      stream.options?.onChanges?.({
+        project_name: "demo",
+        batch_id: "batch-sp",
+        fingerprint: "fp-sp",
+        generated_at: "2026-03-01T00:00:00Z",
+        source: "filesystem",
+        changes: [
+          {
+            entity_type: "script_plan",
+            action: "updated",
+            entity_id: "episode_1",
+            label: "第一集的脚本规划",
+            label_key: "script_plan",
+            label_params: { episode: 1 },
+            episode: 1,
+            focus: null,
+            important: false,
+          },
+        ],
+      });
+    });
+
+    const afterPatch = rev();
+    expect(afterPatch).toBeGreaterThan(initial);
+
+    act(() => {
+      stream.options?.onChanges?.({
+        project_name: "demo",
+        batch_id: "batch-char",
+        fingerprint: "fp-char",
+        generated_at: "2026-03-01T00:00:01Z",
+        source: "filesystem",
+        changes: [
+          {
+            entity_type: "character",
+            action: "created",
+            entity_id: "新角色",
+            label: "角色「新角色」",
+            label_key: "named_entity_character",
+            label_params: { id: "新角色" },
+            focus: null,
+            important: true,
+          },
+        ],
+      });
+    });
+
+    expect(rev()).toBeGreaterThan(afterPatch);
   });
 
   it("forwards an assistant session resuming on its own to the assistant store", () => {
@@ -881,62 +958,6 @@ describe("useProjectEventsSSE", () => {
     expect(useAppStore.getState().workspaceNotifications).toHaveLength(0);
   });
 
-  function emitDraftCreated(stream: ReturnType<typeof mockProjectEventStream>, source: "webui" | "worker") {
-    act(() => {
-      stream.options?.onChanges?.({
-        project_name: "demo",
-        batch_id: `batch-draft-${source}`,
-        fingerprint: `fp-draft-${source}`,
-        generated_at: "2026-03-01T00:00:00Z",
-        source,
-        changes: [
-          {
-            entity_type: "draft",
-            action: "created",
-            entity_id: "episode_1_script_plan",
-            label: "第 1 集的剧本",
-            label_key: "draft_normalized_script",
-            label_params: { episode: 1 },
-            episode: 1,
-            focus: { pane: "episode", episode: 1 },
-            important: true,
-          },
-        ],
-      });
-    });
-  }
-
-  it("navigates to the episode when another writer creates a draft", async () => {
-    const stream = mockProjectEventStream();
-    renderHarness("/characters");
-
-    emitDraftCreated(stream, "worker");
-
-    await waitFor(() => {
-      expect(screen.getByTestId("location")).toHaveTextContent("/episodes/1");
-    });
-    await waitFor(() => {
-      expect(useAppStore.getState().toast).not.toBeNull();
-    });
-  });
-
-  it("stays put without notifications when the user's own draft save creates a draft", async () => {
-    const stream = mockProjectEventStream();
-    renderHarness("/characters");
-
-    emitDraftCreated(stream, "webui");
-
-    await waitFor(() => {
-      expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
-    });
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(screen.getByTestId("location")).toHaveTextContent("/characters");
-    expect(useAppStore.getState().toast).toBeNull();
-    expect(useAppStore.getState().workspaceNotifications).toHaveLength(0);
-  });
-
   it("defers remote navigation when a workspace edit marker is present", async () => {
     const stream = mockProjectEventStream();
 
@@ -1254,6 +1275,17 @@ describe("useProjectEventsSSE", () => {
         );
       });
     }
+
+    it("收到提示词编写完成事件即刷新参考生视频单元列表", () => {
+      const stream = mockProjectEventStream();
+      vi.spyOn(useTasksStore.getState(), "refreshTasks").mockResolvedValue(undefined);
+      renderHarness();
+      const before = useAppStore.getState().referenceVideoUnitsRevision;
+
+      emit(stream, [taskChange({ action: "task_succeeded", task_type: "text_episode_script" })]);
+
+      expect(useAppStore.getState().referenceVideoUnitsRevision).toBeGreaterThan(before);
+    });
 
     it("收到任务终态即刷新任务列表，不等兜底轮询", async () => {
       const stream = mockProjectEventStream();
