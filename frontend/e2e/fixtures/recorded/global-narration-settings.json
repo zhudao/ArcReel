@@ -1,0 +1,10 @@
+{
+  "method": "GET",
+  "path": "/api/v1/system/global-narration-settings",
+  "status": 200,
+  "body": {
+    "audio_backend": null,
+    "narration_voice": "",
+    "narration_speed": null
+  }
+}

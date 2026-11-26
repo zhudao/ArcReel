@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lib.backends.backend_assembly.assembler import load_builtin_config
 from lib.backends.backend_assembly.loaded_config import LoadedConfig
 from lib.backends.backend_assembly.specs import get_provider_spec
-from lib.backends.text_backends.base import TEXT_TASK_TIERS, VISION_REQUIRED_TASKS, TextBackend, TextTaskType
+from lib.backends.text_backends.base import (
+    TEXT_TASK_TIERS,
+    VISION_REQUIRED_TASKS,
+    TextBackend,
+    TextCapability,
+    TextGenerationRequest,
+    TextGenerationResult,
+    TextTaskType,
+)
 from lib.capabilities.kernel import CapabilitySnapshot
 from lib.catalog import query as catalog
 from lib.catalog.errors import ModelDiscontinuedError
@@ -180,18 +191,54 @@ async def _automatic_text_spec(session: AsyncSession) -> CustomTextSpec:
     )
 
 
+@dataclass(frozen=True)
+class AssembledTextBackend:
+    delegate: TextBackend
+    snapshot: CapabilitySnapshot
+
+    @property
+    def name(self) -> str:
+        return self.delegate.name
+
+    @property
+    def model(self) -> str:
+        return self.delegate.model
+
+    @property
+    def capabilities(self) -> set[TextCapability]:
+        return self.delegate.capabilities
+
+    async def generate(self, request: TextGenerationRequest) -> TextGenerationResult:
+        return await self.delegate.generate(replace(request, snapshot=self.snapshot))
+
+
 def _build_text(spec: TextAssemblySpec) -> TextBackend:
     model = spec.snapshot.model_id
     if isinstance(spec, CustomTextSpec):
         backend = spec.build_backend(spec.connection, model, spec.paths)
         if not isinstance(backend, CustomTextBackend):
             raise ValueError(f"expected text endpoint: {spec.endpoint}")
-        return backend
-    return build_builtin_text(spec.config, model, spec.snapshot.provider_id, spec.registry_backend)
+    else:
+        backend = build_builtin_text(spec.config, model, spec.snapshot.provider_id, spec.registry_backend)
+    return AssembledTextBackend(backend, spec.snapshot)
 
 
 async def assemble_text(spec: TextAssemblySpec) -> TextBackend:
     return await asyncio.to_thread(_build_text, spec)
+
+
+_provider_observer: ContextVar[Callable[[str], Awaitable[None]] | None] = ContextVar(
+    "text_provider_observer", default=None
+)
+
+
+@contextmanager
+def observe_text_provider(observer: Callable[[str], Awaitable[None]]) -> Generator[None]:
+    token = _provider_observer.set(observer)
+    try:
+        yield
+    finally:
+        _provider_observer.reset(token)
 
 
 async def resolve_and_assemble_text(
@@ -200,5 +247,8 @@ async def resolve_and_assemble_text(
     from lib.db import async_session_factory
 
     target = await TextRuntime(ConfigResolver(async_session_factory)).for_task(task_type, project_name)
+    observer = _provider_observer.get()
+    if observer is not None:
+        await observer(target.provider_id)
     backend = await assemble_text(target.spec)
     return backend, target

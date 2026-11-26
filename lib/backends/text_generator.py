@@ -13,11 +13,13 @@ from typing import TYPE_CHECKING
 from lib.backends.providers import CallPurpose, require_provider_pair
 from lib.backends.text_backends.base import (
     DEFAULT_MAX_OUTPUT_TOKENS,
+    RequestTokens,
     TextGenerationRequest,
     TextGenerationResult,
     TextOutputTruncatedError,
     TextTaskType,
 )
+from lib.backends.text_backends.streaming import current_text_task
 from lib.billing.ledger import Ledger
 from lib.db.base import DEFAULT_USER_ID
 from lib.video_runtime.text import resolve_and_assemble_text
@@ -28,10 +30,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def effective_max_output_tokens(registered: int | None) -> int:
-    """文本请求实际生效的输出上限：取 min(模型登记的最大输出长度, 64000)，未登记按 64000。"""
+def effective_max_output_tokens(registered: int | None) -> int | None:
+    """文本请求实际生效的输出上限：取 min(模型登记的最大输出长度, 64000)，未登记时交由协议处理。"""
     if registered is None or registered <= 0:
-        return DEFAULT_MAX_OUTPUT_TOKENS
+        return None
     return min(registered, DEFAULT_MAX_OUTPUT_TOKENS)
 
 
@@ -68,9 +70,13 @@ class TextGenerator:
         return self.backend.model
 
     @property
-    def max_output_tokens(self) -> int:
-        """本生成器每次请求实际生效的输出上限（单位 token）。"""
+    def max_output_tokens(self) -> int | None:
+        """按模型登记值解析的请求上限（单位 token）。"""
         return self._max_output_tokens
+
+    @property
+    def planning_output_budget(self) -> int:
+        return self._max_output_tokens or 8192
 
     @classmethod
     async def create(
@@ -111,11 +117,12 @@ class TextGenerator:
         （如回复须整段解析为 JSON）：截断时同样抛出该异常，不返回残缺的结果。
         """
         ceiling = self._max_output_tokens
-        request = replace(
-            request,
-            max_output_tokens=min(request.max_output_tokens, ceiling) if request.max_output_tokens else ceiling,
-        )
+        if request.max_output_tokens:
+            ceiling = min(request.max_output_tokens, ceiling or DEFAULT_MAX_OUTPUT_TOKENS)
+        request = replace(request, max_output_tokens=ceiling)
+        task = current_text_task()
         async with self.ledger.record(
+            task_id=task.task_id if task else None,
             project_name=project_name or "",
             call_type="text",
             model=self.backend.model,
@@ -124,11 +131,25 @@ class TextGenerator:
             user_id=self._user_id,
             purpose=self._purpose,
         ) as call:
+            requests_recorded = False
+
+            def record_request(tokens: RequestTokens) -> None:
+                nonlocal requests_recorded
+                requests_recorded = True
+                call.record_request(tokens)
+                if request.on_usage:
+                    request.on_usage(tokens)
+
             try:
-                result = await self.backend.generate(request)
+                result = await self.backend.generate(
+                    replace(request, on_usage=record_request, task_type=request.task_type or self._purpose)
+                )
             except TextOutputTruncatedError as exc:
                 raise self._truncation(exc.provider, exc.output_tokens) from exc
             if result.truncated and require_complete:
+                if not requests_recorded:
+                    for tokens in result.request_tokens():
+                        call.record_request(tokens)
                 raise self._truncation(result.provider, result.output_tokens)
             call.success(result)
             return result

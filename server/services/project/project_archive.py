@@ -9,8 +9,8 @@ import shutil
 import stat
 import tempfile
 import zipfile
-from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
-from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
+from collections.abc import AsyncGenerator, Callable, Generator, Iterator, Mapping
+from contextlib import AbstractContextManager, asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -26,6 +26,7 @@ from lib.artifacts.artifact_activation import (
     snapshot_preserved_artifact_manifest,
     stage_preserved_artifact_claims,
     take_migrated_artifact_claims,
+    verified_legacy_json_claims,
 )
 from lib.artifacts.artifact_manifest import (
     ArtifactKey,
@@ -37,6 +38,7 @@ from lib.artifacts.artifact_manifest import (
 )
 from lib.artifacts.formal_write import project_metadata_lock
 from lib.artifacts.rendered_artifact import RENDERS_DIRNAME
+from lib.artifacts.sqlite_history import ResourceBatch, SQLiteHistory
 from lib.artifacts.version_manager import VersionManager, selected_manual_upload_snapshot
 from lib.asset_library.links import (
     UPLOADABLE_RESOURCE_TYPES,
@@ -54,6 +56,7 @@ from lib.infra.async_thread import EventLoopBridge, run_noninterruptible_async
 from lib.infra.content_digest import digest_stream, sha256_file
 from lib.infra.json_io import load_json
 from lib.infra.path_safety import PathTraversalError, safe_join, try_safe_join
+from lib.infra.project_write_journal import is_history_database_name
 from lib.infra.validation_messages import ValidationResult, default_translate
 from lib.material.formal_objects import (
     ObjectContentStorage,
@@ -67,13 +70,12 @@ from lib.material.work_files import (
     RemoteWorkFile,
     held_work_files,
     locked_remote_work_files,
-    remote_work_files,
 )
 from lib.project import deleted_projects
 from lib.project.asset_types import ASSET_SPECS, asset_name_comparison_key, build_asset_entry, normalize_asset_name
 from lib.project.data_validator import DataValidator
 from lib.project.project_change_hints import emit_project_change_hint
-from lib.project.project_manager import ProjectManager
+from lib.project.project_manager import ProjectManager, project_names_lock
 from lib.project.project_migration_failure import ProjectMigrationError, migration_failure_details
 from lib.project.project_migration_report import (
     MigrationAdjustment,
@@ -81,6 +83,7 @@ from lib.project.project_migration_report import (
     extend_migration_report,
     visible_migration_report,
 )
+from lib.project.project_migrations.backups import is_migration_copy_name
 from lib.project.project_migrations.runner import migrate_project_dir
 from lib.project.project_migrations.v1_to_v2_normalize_providers import (
     migrate_project_dict as normalize_legacy_providers,
@@ -92,7 +95,11 @@ from lib.project.project_migrations.v19_to_v20_bare_provider_models import (
 from lib.project.project_migrations.v19_to_v20_bare_provider_models import (
     migrate_project_dict as freeze_bare_provider_models,
 )
-from lib.project.project_schema import project_schema_is_current
+from lib.project.project_schema import (
+    SQLITE_HISTORY_SCHEMA_VERSION,
+    parse_project_schema_version,
+    project_schema_is_current,
+)
 from lib.project.resource_paths import (
     CHARACTER_DERIVATIVE_RESOURCE_TYPE,
     END_FRAME_RESOURCE_TYPE,
@@ -475,27 +482,21 @@ class ProjectArchiveService:
         if not self.project_manager.project_exists(project_name):
             return Path(), []
         project_dir = self.project_manager.get_project_path(project_name)
-        versions = self._load_json_file(project_dir / "versions" / "versions.json") or {}
-        exported = self._exported_work_files(locked_remote_work_files(project_dir), versions, scope)
-        return project_dir, [work_file.path for work_file in exported]
+        return project_dir, [item.path for item in self._exported_work_files(project_dir, scope)]
 
-    def _exported_work_files(
-        self, work_files: list[RemoteWorkFile], versions: dict[str, Any], scope: str
-    ) -> list[RemoteWorkFile]:
-        """归档要带的远端内容版本工作文件：完整归档是全部，仅当前版本是正式文件加上保留的版本快照。"""
-        if scope == "full":
+    def _exported_work_files(self, project_dir: Path, scope: str) -> list[RemoteWorkFile]:
+        work_files = locked_remote_work_files(project_dir)
+        if scope == "full" or not work_files:
             return work_files
+        history = SQLiteHistory(project_dir)
+        keys = {(item.resource_type, item.resource_id) for item in work_files}
+        versions = history.resources(keys) if history.is_enabled() else self._load_versions_payload(project_dir)
         _, retained = self._current_export_versions(versions)
-        return [work_file for work_file in work_files if work_file.formal or work_file.path in retained]
+        return [item for item in work_files if item.formal or item.path in retained]
 
     def _verify_remote_content(self, snapshot_dir: Path, scope: str) -> None:
-        """快照里须有归档要带的每个远端内容版本的真实内容；缺失或与摘要不符时不产出归档。
-
-        版本快照位置按记录的摘要校验；正式文件只要求在场，内容以盘上为准，与本地内容版本的导出一致。
-        """
-        versions = self._load_json_file(snapshot_dir / "versions" / "versions.json") or {}
-        project = self._load_json_file(snapshot_dir / self.project_manager.PROJECT_FILE) or {}
-        for work_file in self._exported_work_files(remote_work_files(versions, project), versions, scope):
+        """校验快照中远端版本的内容摘要，并确认正式文件在场。"""
+        for work_file in self._exported_work_files(snapshot_dir, scope):
             path = snapshot_dir / work_file.path
             if not path.is_file():
                 raise MaterialFetchFailedError("work_file_missing")
@@ -590,16 +591,19 @@ class ProjectArchiveService:
         """
         if self._provider_asset_links is None:
             return []
-        versions = self._load_json_file(snapshot_dir / "versions" / "versions.json") or {}
-        if scope == "current":
-            versions, _ = self._current_export_versions(versions)
-        content_digests = {
-            record[CONTENT_VERSION_ID]: record[CONTENT_DIGEST]
-            for resource_type, _resource_id, record in iter_version_records(versions)
-            if resource_type in UPLOADABLE_RESOURCE_TYPES
-            and isinstance(record.get(CONTENT_VERSION_ID), str)
-            and isinstance(record.get(CONTENT_DIGEST), str)
-        }
+        history = SQLiteHistory(snapshot_dir)
+        if history.is_enabled():
+            batches = history.iter_resources()
+        else:
+            batches = iter([self._load_versions_payload(snapshot_dir)])
+        content_digests = {}
+        for versions in batches:
+            if scope == "current":
+                versions, _ = self._current_export_versions(versions)
+            for resource_type, _resource_id, record in iter_version_records(versions):
+                identity, digest = record.get(CONTENT_VERSION_ID), record.get(CONTENT_DIGEST)
+                if resource_type in UPLOADABLE_RESOURCE_TYPES and isinstance(identity, str) and isinstance(digest, str):
+                    content_digests[identity] = digest
         return self._provider_asset_links.export(project_name, content_digests) if content_digests else []
 
     def _verified_archived_links(
@@ -612,7 +616,7 @@ class ProjectArchiveService:
         raw = (manifest or {}).get(ARCHIVED_LINKS_KEY)
         if self._provider_asset_links is None or not isinstance(raw, list) or not raw:
             return []
-        versions = self._load_json_file(project_dir / "versions" / "versions.json") or {}
+        versions = self._load_versions_payload(project_dir) or {}
         records: dict[str, tuple[str, str, dict[str, Any]]] = {}
         for resource_type, resource_id, record in iter_version_records(versions):
             content_version_id = record.get(CONTENT_VERSION_ID)
@@ -751,6 +755,19 @@ class ProjectArchiveService:
                         staging_dir,
                     )
 
+                    try:
+                        preserved_manifest = (
+                            decode_artifact_manifest_payload(manifest["artifact_manifest"])
+                            if isinstance(manifest, dict) and "artifact_manifest" in manifest
+                            else None
+                        )
+                        verified_json = (
+                            verified_legacy_json_claims(staging_dir, preserved_manifest)
+                            if preserved_manifest is not None
+                            else frozenset()
+                        )
+                    except _ARTIFACT_ACTIVATION_ERRORS as exc:
+                        self._raise_artifact_activation_validation_error(ArchiveDiagnostics(), exc)
                     self._confine_version_history(staging_dir)
                     diagnostics = self._repair_project_tree(staging_dir)
                     encoding_summary = migrate_project_source_encoding(staging_dir)
@@ -761,26 +778,27 @@ class ProjectArchiveService:
                             ValidationMessage("arch_source_encoding_unconverted", {"name": failed_name}),
                         )
                     try:
-                        preserved_manifest = (
-                            decode_artifact_manifest_payload(manifest["artifact_manifest"])
-                            if isinstance(manifest, dict) and "artifact_manifest" in manifest
-                            else None
-                        )
                         staged = preserved_manifest is not None and stage_preserved_artifact_claims(
                             staging_dir, preserved_manifest
                         )
                     except _ARTIFACT_ACTIVATION_ERRORS as exc:
                         self._raise_artifact_activation_validation_error(diagnostics, exc)
                     try:
+                        if project_schema_is_current(self._load_project_file(staging_dir / "project.json")):
+                            source = staging_dir / "versions/versions.json"
+                            SQLiteHistory(staging_dir).create(SQLiteHistory.read_exchange(source))
+                            source.unlink()  # hard-delete: temp -- exchange payload in import staging
                         migrate_project_dir(staging_dir, bare_provider_models=self._bare_provider_models)
                     except Exception as exc:
                         self._raise_migration_validation_error(diagnostics, exc)
+                    self._repair_unit_mentions_tree(staging_dir, diagnostics)
                     if preserved_manifest is not None and staged:
                         try:
-                            preserved_manifest = take_migrated_artifact_claims(staging_dir, preserved_manifest)
+                            preserved_manifest = take_migrated_artifact_claims(
+                                staging_dir, preserved_manifest, verified_json=verified_json
+                            )
                         except _ARTIFACT_ACTIVATION_ERRORS as exc:
                             self._raise_artifact_activation_validation_error(diagnostics, exc)
-                    self._repair_unit_mentions_tree(staging_dir, diagnostics)
                     diagnostics.extend_validation(self.validator.validate_project_tree(staging_dir))
                     if diagnostics.blocking:
                         raise ProjectArchiveValidationError(
@@ -825,33 +843,39 @@ class ProjectArchiveService:
                         root_parts=root_parts,
                         uploaded_filename=uploaded_filename,
                     )
-                    target_name, conflict_resolution = self._resolve_conflict(
-                        target_name,
-                        project_title=str(project.get("title") or "").strip(),
-                        conflict_policy=conflict_policy,
-                    )
-
                     self._ensure_standard_subdirs(staging_dir)
-                    archived_links = self._verified_archived_links(staging_dir, manifest, target_name)
-
-                    commit = (
-                        self._formal_commit(target_name)
-                        if self._formal_commit is not None and self._has_importable_images(staging_dir)
-                        else nullcontext(None)
-                    )
-                    with commit as storage:
-                        if storage is not None:
-                            self._track_current_images(staging_dir)
-                            try:
-                                self._store_imported_images(staging_dir, storage)
-                            except RemoteSaveFailedError as exc:
-                                raise BadGatewayError("archive_import_remote_save_failed", **exc.params) from exc
-                            storage.track(self.project_manager.projects_dir / target_name)
-                        self._install_project_dir(
-                            staging_dir,
+                    with (
+                        self._prepare_project_dir(staging_dir, target_name) as prepared_dir,
+                        project_names_lock(self.project_manager.layout),
+                    ):
+                        target_name, conflict_resolution = self._resolve_conflict(
                             target_name,
-                            overwrite=(conflict_policy == "overwrite"),
+                            project_title=str(project.get("title") or "").strip(),
+                            conflict_policy=conflict_policy,
                         )
+
+                        archived_links = self._verified_archived_links(prepared_dir, manifest, target_name)
+
+                        commit = (
+                            self._formal_commit(target_name)
+                            if self._formal_commit is not None and self._has_importable_images(prepared_dir)
+                            else nullcontext(None)
+                        )
+                        with commit as storage:
+                            if storage is not None:
+                                self._track_current_images(prepared_dir)
+                                try:
+                                    self._store_imported_images(prepared_dir, storage)
+                                except RemoteSaveFailedError as exc:
+                                    raise BadGatewayError("archive_import_remote_save_failed", **exc.params) from exc
+                                storage.track(self.project_manager.projects_dir / target_name)
+                            target_dir = self.project_manager.projects_dir / target_name
+                            if conflict_resolution == "overwritten" and target_dir.exists():
+                                self._replace_project_dir(prepared_dir, target_dir)
+                            else:
+                                if conflict_resolution == "overwritten":
+                                    conflict_resolution = "none"
+                                prepared_dir.rename(target_dir)
                     self._restore_archived_links(archived_links, diagnostics)
 
                     imported_project = self.project_manager.load_project(target_name)
@@ -974,14 +998,29 @@ class ProjectArchiveService:
         scope: str,
     ) -> None:
         is_current = scope == "current"
-        trimmed_versions: dict[str, Any] | None = None
-        retained_version_files: frozenset[str] = frozenset()
-        if is_current:
+        retained_version_files: set[str] | frozenset[str] = set()
+        store = SQLiteHistory(snapshot_dir)
+        if store.is_enabled():
+            retained: set[str] = set()
+
+            def transform(payload: dict) -> dict:
+                if is_current:
+                    payload, paths = self._current_export_versions(payload)
+                    retained.update(paths)
+                self._drop_remote_locators(payload)
+                return payload
+
+            store.export_json(store.path.with_name("versions.json"), transform)
+            retained_version_files = retained
+        elif is_current:
             versions_path = snapshot_dir / "versions" / "versions.json"
             payload = self._load_json_file(versions_path) if versions_path.is_file() else None
             trimmed_versions, retained_version_files = self._current_export_versions(
                 payload if isinstance(payload, dict) else {}
             )
+            if versions_path.is_file():
+                with versions_path.open("w", encoding="utf-8") as stream:
+                    json.dump(trimmed_versions, stream, ensure_ascii=False)
 
         for current_dir, dirnames, filenames in os.walk(snapshot_dir):
             current_path = Path(current_dir)
@@ -1008,6 +1047,7 @@ class ProjectArchiveService:
                 name
                 for name in sorted(filenames)
                 if not name.startswith(".")
+                and not (relative_dir.parts == ("versions",) and is_history_database_name(name))
                 and not (current_path / name).is_symlink()
                 and not (is_root and name in self._AGENT_RUNTIME_EXCLUDES)
             ]
@@ -1028,18 +1068,6 @@ class ProjectArchiveService:
             for filename in visible_files:
                 source_path = current_path / filename
                 archive_name = Path(project_name, relative_dir, filename).as_posix()
-
-                if is_current and relative_dir.parts == ("versions",) and filename == "versions.json":
-                    assert trimmed_versions is not None
-                    archive.writestr(
-                        archive_name,
-                        json.dumps(
-                            trimmed_versions,
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                    continue
 
                 archive.write(source_path, arcname=archive_name)
 
@@ -1088,17 +1116,14 @@ class ProjectArchiveService:
                     records = resource_info.get("versions", [])
                     if not isinstance(records, list):
                         continue
-                    if current_ver is not None:
-                        records = [
-                            record
-                            for record in records
-                            if isinstance(record, dict) and record.get("version") == current_ver
-                        ]
-                        resource_info["versions"] = records
-                    if (
-                        len(records) == 1
-                        and isinstance(records[0], dict)
-                        and VersionManager.is_managed_snapshot_path(resource_type, records[0].get("file"))
+                    records = [
+                        record
+                        for record in records
+                        if current_ver is not None and isinstance(record, dict) and record.get("version") == current_ver
+                    ]
+                    resource_info["versions"] = records
+                    if len(records) == 1 and VersionManager.is_managed_snapshot_path(
+                        resource_type, records[0].get("file")
                     ):
                         snapshots.add(records[0]["file"])
         return trimmed, frozenset(snapshots)
@@ -1123,14 +1148,26 @@ class ProjectArchiveService:
                 if target_dir.exists():
                     shutil.rmtree(target_dir)  # hard-delete: temp -- 导出用的目录快照
                 try:
+                    history = SQLiteHistory(source_dir)
+                    history_before = history.revision() if history.is_enabled() else None
                     manifest_before = self._source_manifest_entries(source_dir)
                     copied = self._copy_visible_tree(source_dir, target_dir)
+                    copied_history: bytes | None = None
+                    if history.is_enabled():
+                        target_history = SQLiteHistory(target_dir)
+                        history.backup_to(target_history)
+                        copied_history = target_history.revision()
                     source_after = self._visible_tree_signature(source_dir)
                     manifest_after = self._source_manifest_entries(source_dir)
+                    history_after = history.revision() if history.is_enabled() else None
                 except FileNotFoundError as exc:
                     last_missing = exc
                     continue
-            if manifest_before == manifest_after and source_after == copied:
+            if (
+                manifest_before == manifest_after
+                and source_after == copied
+                and history_before == history_after == copied_history
+            ):
                 return manifest_before
         if target_dir.exists():
             shutil.rmtree(target_dir)  # hard-delete: temp -- 导出用的目录快照
@@ -1151,6 +1188,11 @@ class ProjectArchiveService:
         project = self._load_json_file(source_dir / self.project_manager.PROJECT_FILE)
         if not isinstance(project, dict) or not project_schema_is_current(project):
             return None
+        if (
+            parse_project_schema_version(project) >= SQLITE_HISTORY_SCHEMA_VERSION
+            and not SQLiteHistory(source_dir).is_enabled()
+        ):
+            raise ArtifactManifestError("missing v21 version history: versions/history.sqlite3")
         return {
             key: entry
             for key, entry in ProjectArtifactManifestAdapter(source_dir).snapshot_entries().items()
@@ -1168,24 +1210,25 @@ class ProjectArchiveService:
         return tuple(signature)
 
     def _iter_visible_tree(self, root: Path) -> Iterator[tuple[Path, Path, tuple[str, ...]]]:
+        history = SQLiteHistory(root)
+        retired_exchange = history.path.with_name("versions.json") if history.is_enabled() else None
         for current_dir, dirnames, filenames in os.walk(root):
             current_path = Path(current_dir)
             is_root = current_path == root
-            dirnames[:] = [
-                name
-                for name in sorted(dirnames)
-                if not name.startswith(".")
-                and not (current_path / name).is_symlink()
-                and not (is_root and name in self._AGENT_RUNTIME_EXCLUDES)
-                and not (is_root and name not in self._ROOT_VISIBLE_ENTRIES)
-            ]
+
+            def _visible_entry(name: str, *, current_path: Path = current_path, is_root: bool = is_root) -> bool:
+                return (
+                    not name.startswith(".")
+                    and not (current_path / name).is_symlink()
+                    and not (is_root and name in self._AGENT_RUNTIME_EXCLUDES)
+                    and not (current_path == history.path.parent and is_history_database_name(name))
+                    and not is_migration_copy_name(name)
+                    and not (is_root and name not in self._ROOT_VISIBLE_ENTRIES)
+                )
+
+            dirnames[:] = [name for name in sorted(dirnames) if _visible_entry(name)]
             visible_files = tuple(
-                name
-                for name in sorted(filenames)
-                if not name.startswith(".")
-                and not (current_path / name).is_symlink()
-                and not (is_root and name in self._AGENT_RUNTIME_EXCLUDES)
-                and not (is_root and name not in self._ROOT_VISIBLE_ENTRIES)
+                name for name in sorted(filenames) if _visible_entry(name) and current_path / name != retired_exchange
             )
             yield current_path, current_path.relative_to(root), visible_files
 
@@ -1231,7 +1274,8 @@ class ProjectArchiveService:
             return diagnostics
 
         basename_index = self._build_basename_index(project_dir)
-        versions_payload = self._load_versions_payload(project_dir)
+        history = SQLiteHistory(project_dir)
+        versions_payload = history if history.is_enabled() else self._load_versions_payload(project_dir)
         project_changed = False
 
         style_image_rel = project.get("style_image") or "style_reference.png"
@@ -1428,7 +1472,7 @@ class ProjectArchiveService:
         project_scenes: set[str],
         project_props: set[str],
         project_products: set[str],
-        versions_payload: dict[str, Any],
+        versions_payload: SQLiteHistory | dict[str, Any],
         diagnostics: ArchiveDiagnostics,
         basename_index: dict[str, list[str]],
     ) -> tuple[bool, bool]:
@@ -1693,7 +1737,7 @@ class ProjectArchiveService:
         script_payload: dict[str, Any],
         project_payload: dict[str, Any],
         content_mode: str,
-        versions_payload: dict[str, Any],
+        versions_payload: SQLiteHistory | dict[str, Any],
         diagnostics: ArchiveDiagnostics,
     ) -> bool:
         """修复 参考生视频剧本的 video_units，返回 script_changed。
@@ -1895,7 +1939,7 @@ class ProjectArchiveService:
         diagnostics: ArchiveDiagnostics,
         resource_type: str | None = None,
         resource_id: str | None = None,
-        versions_payload: dict[str, Any] | None = None,
+        versions_payload: SQLiteHistory | dict[str, Any] | None = None,
     ) -> bool:
         raw_value = payload.get(field_name)
         if not isinstance(raw_value, str) or not raw_value.strip():
@@ -1970,11 +2014,13 @@ class ProjectArchiveService:
     def _resolve_version_file(
         self,
         project_dir: Path,
-        versions_payload: dict[str, Any],
+        versions_payload: SQLiteHistory | dict[str, Any],
         *,
         resource_type: str,
         resource_id: str,
     ) -> str | None:
+        if isinstance(versions_payload, SQLiteHistory):
+            versions_payload = versions_payload.resources([(resource_type, resource_id)])
         type_payload = versions_payload.get(resource_type, {})
         resource_info = type_payload.get(resource_id) if isinstance(type_payload, dict) else None
         if isinstance(resource_info, dict):
@@ -2063,7 +2109,9 @@ class ProjectArchiveService:
             if not item.is_file() or item.is_symlink():
                 continue
             relative = item.relative_to(project_dir)
-            if self._is_hidden_path(relative):
+            if self._is_hidden_path(relative) or (
+                relative.parts[:-1] == ("versions",) and is_history_database_name(item.name)
+            ):
                 continue
             index.setdefault(item.name, []).append(relative.as_posix())
         return index
@@ -2079,13 +2127,27 @@ class ProjectArchiveService:
         """
 
         versions_path = project_dir / "versions" / "versions.json"
-        if not versions_path.is_file():
-            return
+
+        def _raise_malformed_history(cause: BaseException | None = None) -> NoReturn:
+            raise ProjectArchiveValidationError(
+                ValidationMessage("arch_import_validation_failed"),
+                errors=[ValidationMessage("arch_version_history_malformed", {"location": "versions/versions.json"})],
+            ) from cause
+
         payload = self._load_json_file(versions_path)
         if not isinstance(payload, dict):
+            project = self._load_json_file(project_dir / "project.json")
+            raw_version = project.get("schema_version") if isinstance(project, dict) else None
+            if versions_path.exists() or (type(raw_version) is int and raw_version >= SQLITE_HISTORY_SCHEMA_VERSION):
+                _raise_malformed_history()
             return
 
         unknown = [key for key in payload if key not in VersionManager.RESOURCE_TYPES]
+        if unknown and project_schema_is_current(self._load_project_file(project_dir / "project.json")):
+            try:
+                SQLiteHistory.read_exchange(versions_path)
+            except ValueError as exc:
+                _raise_malformed_history(exc)
         for key in unknown:
             records = sum(len(history) for _, history in self._iter_version_histories(payload.pop(key)))
             logger.info("导入包的版本历史含未知资源类型桶 %r（%d 条版本记录），已剔除", key, records)
@@ -2112,9 +2174,11 @@ class ProjectArchiveService:
 
     def _importable_image_records(self, project_dir: Path) -> tuple[dict[str, Any], list[tuple[dict[str, Any], Path]]]:
         """暂存目录的版本历史，以及其中可保存到对象存储的图片版本记录与快照文件。"""
-        payload = self._load_json_file(project_dir / "versions" / "versions.json")
-        if not isinstance(payload, dict):
-            return {}, []
+        store = SQLiteHistory(project_dir)
+        if store.is_enabled():
+            payload = store.resources(key for key in store.resource_keys() if stores_remotely(key[0]))
+        else:
+            payload = self._load_versions_payload(project_dir)
         records = []
         for resource_type, _resource_id, record in iter_version_records(payload):
             if not stores_remotely(resource_type) or not isinstance(record.get("file"), str):
@@ -2133,8 +2197,7 @@ class ProjectArchiveService:
         生成图片的当前正式文件可随仅当前版本的包导入，版本记录按 ``CURRENT_EXPORT_VERSION_RETENTION`` 裁剪。
         资产图以 project.json 的资产图字段为准，其余图片取规范路径。尾帧不经存储选择，不在其列。
         """
-        payload = self._load_json_file(project_dir / "versions" / "versions.json")
-        payload = payload if isinstance(payload, dict) else {}
+        payload = self._load_versions_payload(project_dir)
         project = self._load_json_file(project_dir / self.project_manager.PROJECT_FILE)
         project = project if isinstance(project, dict) else {}
 
@@ -2198,7 +2261,10 @@ class ProjectArchiveService:
                 stored[key] = storage.store(snapshot, digest)
             record[STORAGE] = stored[key].to_record()
         if records:
-            self._write_json_file(project_dir / "versions" / "versions.json", payload)
+            if isinstance(payload, ResourceBatch):
+                SQLiteHistory(project_dir).save(payload)
+            else:
+                self._write_json_file(project_dir / "versions" / "versions.json", payload)
 
     @staticmethod
     def _iter_version_histories(bucket: object) -> Iterator[tuple[str, list[Any]]]:
@@ -2215,6 +2281,9 @@ class ProjectArchiveService:
                 yield str(resource_id), history
 
     def _load_versions_payload(self, project_dir: Path) -> dict[str, Any]:
+        history = SQLiteHistory(project_dir)
+        if history.is_enabled():
+            return history.snapshot()
         versions_path = project_dir / "versions" / "versions.json"
         payload = self._load_json_file(versions_path)
         if payload is None:
@@ -2449,7 +2518,9 @@ class ProjectArchiveService:
                 continue
             if relative_parts == (ARCHIVE_MANIFEST_NAME,):
                 continue
-            if self._is_hidden_member(relative_parts):
+            if (
+                relative_parts[:-1] == ("versions",) and is_history_database_name(relative_parts[-1])
+            ) or self._is_hidden_member(relative_parts):
                 continue
 
             try:
@@ -2536,23 +2607,13 @@ class ProjectArchiveService:
         for subdir in self.project_manager.SUBDIRS:
             (project_dir / subdir).mkdir(parents=True, exist_ok=True)
 
-    def _install_project_dir(
-        self,
-        staging_dir: Path,
-        project_name: str,
-        *,
-        overwrite: bool,
-    ) -> None:
-        target_dir = self.project_manager.projects_dir / project_name
-        prepared_dir = target_dir.with_name(f".import-staging-{target_dir.name}-{secrets.token_hex(4)}")
-
+    @contextmanager
+    def _prepare_project_dir(self, staging_dir: Path, project_name: str) -> Generator[Path]:
+        prepared_dir = self.project_manager.projects_dir / f".import-staging-{project_name}-{secrets.token_hex(4)}"
         try:
             shutil.move(str(staging_dir), str(prepared_dir))
             self.project_manager.sync_agent_profile(prepared_dir)
-            if overwrite and target_dir.exists():
-                self._replace_project_dir(prepared_dir, target_dir)
-            else:
-                prepared_dir.rename(target_dir)
+            yield prepared_dir
         finally:
             if prepared_dir.exists():
                 shutil.rmtree(prepared_dir, ignore_errors=True)  # hard-delete: temp -- 导入暂存目录

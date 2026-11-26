@@ -124,6 +124,7 @@ PROVIDER_ASSET_FAILURE_CODES: frozenset[str] = frozenset(
 )
 
 FAILURE_CODE_KEYS: dict[str, str] = {
+    "text_wait_timeout": "text_wait_timeout",
     "text_default_model_not_set": "text_default_model_not_set",
     "audio_default_model_not_set": "audio_default_model_not_set",
     "image_default_model_not_set": "image_default_model_not_set",
@@ -135,6 +136,9 @@ FAILURE_CODE_KEYS: dict[str, str] = {
     **{code: code for code in VIDEO_REQUEST_FACTS_FAILURE_CODES},
     **{code: code for code in PROVIDER_ASSET_FAILURE_CODES},
     "provider_unsupported_media": "task_fail_provider_unsupported_media",
+    "narration_tts_voice_invalid": "narration_tts_voice_invalid",
+    "narration_tts_voice_required": "narration_tts_voice_required",
+    "narration_tts_speed_invalid": "narration_tts_speed_invalid",
     "narration_tts_speed_out_of_range": "narration_tts_speed_out_of_range",
     "ark_agent_plan_tts_access_denied": "ark_agent_plan_tts_access_denied",
     "ark_agent_plan_tts_failed": "ark_agent_plan_tts_failed",

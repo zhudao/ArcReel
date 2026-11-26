@@ -60,6 +60,7 @@ from lib.artifacts.artifact_planner import (
     ArtifactTargetStatePlan,
     SharedVersionMetadata,
     TargetStatePlanner,
+    control_file_names,
     episode_scope_for_key,
     gap_backfill_entries,
     plan_artifact_target_state,
@@ -256,12 +257,49 @@ def stage_preserved_artifact_claims(project_dir: Path, preserved: ArtifactManife
     return True
 
 
-def take_migrated_artifact_claims(
+def verified_legacy_json_claims(
     project_dir: Path, preserved: ArtifactManifestArchiveSnapshot
+) -> frozenset[ArtifactKey]:
+    """在归档修复与版本迁移改写 JSON 前，用信封指纹核对原始文件。"""
+    try:
+        project = json.loads((project_dir / "project.json").read_bytes().decode("utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return frozenset()
+    if not isinstance(project, Mapping) or project_schema_is_current(project):
+        return frozenset()
+    if set(preserved.entries) != set(preserved.content_digests):
+        raise ValueError("archive Artifact Manifest content evidence does not cover every formal claim")
+    adapter = ProjectArtifactManifestAdapter(project_dir)
+    verified = set()
+    for key, entry in preserved.entries.items():
+        if key.kind not in {
+            ArtifactKind.EPISODE_SCRIPT,
+            ArtifactKind.EPISODE_SUBTITLE,
+            ArtifactKind.EPISODE_PRESENTATION,
+        }:
+            continue
+        observed = adapter.inspect_artifact(entry.artifact_path)
+        if not observed.present:
+            continue
+        evidence = _archived_content_evidence(adapter, entry.artifact_path, preserved.content_digests[key])
+        if evidence == "mismatch":
+            raise ValueError(
+                f"archive Artifact Manifest formal artifact content does not match its claim: {key.encode()}"
+            )
+        if evidence == "exact":
+            verified.add(key)
+    return frozenset(verified)
+
+
+def take_migrated_artifact_claims(
+    project_dir: Path,
+    preserved: ArtifactManifestArchiveSnapshot,
+    *,
+    verified_json: frozenset[ArtifactKey] = frozenset(),
 ) -> ArtifactManifestArchiveSnapshot:
     """读回迁移链平移后的 claim，撤下暂存清单，交给 :func:`ensure_imported_artifact_target_state`。
 
-    内容摘要按键沿用信封。迁移给 claim 换键并搬图（如链首规整把重名资产的衍生迁到保留名下）时依据摘要
+    同键同路径且导入前精确核验过的 JSON 使用迁移后的字节摘要。其余内容摘要按键沿用信封。迁移给 claim 换键并搬图（如链首规整把重名资产的衍生迁到保留名下）时依据摘要
     不变、图的字节不变：新键的图若与某条依据相同、已消失的旧 claim 的内容摘要一致，就沿用这个摘要。
     迁移撤掉的 claim 一并丢弃；迁移补录的条目对不上旧 claim，不在其列，由导入激活按缺口规则重新补录。
     """
@@ -274,6 +312,9 @@ def take_migrated_artifact_claims(
             departed.setdefault(entry.basis_digest, set()).add(preserved.content_digests[key])
     digests = {key: digest for key, digest in preserved.content_digests.items() if key in entries}
     for key, entry in entries.items():
+        if key in verified_json and entry.artifact_path == preserved.entries[key].artifact_path:
+            digests[key] = read_artifact_content_digest(adapter, entry.artifact_path)
+            continue
         candidates = departed.get(entry.basis_digest) if key not in preserved.entries else None
         if candidates:
             digest = read_artifact_content_digest(adapter, entry.artifact_path)
@@ -415,7 +456,8 @@ def _plan_artifact_claim_reconciliation(
 
     shared_versions = SharedVersionMetadata()
     root_planner = TargetStatePlanner(project_dir, shared_versions=shared_versions)
-    planners: dict[int | None, TargetStatePlanner] = {None: root_planner}
+    groups: dict[int | None, list[ArtifactKey]] = {}
+    absent_paths: set[Path] = set()
     dependency_bytes: dict[Path, bytes] = {}
     dependency_digests: dict[Path, str] = {}
     replacements: dict[ArtifactKey, None] = {}
@@ -426,22 +468,25 @@ def _plan_artifact_claim_reconciliation(
             if previous != value:
                 raise RuntimeError(f"artifact target dependency changed during reconciliation: {path}")
 
-    for key, frozen_entry in claimed.items():
-        scope = episode_scope_for_key(key)
-        planner = planners.get(scope)
-        if planner is None:
-            planner = TargetStatePlanner(
+    for key in claimed:
+        groups.setdefault(episode_scope_for_key(key), []).append(key)
+    for scope, keys in groups.items():
+        planner = (
+            root_planner
+            if scope is None
+            else TargetStatePlanner(
                 project_dir,
                 episode_scope=scope,
                 project_bytes=root_planner.project_bytes,
+                parsed_project=root_planner.project,
                 shared_versions=shared_versions,
             )
-            planners[scope] = planner
-        target = planner.resolve_key(key)
-        if target is None or target.artifact_path != frozen_entry.artifact_path:
-            replacements[key] = None
-
-    for planner in planners.values():
+        )
+        for key in keys:
+            target = planner.resolve_key(key)
+            if target is None or target.artifact_path != claimed[key].artifact_path:
+                replacements[key] = None
+        absent_paths.update(planner.absent_paths)
         _merge_dependency_snapshot(dependency_bytes, planner.dependencies)
         _merge_dependency_snapshot(dependency_digests, planner.dependency_digests)
     return (
@@ -451,6 +496,7 @@ def _plan_artifact_claim_reconciliation(
             formal_paths={},
             project=root_planner.project,
             project_bytes=root_planner.project_bytes,
+            absent_paths=frozenset(absent_paths),
             dependency_bytes=dependency_bytes,
             dependency_digests=dependency_digests,
             script_paths=(),
@@ -541,9 +587,23 @@ def assert_artifact_target_state_plan_unchanged(
         project_dir,
         plan.project_bytes if expected_project_bytes is None else expected_project_bytes,
     )
+    from lib.artifacts.sqlite_history import SQLiteHistory
+
+    history = SQLiteHistory(project_dir.resolve(strict=True))
+    for path in plan.absent_paths:
+        if path.exists() or path.is_symlink():
+            raise RuntimeError(f"artifact activation dependency appeared after preflight: {path}")
+    if plan.script_records is not None and control_file_names(project_dir / "scripts") != plan.script_records:
+        raise RuntimeError("script files changed after artifact activation preflight")
+    if plan.grid_records is not None and control_file_names(project_dir / "grids") != plan.grid_records:
+        raise RuntimeError("grid records changed after artifact activation preflight")
     for path, expected in plan.dependency_bytes.items():
         try:
-            current = path.read_bytes()
+            current = (
+                history.revision()
+                if path.resolve(strict=False) == history.path.resolve(strict=False)
+                else path.read_bytes()
+            )
         except OSError as exc:
             raise RuntimeError(f"artifact activation dependency changed after preflight: {path}") from exc
         if current != expected:
@@ -651,4 +711,5 @@ __all__ = [
     "snapshot_usable_artifact_input_claim",
     "stage_preserved_artifact_claims",
     "take_migrated_artifact_claims",
+    "verified_legacy_json_claims",
 ]

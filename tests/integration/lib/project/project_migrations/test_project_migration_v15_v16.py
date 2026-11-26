@@ -40,6 +40,8 @@ from tests.legacy_project_shapes import (
     add_legacy_manual_uploads,
     advance_project_schema,
     legacy_transition_presentation_basis,
+    read_version_history,
+    use_legacy_history,
     without_version_content_digests,
     write_legacy_ad_reference_video_project,
     write_legacy_episode_id_remnants_project,
@@ -278,9 +280,9 @@ async def test_project_with_registered_tts_audio_becomes_tts_and_its_audio_stays
         assert (summary.episodes[0].videos.available, summary.episodes[0].videos.stale) == (2, 0)
 
     manager.update_project(project_dir.name, lambda value: value.update(narration_voice="Cherry"))
-    assert await _tts_status(project_dir, "E1S1") is ArtifactStatus.STALE
+    assert await _tts_status(project_dir, "E1S1") is ArtifactStatus.CURRENT
     status = WorkflowStateService(manager).get_status(project_dir.name, 1)
-    assert status.artifacts["audio"]["stale_ids"] == ["E1S1", "E1S2"]
+    assert status.artifacts["audio"]["current_ids"] == ["E1S1", "E1S2"]
     manager.update_project(project_dir.name, lambda value: value.update(narration_voice="Ethan"))
     assert await _tts_status(project_dir, "E1S1") is ArtifactStatus.CURRENT
 
@@ -327,7 +329,11 @@ async def test_upgrade_preserves_paid_videos_raised_by_tts_but_does_not_refresh_
         _write_json(script_path, script)
     advance_project_schema(project_dir, to_version=schema_version)
     adapter = ProjectArtifactManifestAdapter(project_dir)
-    legacy_target = TargetStatePlanner(project_dir).plan()
+    from lib.project.project_migrations.legacy_audio import V1_AUDIO_RULES, legacy_narrated_duration
+
+    legacy_target = TargetStatePlanner(
+        project_dir, duration_override=legacy_narrated_duration, audio_rules=V1_AUDIO_RULES
+    ).plan()
     for unit_id in ("E1S1", "E1S2"):
         key = ArtifactKey.episode_video(1, unit_id)
         assert adapter.get_entry(key) == legacy_target.entries[key]
@@ -346,7 +352,7 @@ async def test_upgrade_preserves_paid_videos_raised_by_tts_but_does_not_refresh_
     assert status.artifacts["videos"]["current_ids"] == ["E1S1"]
     assert status.artifacts["videos"]["stale_ids"] == ["E1S2"]
     assert adapter.get_entry(ArtifactKey.episode_video(1, "E1S2")) == stale_entry
-    after = without_version_content_digests(_read_json(versions_path))
+    after = without_version_content_digests(read_version_history(project_dir))
     selected = after["videos"]["E1S1"]["versions"][0]
     assert selected == {**before["videos"]["E1S1"]["versions"][0], VIDEO_CURRENCY_DURATION_FIELD: 4}
     assert after["videos"]["E1S2"] == before["videos"]["E1S2"]
@@ -427,7 +433,7 @@ def test_upgrade_does_not_refresh_a_raised_video_whose_narration_is_not_current(
     migrate_project_dir(project_dir)
 
     assert adapter.get_entry(key) == entry
-    assert without_version_content_digests(_read_json(versions_path))["videos"] == versions["videos"]
+    assert without_version_content_digests(read_version_history(project_dir))["videos"] == versions["videos"]
     status = WorkflowStateService(ProjectManager(tmp_path)).get_status(project_dir.name, 1)
     assert status.artifacts["videos"]["stale_ids"] == ["E1S1"]
     assert status.artifacts["videos"]["current_ids"] == []
@@ -447,7 +453,7 @@ def test_raised_video_duration_rebase_can_resume_before_project_version_commit(
     project_bytes = project_path.read_bytes()
     adapter = ProjectArtifactManifestAdapter(project_dir)
     old_entries = adapter.snapshot_entries()
-    migrate_project_dir(project_dir)
+    advance_project_schema(project_dir, to_version=16)
     new_entries = adapter.snapshot_entries()
     versions_path = project_dir / "versions" / "versions.json"
     new_versions = versions_path.read_bytes()
@@ -455,10 +461,11 @@ def test_raised_video_duration_rebase_can_resume_before_project_version_commit(
     project_path.write_bytes(project_bytes)
     if not manifest_committed:
         adapter.replace_entries_atomically(old_entries)
-    assert migrate_project_dir(project_dir) is True
+    advance_project_schema(project_dir, to_version=16)
 
     assert adapter.snapshot_entries() == new_entries
     assert versions_path.read_bytes() == new_versions
+    migrate_project_dir(project_dir)
     status = WorkflowStateService(ProjectManager(tmp_path)).get_status(project_dir.name, 1)
     assert status.artifacts["videos"]["current_ids"] == ["E1S1"]
 
@@ -538,6 +545,7 @@ def test_rerun_after_the_manifest_was_rebased_but_the_file_was_not(tmp_path: Pat
     migrated_bytes = (project_dir / _PRESENTATION_PATH).read_bytes()
     entries = ProjectArtifactManifestAdapter(project_dir).snapshot_entries()
 
+    use_legacy_history(project_dir)
     (project_dir / _PRESENTATION_PATH).write_bytes(legacy_bytes)
     (project_dir / "project.json").write_bytes(project_bytes)
     migrate_v15_to_v16(project_dir)

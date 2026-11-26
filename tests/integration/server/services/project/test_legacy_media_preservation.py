@@ -11,18 +11,23 @@ from typing import Any
 
 import pytest
 
-from lib.artifacts.artifact_currency import read_artifact_content_digest
+from lib.artifacts.artifact_currency import ArtifactCurrencyResolver, read_artifact_content_digest
 from lib.artifacts.artifact_manifest import (
+    ArtifactKey,
     ArtifactKind,
     ArtifactManifestArchiveSnapshot,
+    ArtifactStatus,
     ProjectArtifactManifestAdapter,
     encode_artifact_manifest_payload,
 )
+from lib.artifacts.version_manager import VersionManager
 from lib.infra.path_safety import try_safe_join
 from lib.project.asset_types import ASSET_SPECS, normalize_asset_name
 from lib.project.project_manager import ProjectManager
 from lib.project.project_migrations.runner import migrate_project_dir
 from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
+from lib.speech.speech_presentation import presentation_artifact_paths
+from lib.workflow.workflow_state import WorkflowStateService
 from server.services.project.project_archive import (
     ARCHIVE_MANIFEST_NAME,
     ProjectArchiveService,
@@ -111,7 +116,7 @@ def _media_snapshot(
     return media
 
 
-def _write_enveloped_archive(project_dir: Path, archive_path: Path) -> None:
+def _write_enveloped_archive(project_dir: Path, archive_path: Path, *, full_manifest: bool = False) -> None:
     adapter = ProjectArtifactManifestAdapter(project_dir)
     media_kinds = {
         ArtifactKind.ASSET_SHEET,
@@ -120,7 +125,11 @@ def _write_enveloped_archive(project_dir: Path, archive_path: Path) -> None:
         ArtifactKind.EPISODE_VIDEO,
         ArtifactKind.EPISODE_AUDIO,
     }
-    entries = {key: entry for key, entry in adapter.snapshot_entries().items() if key.kind in media_kinds}
+    entries = {
+        key: entry
+        for key, entry in adapter.snapshot_entries().items()
+        if (full_manifest or key.kind in media_kinds) and not entry.artifact_path.startswith("renders/")
+    }
     digests = {key: read_artifact_content_digest(adapter, entry.artifact_path) for key, entry in entries.items()}
     manifest = ArtifactManifestArchiveSnapshot(entries=entries, content_digests=digests)
     envelope = {"project_name": project_dir.name, "artifact_manifest": encode_artifact_manifest_payload(manifest)}
@@ -128,7 +137,7 @@ def _write_enveloped_archive(project_dir: Path, archive_path: Path) -> None:
         archive.writestr(ARCHIVE_MANIFEST_NAME, json.dumps(envelope))
         for path in sorted(project_dir.rglob("*")):
             relative = path.relative_to(project_dir)
-            if all(not part.startswith(".") for part in relative.parts):
+            if relative.parts[0] != "renders" and all(not part.startswith(".") for part in relative.parts):
                 archive.write(path, relative.as_posix())
 
 
@@ -146,7 +155,18 @@ def test_legacy_media_fields_preserve_readable_bytes_and_unreadable_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str, entry_point: str, root_is_alias: bool
 ) -> None:
     tmp_path = tmp_path.resolve()
-    project_dir = LEGACY_PROJECT_SHAPES[shape](tmp_path / "source")
+    project_dir = LEGACY_PROJECT_SHAPES[shape](tmp_path / "source" / "projects")
+    tts_snapshot = shape in {"v15-tts", "v20-tts-exports"}
+    before_updated_at = None
+    media_bytes: dict[Path, bytes] = {}
+    if tts_snapshot:
+        before_updated_at = _read_json(project_dir / "project.json")["metadata"]["updated_at"]
+        media_bytes = {
+            path.relative_to(project_dir): path.read_bytes()
+            for pattern in ("versions/audio/*.wav", "renders/*/*/*.zip", "renders/*/*/*.mp4")
+            for path in project_dir.glob(pattern)
+            if entry_point == "in_place" or path.relative_to(project_dir).parts[0] != "renders"
+        }
     expected = _media_snapshot(project_dir)
     cleared = ((0, "storyboard_image"), (1, "storyboard_image"), (1, "video_clip"))
     if shape == "shared-item-id":
@@ -175,7 +195,7 @@ def test_legacy_media_fields_preserve_readable_bytes_and_unreadable_state(
             extraction_root = alias
         monkeypatch.setattr(tempfile, "tempdir", str(extraction_root))
         archive_path = tmp_path / "legacy.zip"
-        _write_enveloped_archive(project_dir, archive_path)
+        _write_enveloped_archive(project_dir, archive_path, full_manifest=tts_snapshot)
         target = ProjectManager(tmp_path / "imported")
         service = ProjectArchiveService(target)
         if shape in {"missing-character-original", "dangling-alias-reference"}:
@@ -202,6 +222,12 @@ def test_legacy_media_fields_preserve_readable_bytes_and_unreadable_state(
 
     project = _read_json(project_dir / "project.json")
     assert project["schema_version"] == CURRENT_PROJECT_SCHEMA_VERSION
+    if tts_snapshot:
+        assert project["metadata"]["updated_at"] == before_updated_at
+        assert {path: (project_dir / path).read_bytes() for path in media_bytes} == media_bytes
+        _assert_released_tts_delivery(
+            project_dir, has_timeline_exports=shape == "v20-tts-exports" and entry_point == "in_place"
+        )
     if shape == "crossed-script-bindings":
         expected_bindings = {1: "scripts/episode_1.json", 2: "scripts/episode_2.json"}
         assert {entry["episode"]: entry["script_file"] for entry in project["episodes"]} == expected_bindings
@@ -219,3 +245,146 @@ def test_legacy_media_fields_preserve_readable_bytes_and_unreadable_state(
         if expected.get(location) != after.get(location)
     }
     assert not changed, f"Media bytes changed (expected, actual): {changed}"
+
+
+def _assert_released_tts_delivery(project_dir: Path, *, has_timeline_exports: bool) -> None:
+    project = _read_json(project_dir / "project.json")
+    assert project["narration_delivery"] == "use_tts"
+    assert (project["audio_backend"], project["narration_voice"], project["narration_speed"]) == (
+        "dashscope/qwen3-tts-flash",
+        "voice-clone-rain",
+        1.2,
+    )
+    workflow = WorkflowStateService(ProjectManager(project_dir.parent.parent))
+    audio = workflow.get_status(project_dir.name, 1).artifacts["audio"]
+    assert audio["current_ids"] == ["E1S2"]
+    assert audio["stale_ids"] == ["E1S1"]
+    versions = VersionManager(project_dir).get_versions("audio", "E1S1")
+    assert all(record["artifact_audio_basis"]["kind_version"] == 2 for record in versions["versions"])
+    assert versions["current_version"] == 2
+    historical, selected = sorted(versions["versions"], key=lambda record: record["version"])
+    assert (project_dir / selected["file"]).read_bytes() == (project_dir / "audio/segment_E1S1.wav").read_bytes()
+    assert (project_dir / historical["file"]).read_bytes() != (project_dir / selected["file"]).read_bytes()
+    entries = ProjectArtifactManifestAdapter(project_dir).snapshot_entries()
+    resolver = ArtifactCurrencyResolver(project_dir)
+    for index in (1, 2):
+        unit = f"E1S{index}"
+        subtitle_path, presentation_path = presentation_artifact_paths(1, unit, "use_tts")
+        presentation = _read_json(project_dir / presentation_path)
+        cues = _read_json(project_dir / subtitle_path)["cues"]
+        assert cues == presentation["subtitles"]
+        assert [cue["text"] for cue in cues] == [f"第{index}段旁白。"]
+        for key, path in (
+            (ArtifactKey.episode_subtitle(1, unit, "use_tts"), subtitle_path),
+            (ArtifactKey.episode_presentation(1, unit, "use_tts"), presentation_path),
+        ):
+            assert entries[key].artifact_path == path
+            expected_currency = ArtifactStatus.CURRENT if index == 2 else ArtifactStatus.STALE
+            assert resolver.compare(key, artifact_path=path).status is expected_currency
+        if index == 1:
+            assert presentation["narration_audio"]["artifact_path"] == historical["file"]
+            assert presentation["narration_audio"]["basis"] == historical["artifact_audio_basis"]
+    exports = {
+        key.kind: resolver.compare(key, artifact_path=entry.artifact_path).status
+        for key, entry in entries.items()
+        if key.kind in {ArtifactKind.EPISODE_FINAL_CUT, ArtifactKind.EPISODE_JIANYING_DRAFT}
+    }
+    if not has_timeline_exports:
+        assert not any((project_dir / "renders").rglob("*.*"))
+    assert exports == (
+        {
+            ArtifactKind.EPISODE_FINAL_CUT: ArtifactStatus.CURRENT,
+            ArtifactKind.EPISODE_JIANYING_DRAFT: ArtifactStatus.CURRENT,
+        }
+        if has_timeline_exports
+        else {}
+    )
+
+
+@pytest.mark.parametrize("member", ["scripts/episode_1.json", presentation_artifact_paths(1, "E1S2", "use_tts")[1]])
+def test_import_rejects_changed_json_even_when_migration_would_rewrite_it(tmp_path: Path, member: str) -> None:
+    project_dir = LEGACY_PROJECT_SHAPES["v15-tts"](tmp_path / "source")
+    original = tmp_path / "original.zip"
+    modified = tmp_path / "modified.zip"
+    _write_enveloped_archive(project_dir, original, full_manifest=True)
+    with zipfile.ZipFile(original) as source, zipfile.ZipFile(modified, "w") as target:
+        for info in source.infolist():
+            data = source.read(info)
+            target.writestr(info, data + b" " if info.filename == member else data)
+
+    manager = ProjectManager(tmp_path / "imported")
+    with pytest.raises(ProjectArchiveValidationError) as rejected:
+        ProjectArchiveService(manager).import_project_archive(modified, confirm_report=True)
+    assert "content does not match" in str(rejected.value.errors[0].params["reason"])
+    assert manager.list_projects() == []
+
+
+def test_audio_upgrade_retries_after_versions_write_before_manifest_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = LEGACY_PROJECT_SHAPES["v20-tts-exports"](tmp_path / "projects")
+
+    def interrupt(*args, **kwargs):
+        assert (
+            VersionManager(root).get_versions("audio", "E1S2")["versions"][0]["artifact_audio_basis"]["kind_version"]
+            == 2
+        )
+        raise RuntimeError("interrupted manifest commit")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(ProjectArtifactManifestAdapter, "replace_entries_if_matches_atomically", interrupt)
+        with pytest.raises(RuntimeError, match="interrupted manifest commit"):
+            migrate_project_dir(root)
+    migrate_project_dir(root)
+    _assert_released_tts_delivery(root, has_timeline_exports=True)
+    snapshots = {path: path.read_bytes() for path in root.rglob("*.json")}
+    migrate_project_dir(root)
+    assert {path: path.read_bytes() for path in snapshots} == snapshots
+
+
+def test_explicitly_restoring_stale_pre_upgrade_audio_uses_text_currency(tmp_path: Path) -> None:
+    from server.services.currency.artifact_version_restore import restore_typed_media_version
+
+    root = LEGACY_PROJECT_SHAPES["v20-tts-exports"](tmp_path / "projects")
+    migrate_project_dir(root)
+    manager = ProjectManager(tmp_path)
+    manager.update_project(
+        root.name, lambda p: [p.pop(k, None) for k in ("audio_backend", "narration_voice", "narration_speed")]
+    )
+    relative = "audio/segment_E1S1.wav"
+    resolver = ArtifactCurrencyResolver(root)
+    key = ArtifactKey.episode_audio(1, "E1S1")
+    assert resolver.compare(key, artifact_path=relative).status is ArtifactStatus.STALE
+    restore_typed_media_version(
+        project_manager=manager,
+        project_name=root.name,
+        project_path=root,
+        versions=VersionManager(root),
+        resource_type="audio",
+        resource_id="E1S1",
+        version=1,
+        current_file=root / relative,
+        artifact_path=relative,
+    )
+    assert ArtifactCurrencyResolver(root).compare(key, artifact_path=relative).status is ArtifactStatus.CURRENT
+
+
+def test_partial_project_group_preserves_provable_historical_presentation(tmp_path: Path) -> None:
+    root = LEGACY_PROJECT_SHAPES["v20-tts-exports"](tmp_path / "projects")
+    project_path = root / "project.json"
+    project = _read_json(project_path)
+    del project["narration_voice"]
+    project_path.write_text(json.dumps(project))
+    migrate_project_dir(root)
+    migrated = _read_json(project_path)
+    assert migrated["narration_delivery"] == "use_tts"
+    assert {"audio_backend", "narration_voice", "narration_speed"}.isdisjoint(migrated)
+    _, pres = presentation_artifact_paths(1, "E1S1", "use_tts")
+    audio = _read_json(root / pres)["narration_audio"]
+    assert (audio["version"], audio["basis"]["kind_version"]) == (1, 2)
+    assert (
+        ArtifactCurrencyResolver(root)
+        .compare(ArtifactKey.episode_audio(1, "E1S2"), artifact_path="audio/segment_E1S2.wav")
+        .status
+        is ArtifactStatus.STALE
+    )

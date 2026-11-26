@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from lib.agent.profile_manifest import ContentMode
 from lib.artifacts.artifact_activation import ArtifactCurrencyResolver, active_artifact_currency_resolver
+from lib.backends.http_status_errors import TextWaitTimeout
 from lib.backends.text_backends.base import TextOutputTruncatedError
 from lib.catalog.errors import ModelNotInCatalogError
 from lib.config.resolver import (
@@ -122,7 +123,7 @@ from lib.generation.generation_result import (
     GenerationProblemCode,
     GenerationSelectionMode,
     GenerationTargetState,
-    encode_generation_problem,
+    QueuedGenerationError,
     enqueue_problem,
     migration_problem,
     problem_from_task_failure,
@@ -130,7 +131,8 @@ from lib.generation.generation_result import (
 from lib.generation.task_failure_encoding import is_database_failure, is_provider_refusal
 from lib.generation.video_request_facts import VideoRequestFactsError, VideoRequestFactsFailure
 from lib.i18n import _ as i18n_message
-from lib.infra.async_thread import run_sync_transaction
+from lib.infra.api_errors import UnprocessableError
+from lib.infra.async_thread import EventLoopBridge, run_sync_transaction
 from lib.infra.async_thread import run_sync_transaction as _run_sync_transaction
 from lib.infra.content_digest import (
     OPTIONAL_PREFIXED_DIGEST_PATTERN,
@@ -149,7 +151,7 @@ from lib.project.asset_merge import (
     AssetMergeReport,
 )
 from lib.project.asset_types import ASSET_SPECS
-from lib.project.project_manager import ProjectManager, is_reference_video_project
+from lib.project.project_manager import ProjectManager, get_project_manager, is_reference_video_project
 from lib.project.project_migration_failure import (
     MigrationFailureRecord,
     ProjectMigrationError,
@@ -201,9 +203,9 @@ from lib.script.source_loader import (
 from lib.speech.character_voice import VALID_CHARACTER_VOICE_BINDINGS
 from lib.speech.narration_config import (
     POST_PRODUCTION,
+    TTS_GROUP_FIELDS,
     NarrationConfigError,
     NarrationDelivery,
-    validate_project_narration_config,
 )
 from lib.speech.speech_composition import SpeechProblemCode
 from lib.workflow.operation_admission import admit_plan_episodes, whole_source_present
@@ -221,9 +223,13 @@ from server.services.admission.prompt_preview import ItemPromptPreview, ScriptIt
 from server.services.admission.video_batch_admission import generation_action_for
 from server.services.project.asset_identity import merge_project_asset, rename_project_asset
 from server.services.project.episode_id_records import recorded_episode_ids_on
-from server.services.project.narration_settings import NarrationSettingsInput, new_project_narration_fields
+from server.services.project.narration_settings import (
+    NarrationSettingsInput,
+    apply_project_tts_patch,
+    new_project_narration_fields,
+)
 from server.services.project.script_review import ScriptPlanContent, ScriptReviewError, ScriptReviewService
-from server.services.project.workflow_planner import WorkflowPlanner
+from server.services.project.workflow_planner import DEFAULT_WORKFLOW_CONFIG, WorkflowPlanner
 from server.services.tasks.episode_activity import episode_has_active_tasks
 from server.services.tasks.video_caps import resolve_agent_video_capabilities
 from server.text_generation import (
@@ -302,8 +308,10 @@ class Services:
         return cls(
             projects=projects,
             workflow_planner=WorkflowPlanner(projects),
-            capabilities=ConfigResolver(async_session_factory),
-            queue=GenerationQueue(project_manager=projects),
+            capabilities=DEFAULT_WORKFLOW_CONFIG,
+            queue=get_generation_queue()
+            if projects is get_project_manager()
+            else GenerationQueue(project_manager=projects),
         )
 
 
@@ -662,6 +670,8 @@ async def _run_text_generation(
         return ToolOutcome(problem=_prompt_overwrite_problem(exc))
     except OperationNotAdmittedError as exc:
         return ToolOutcome(problem=_not_admitted_problem(exc))
+    except TextWaitTimeout as exc:
+        return ToolOutcome(problem=ToolProblem(exc.code, str(exc)))
     except TextOutputTruncatedError as exc:
         return ToolOutcome(problem=truncation_problem(exc))
     except VideoRequestFactsUnavailableError as exc:
@@ -1484,14 +1494,14 @@ class CreateProjectToolRequest(BaseModel):
     )
     audio_backend: str | SkipJsonSchema[None] = Field(
         default=None,
-        description="TTS 模型，形如 provider/model；仅 use_tts 使用，省略时取全局默认音频模型",
+        description="TTS 模型，形如 provider/model；省略配音三项时整组跟随全局",
     )
     narration_voice: str | SkipJsonSchema[None] = Field(
-        default=None, description="旁白音色 id；仅 use_tts 使用，省略时取全局默认音色"
+        default=None, description="旁白音色 id；选择模型后可指定音色，省略取该模型首个建议音色"
     )
     narration_speed: float | None = Field(
         default=None,
-        description="配音语速倍率（正数）；仅 use_tts 使用，省略时取全局默认，null 表示不向供应商传语速",
+        description="配音语速倍率（正数）；项目覆盖中省略或传 null 表示使用供应商默认语速",
     )
 
     @model_validator(mode="after")
@@ -1567,7 +1577,7 @@ async def list_projects(
 
 
 _NARRATION_CONFIG_PROBLEMS = {
-    "narration_tts_model_required": "use_tts 需要 TTS 模型：传 audio_backend（provider/model），或先让用户配置音频供应商",
+    "narration_tts_model_required": "设置项目配音覆盖时，请先传 audio_backend（provider/model）",
     "narration_tts_model_invalid": "audio_backend 不是可用的 TTS 模型，需为音频供应商下的 provider/model",
     "narration_tts_voice_required": "use_tts 需要非空的 narration_voice",
     "narration_tts_speed_invalid": "narration_speed 必须是正的有限数值或 null",
@@ -1592,12 +1602,17 @@ async def create_project(
             resolver=services.capabilities,
         )
     except NarrationConfigError as exc:
-        return ToolOutcome(problem=ToolProblem("invalid_request", _NARRATION_CONFIG_PROBLEMS[exc.code]))
+        return ToolOutcome(
+            problem=ToolProblem("invalid_request", _NARRATION_CONFIG_PROBLEMS.get(exc.code, i18n_message(exc.code)))
+        )
+    except ModelNotInCatalogError as exc:
+        return ToolOutcome(problem=model_not_in_catalog_problem(exc))
+    except UnprocessableError as exc:
+        return ToolOutcome(problem=ToolProblem("invalid_request", _zh(exc.key, **exc.params)))
 
     def _create() -> dict[str, Any]:
         name = services.projects.normalize_project_name(value.name)
-        services.projects.create_project(name, content_mode=value.content_mode, publish=False)
-        try:
+        with services.projects.creating_project(name, content_mode=value.content_mode, publish=False):
             project = services.projects.create_project_metadata(
                 name,
                 value.title,
@@ -1612,9 +1627,6 @@ async def create_project(
                 brief=value.brief,
                 narration=narration,
             )
-        except Exception:
-            services.projects.delete_project_directory(name)
-            raise
         return {"name": name, "project": project}
 
     try:
@@ -2305,6 +2317,8 @@ PROJECT_SETTINGS = (
     EPISODE_TARGET_DURATION_FIELD,
     "source_language",
     "brief",
+    "audio_backend",
+    "narration_delivery",
     "narration_voice",
     "narration_speed",
     "character_voice_binding",
@@ -2392,7 +2406,11 @@ class PatchProjectRequest(BaseModel):
     )
     settings: dict[str, Any] | None = Field(
         default=None,
-        description=f"（settings 写入分支）顶层字段映射，键须在白名单 {list(PROJECT_SETTINGS)} 内，值为 null 时清除该字段",
+        description=(
+            f"（settings 写入分支）顶层字段映射，可写字段 {list(PROJECT_SETTINGS)}。"
+            "narration_delivery 可独立切换。audio_backend 创建或切换项目配音覆盖，"
+            "可同时传 narration_voice 与 narration_speed。单独传 audio_backend: null 恢复跟随全局。"
+        ),
     )
     overview: dict[str, Any] | None = Field(
         default=None,
@@ -2714,6 +2732,8 @@ async def _execute_plan_episodes(
                 )
         except TextOutputTruncatedError as exc:
             outcome: ToolOutcome[Any] = ToolOutcome(problem=truncation_problem(exc))
+        except TextWaitTimeout as exc:
+            outcome = ToolOutcome(problem=ToolProblem(exc.code, str(exc)))
         except NoAvailableProviderError as exc:
             outcome = ToolOutcome(problem=no_available_provider_problem(exc))
         except ModelNotInCatalogError as exc:
@@ -3009,6 +3029,8 @@ async def _draft_replan_window(
             )
         except TextOutputTruncatedError as exc:
             outcome: ToolOutcome[Any] = ToolOutcome(problem=truncation_problem(exc))
+        except TextWaitTimeout as exc:
+            outcome = ToolOutcome(problem=ToolProblem(exc.code, str(exc)))
         except NoAvailableProviderError as exc:
             outcome = ToolOutcome(problem=no_available_provider_problem(exc))
         except ModelNotInCatalogError as exc:
@@ -3170,7 +3192,7 @@ async def execute_queued_text_task(
             raise ValueError(f"unsupported text task_type: {task_type}") from exc
         outcome = await _execute_text_handler(operation, handler, request, scope, services)
     if outcome.problem is not None:
-        raise RuntimeError(encode_generation_problem(_queued_generation_problem(outcome.problem)))
+        raise QueuedGenerationError(_queued_generation_problem(outcome.problem))
     value = outcome.value
     if isinstance(value, TextGenerationResult):
         return _text_result_payload(value)
@@ -3317,8 +3339,16 @@ def _coerce_setting_value(key: str, value: Any) -> Any:
                 f"character_voice_binding 必须是 {sorted(VALID_CHARACTER_VOICE_BINDINGS)} 之一或 null,收到 {value!r}"
             )
         return value
+    if key == "narration_delivery":
+        if value not in ("post_production", "use_tts"):
+            raise ValueError("narration_delivery 必须是 post_production 或 use_tts")
+        return value
+    if key == "audio_backend":
+        if value is not None and not isinstance(value, str):
+            raise ValueError("audio_backend 必须是 provider/model 或 null")
+        return value
     if key == "narration_voice":
-        if value is not None and (not isinstance(value, str) or not value.strip()):
+        if value is not None and not isinstance(value, str):
             raise ValueError(f"narration_voice 必须是非空字符串或 null,收到 {value!r}")
         return value
     if key == "narration_speed":
@@ -3396,6 +3426,7 @@ def _patch_project_sync(
     request: ToolRequest[PatchProjectRequest],
     scope: ProjectScope,
     services: Services,
+    bridge: EventLoopBridge,
 ) -> ToolOutcome[PatchProjectResult]:
     value = request.value
     try:
@@ -3436,22 +3467,25 @@ def _patch_project_sync(
                     raise ValueError(
                         f"{EPISODE_TARGET_DURATION_FIELD} 不适用广告/短片项目（整集体量按 target_duration 预算规划）"
                     )
+                previous = {key: project_data[key] for key in coerced if key in project_data}
+                apply_project_tts_patch(
+                    project_data,
+                    coerced,
+                    lambda provider, model: bridge.run(services.capabilities.audio_model_profile(provider, model)),
+                )
                 for key, field_value in coerced.items():
-                    current = project_data.get(key)
-                    if field_value is None:
-                        diagnostics[key] = ("clear", None) if key in project_data else ("noop", None)
-                        project_data.pop(key, None)
-                    elif current == field_value:
-                        diagnostics[key] = ("noop", current)
+                    if key not in TTS_GROUP_FIELDS:
+                        if field_value is None:
+                            project_data.pop(key, None)
+                        else:
+                            project_data[key] = field_value
+                    saved = project_data.get(key)
+                    if key in previous and key not in project_data:
+                        diagnostics[key] = ("clear", None)
+                    elif saved != previous.get(key):
+                        diagnostics[key] = ("set", saved)
                     else:
-                        diagnostics[key] = ("set", field_value)
-                        project_data[key] = field_value
-                try:
-                    validate_project_narration_config(project_data)
-                except NarrationConfigError as exc:
-                    raise ValueError(
-                        f"项目的旁白交付方式是 TTS 配音，TTS 快照必须完整，本次修改被拒绝（{exc.code}）"
-                    ) from exc
+                        diagnostics[key] = ("noop", saved)
 
             services.projects.update_project(scope.project_name, mutate_settings)
             return ToolOutcome(
@@ -3465,6 +3499,14 @@ def _patch_project_sync(
         return ToolOutcome(
             value=PatchProjectResult(message=_format_upsert(value.table, changes), operation="assets", changes=changes)
         )
+    except NarrationConfigError as exc:
+        return ToolOutcome(
+            problem=ToolProblem("invalid_request", _NARRATION_CONFIG_PROBLEMS.get(exc.code, i18n_message(exc.code)))
+        )
+    except ModelNotInCatalogError as exc:
+        return ToolOutcome(problem=model_not_in_catalog_problem(exc))
+    except UnprocessableError as exc:
+        return ToolOutcome(problem=ToolProblem("invalid_request", _zh(exc.key, **exc.params)))
     except Exception as exc:
         return ToolOutcome(problem=_unexpected("patch_project", exc))
 
@@ -3475,7 +3517,7 @@ async def patch_project(
     _caller: CallerContext,
     services: Services,
 ) -> ToolOutcome[PatchProjectResult]:
-    return await _run_sync_transaction(_patch_project_sync, request, scope, services)
+    return await _run_sync_transaction(_patch_project_sync, request, scope, services, EventLoopBridge.capture())
 
 
 def _patch_episode_meta_sync(

@@ -1,39 +1,32 @@
-"""新建项目的旁白交付配置（docs/adr/0089）。
-
-Web 创建向导与 Agent 建项工具共用：TTS 配音项目省略的模型、音色与配音语速以全局默认预填，
-写入 project.json 后成为项目快照，此后全局默认的变化不再影响这个项目。
-"""
+"""项目旁白交付与配音设置。"""
 
 from __future__ import annotations
 
-import logging
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+from lib.backends.audio_profiles import AudioProfile
 from lib.catalog import query as catalog
 from lib.config.registry import PROVIDER_REGISTRY
-from lib.config.resolver import ConfigResolver, ProviderModel
+from lib.config.resolver import ConfigResolver
 from lib.custom_provider import is_custom_provider
 from lib.speech.narration_config import (
     NARRATION_DELIVERY_FIELD,
     POST_PRODUCTION,
     TTS_BACKEND_FIELD,
+    TTS_GROUP_FIELDS,
     TTS_SPEED_FIELD,
     TTS_VOICE_FIELD,
-    USE_TTS,
     NarrationConfigError,
     NarrationDelivery,
     parse_tts_backend,
     parse_tts_speed,
-    validate_project_narration_config,
 )
-from server.services.tasks.generation_context import audio_backend_voice_ids
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class NarrationSettingsInput:
-    """建项请求里的旁白配置。``provided`` 列出请求显式给出的 TTS 字段，其余字段按全局默认预填。"""
+    """建项请求里的旁白配置。``provided`` 列出请求显式给出的 TTS 字段。"""
 
     delivery: NarrationDelivery = POST_PRODUCTION
     audio_backend: str | None = None
@@ -59,88 +52,59 @@ def validate_tts_backend(value: str) -> str:
     return f"{provider_id}/{model_id}"
 
 
-def validate_tts_speed(value: float) -> float:
-    speed = parse_tts_speed(value)
-    if speed is None:
-        raise NarrationConfigError("narration_tts_speed_invalid")
-    return speed
-
-
-async def _voice_for_backend(resolver: ConfigResolver, provider_id: str, model_id: str, voice: str) -> str:
-    """让全局音色与项目实际使用的 TTS 模型相符。
-
-    全局音色只有一份，默认音频模型却可能按注册表顺序自动推断到另一家供应商（缺省音色 Cherry
-    只属于 DashScope）。音色不在所选内置模型的音色表中时，改用表中第一个音色。自定义供应商的
-    音色表不一定完整，音色原样保留；音色表取不到时同样原样保留，合成时照常报错。
-    """
-    if is_custom_provider(provider_id):
-        return voice
-    try:
-        voice_ids = await audio_backend_voice_ids(provider_id, model_id, resolver)
-    except Exception as exc:
-        logger.warning("读取音色表失败，旁白音色按全局设置预填 backend=%s/%s：%s", provider_id, model_id, exc)
-        return voice
-    if voice_ids and voice not in voice_ids:
-        return voice_ids[0]
-    return voice
-
-
-async def default_narration_tts(resolver: ConfigResolver) -> tuple[ProviderModel, str, float | None]:
-    """新建 TTS 项目的预填值：全局默认音频模型、与之相符的旁白音色与配音语速。
-
-    未配置任何音频供应商时抛 ValueError。
-    """
-    from lib.video_runtime.audio import default_narration_tts as resolve_default_narration_tts
-
-    backend, voice, speed = await resolve_default_narration_tts(resolver)
-    return backend, await _voice_for_backend(resolver, backend.provider_id, backend.model_id, voice), speed
-
-
-async def new_project_narration_fields(
-    value: NarrationSettingsInput,
-    *,
-    resolver: ConfigResolver,
-) -> dict[str, object]:
-    """算出新项目要写入 project.json 的旁白配置字段。"""
-    from lib.video_runtime.audio import default_narration_tts as resolve_default_narration_tts
-
+async def new_project_narration_fields(value: NarrationSettingsInput, *, resolver: ConfigResolver) -> dict[str, object]:
     fields: dict[str, object] = {NARRATION_DELIVERY_FIELD: value.delivery}
-    backend = value.audio_backend if TTS_BACKEND_FIELD in value.provided else None
-    voice = value.narration_voice if TTS_VOICE_FIELD in value.provided else None
-    speed = value.narration_speed if TTS_SPEED_FIELD in value.provided else None
-
-    if value.delivery == USE_TTS:
-        omitted = {TTS_BACKEND_FIELD, TTS_VOICE_FIELD, TTS_SPEED_FIELD} - value.provided
-        if omitted:
-            try:
-                default_backend, default_voice, default_speed = await resolve_default_narration_tts(resolver)
-            except ValueError:
-                default_backend, default_voice, default_speed = None, None, None
-            if TTS_BACKEND_FIELD in omitted and default_backend is not None:
-                backend = f"{default_backend.provider_id}/{default_backend.model_id}"
-            if TTS_VOICE_FIELD in omitted:
-                voice = default_voice
-            if TTS_SPEED_FIELD in omitted:
-                speed = default_speed
-        if not backend:
-            raise NarrationConfigError("narration_tts_model_required")
-
+    patch = {key: getattr(value, key) for key in value.provided}
+    backend = patch.get(TTS_BACKEND_FIELD)
+    profile = AudioProfile()
     if backend:
-        backend = fields[TTS_BACKEND_FIELD] = validate_tts_backend(backend)
-        if TTS_VOICE_FIELD not in value.provided and voice is not None:
-            provider_id, model_id = backend.split("/", 1)
-            voice = await _voice_for_backend(resolver, provider_id, model_id, voice)
-    if voice is not None and voice.strip():
-        fields[TTS_VOICE_FIELD] = voice.strip()
-    if speed is not None:
-        fields[TTS_SPEED_FIELD] = validate_tts_speed(speed)
-    validate_project_narration_config(fields)
+        provider, model = validate_tts_backend(backend).split("/", 1)
+        profile = await resolver.audio_model_profile(provider, model)
+    apply_project_tts_patch(fields, patch, lambda _provider, _model: profile)
     return fields
+
+
+def apply_project_tts_patch(
+    project: dict, patch: Mapping[str, object], profile_for: Callable[[str, str], AudioProfile]
+) -> None:
+    if not any(k in patch for k in TTS_GROUP_FIELDS):
+        return
+    previous = project.get(TTS_BACKEND_FIELD)
+    raw_backend = patch.get(TTS_BACKEND_FIELD, previous)
+    if raw_backend is not None and not isinstance(raw_backend, str):
+        raise NarrationConfigError("narration_tts_model_invalid")
+    backend = (raw_backend or "").strip()
+    if not backend:
+        if TTS_BACKEND_FIELD not in patch:
+            raise NarrationConfigError("narration_tts_model_required")
+        raw_voice = patch.get(TTS_VOICE_FIELD)
+        has_voice = bool(raw_voice.strip()) if isinstance(raw_voice, str) else raw_voice is not None
+        if has_voice or patch.get(TTS_SPEED_FIELD) is not None:
+            raise NarrationConfigError("narration_tts_clear_conflict")
+        for key in TTS_GROUP_FIELDS:
+            project.pop(key, None)
+        return
+    normalized = validate_tts_backend(backend)
+    provider, model = normalized.split("/", 1)
+    profile = profile_for(provider, model)
+    same = previous == normalized
+    raw_voice = patch.get(TTS_VOICE_FIELD, project.get(TTS_VOICE_FIELD) if same else profile.first_voice)
+    raw_speed = patch.get(TTS_SPEED_FIELD, project.get(TTS_SPEED_FIELD) if same else None)
+    voice = raw_voice.strip() if isinstance(raw_voice, str) else ""
+    speed = parse_tts_speed(raw_speed)
+    if raw_speed is not None and speed is None:
+        raise NarrationConfigError("narration_tts_speed_invalid")
+    profile.validate(voice, speed)
+    project.update({TTS_BACKEND_FIELD: normalized, TTS_VOICE_FIELD: voice})
+    if speed is None:
+        project.pop(TTS_SPEED_FIELD, None)
+    else:
+        project[TTS_SPEED_FIELD] = speed
 
 
 __all__ = [
     "NarrationSettingsInput",
+    "apply_project_tts_patch",
     "new_project_narration_fields",
     "validate_tts_backend",
-    "validate_tts_speed",
 ]

@@ -18,6 +18,7 @@ from lib.backends.audio_backends.base import (
     AudioSynthesisResult,
     VoiceOption,
 )
+from lib.backends.audio_profiles import AudioProfile, endpoint_profile
 from lib.backends.openai_shared import OPENAI_RETRYABLE_ERRORS, create_openai_client
 from lib.backends.providers import PROVIDER_OPENAI
 from lib.backends.transport_layer import TransportLayer
@@ -29,34 +30,6 @@ logger = logging.getLogger(__name__)
 
 _SUPPORTED_RESPONSE_FORMATS = frozenset({"mp3", "opus", "aac", "flac", "wav", "pcm"})
 _FALLBACK_RESPONSE_FORMAT = "wav"
-
-_VOICE_CATALOG: tuple[VoiceOption, ...] = tuple(
-    VoiceOption(id=voice_id, label=voice_id)
-    for voice_id in (
-        "alloy",
-        "ash",
-        "ballad",
-        "coral",
-        "echo",
-        "fable",
-        "nova",
-        "onyx",
-        "sage",
-        "shimmer",
-        "verse",
-        "marin",
-        "cedar",
-    )
-)
-
-_LEGACY_UNSUPPORTED_VOICE_IDS = frozenset({"ballad", "verse", "marin", "cedar"})
-_VOICES_BY_MODEL: dict[str, tuple[VoiceOption, ...]] = {
-    "gpt-4o-mini-tts": _VOICE_CATALOG,
-    "gpt-4o-mini-tts-2025-12-15": _VOICE_CATALOG,
-    **dict.fromkeys(
-        ("tts-1", "tts-1-hd"), tuple(v for v in _VOICE_CATALOG if v.id not in _LEGACY_UNSUPPORTED_VOICE_IDS)
-    ),
-}
 
 
 def _response_format_for(output_path: Path) -> str:
@@ -96,12 +69,14 @@ class OpenAIAudioBackend:
     def capabilities(self) -> set[AudioCapability]:
         return {AudioCapability.TEXT_TO_SPEECH, AudioCapability.SPEECH_SPEED}
 
+    def _profile(self) -> AudioProfile:
+        return endpoint_profile("openai-tts", self._model, official_host=self._official_host)
+
     def list_voices(self) -> list[VoiceOption]:
-        if not self._official_host:
-            return []
-        return list(_VOICES_BY_MODEL.get(self._model, ()))
+        return list(self._profile().voices)
 
     async def synthesize(self, request: AudioSynthesisRequest) -> AudioSynthesisResult:
+        self._profile().validate(request.voice, request.speed)
         audio_bytes = await self._request_speech(request)
         await run_noninterruptible_sync(request.output_path.write_bytes, audio_bytes)
 

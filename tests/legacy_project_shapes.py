@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zipfile
 from collections.abc import Callable
 from dataclasses import replace
 from functools import partial
@@ -29,12 +30,12 @@ from lib.artifacts.version_manager import VERSION_CONTENT_DIGEST, VersionManager
 from lib.artifacts.video_artifact_facts import VideoArtifactCurrencyFacts
 from lib.artifacts.visual_artifact_provenance import build_storyboard_video_artifact_visual_basis
 from lib.project import project_trash
+from lib.project.project_migrations.legacy_audio import legacy_prepared_basis
 from lib.project.project_migrations.runner import MIGRATORS
 from lib.project.source_revision import SourceScope, compute_source_revision
 from lib.script.grid.models import GridGeneration, build_frame_chain
 from lib.script.script_review import content_fingerprint
-from lib.speech.narration_config import TtsSynthesisSettings, tts_snapshot_fields
-from lib.speech.narration_delivery import build_narration_audio_basis
+from lib.speech.narration_config import TtsSynthesisSettings, tts_group_fields
 from lib.speech.speech_artifact_provenance import (
     SelectedMediaEvidence,
     build_video_duration_basis,
@@ -501,7 +502,7 @@ def write_legacy_tts_narration_project(
         segment["generated_assets"]["narration_audio"] = audio_path
         speech = {key: value for key, value in segment.items() if key != "transition_to_next"}
         basis = ArtifactBasisDescriptor.from_basis(
-            build_narration_audio_basis(admit_script_unit("segments", speech).preparation, synthesis)
+            legacy_prepared_basis(admit_script_unit("segments", speech).preparation, synthesis)
         )
         audio = project_dir / audio_path
         audio.parent.mkdir(exist_ok=True)
@@ -530,7 +531,7 @@ def write_legacy_tts_narration_project(
     if raised_video_duration_seconds is not None:
         advance_project_schema(project_dir, to_version=13)
         project = json.loads(project_path.read_bytes())
-        project.update(tts_snapshot_fields(settings[-1]))
+        project.update(tts_group_fields(settings[-1]))
         _write_json(project_path, project)
         metadata_path = project_dir / "versions" / "versions.json"
         metadata = json.loads(metadata_path.read_bytes())
@@ -1764,6 +1765,23 @@ def without_version_content_digests(versions: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def use_legacy_history(project_dir: Path) -> None:
+    from lib.artifacts.version_manager import VersionManager
+
+    manager = VersionManager(project_dir)
+    if manager.sqlite.is_enabled():
+        if not manager.versions_file.exists():
+            manager.sqlite.export_json(manager.versions_file)
+        manager.sqlite.path.unlink()
+
+
+def read_version_history(project_dir: Path) -> dict:
+    from lib.artifacts.version_manager import VersionManager
+
+    with VersionManager(project_dir).locked_history() as history:
+        return history
+
+
 def advance_project_schema(project_dir: Path, *, to_version: int) -> None:
     """按迁移链把项目从当前 ``schema_version`` 逐级推进到 ``to_version``。"""
 
@@ -1968,7 +1986,17 @@ def write_legacy_quarantine_project(root: Path) -> Path:
     return project_dir
 
 
+def _write_released_tts_project(root: Path, *, shape: str) -> Path:
+    """v15 音频和转场沿用 v0.31.0，字幕采用现行计时规则。v20 快照由 v0.37.0 渲染。"""
+    project_dir = root / shape
+    with zipfile.ZipFile(Path(__file__).parent / "fixtures" / f"{shape}.zip") as snapshot:
+        snapshot.extractall(project_dir)
+    return project_dir
+
+
 LEGACY_PROJECT_SHAPES: dict[str, Callable[[Path], Path]] = {
+    "v15-tts": partial(_write_released_tts_project, shape="v15-tts"),
+    "v20-tts-exports": partial(_write_released_tts_project, shape="v20-tts-exports"),
     "storyboard": write_legacy_storyboard_project,
     "shared-product-originals": partial(_write_shared_asset_project, modify=share_reference_files),
     "borrowed-sheet": partial(_write_shared_asset_project, modify=share_asset_sheets),

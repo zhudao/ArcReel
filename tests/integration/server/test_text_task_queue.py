@@ -16,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from lib.artifacts.artifact_activation import activate_artifact_target_state
 from lib.artifacts.artifact_manifest import ArtifactKey, ProjectArtifactManifestAdapter
-from lib.backends.http_status_errors import ProviderRejectedError
+from lib.backends.http_status_errors import ProviderRejectedError, TextWaitTimeout
 from lib.backends.text_backends.base import TextGenerationResult as BackendTextGenerationResult
 from lib.backends.text_backends.base import TextOutputTruncatedError
 from lib.backends.text_generator import TextGenerator
@@ -46,7 +46,7 @@ from lib.generation.generation_result import (
     GenerationSelectionMode,
     problem_from_task_failure,
 )
-from lib.generation.generation_worker import CapacityTable, GenerationWorker
+from lib.generation.generation_worker import GenerationWorker
 from lib.generation.video_request_facts import VideoRequestFactsFailure
 from lib.infra.api_errors import ConflictError
 from lib.infra.async_thread import run_sync_transaction
@@ -89,13 +89,8 @@ async def _start_text_worker(
     queue: GenerationQueue,
     executor: Callable[..., Awaitable[dict[str, Any]]],
 ) -> GenerationWorker:
-    async def text_provider(_task: dict[str, Any]) -> str:
-        return "text"
-
     worker = GenerationWorker(
         queue=queue,
-        capacity=CapacityTable(_limits={}, _defaults={"text": 1}),
-        provider_projection=text_provider,
         executor=executor,
         lanes=("text",),
         resume_executor=refuse_resume_execution,
@@ -555,6 +550,7 @@ async def test_queued_plan_resolves_data_root_from_current_config_and_preserves_
 @pytest.mark.parametrize(
     ("failure", "code", "action", "params"),
     [
+        (TextWaitTimeout(), "text_wait_timeout", GenerationAction.RETRY, {}),
         (
             PlanningOutputTruncatedError(
                 TextOutputTruncatedError(
@@ -847,7 +843,7 @@ async def test_cancel_during_started_episode_plan_commit_leaves_member_running_t
 
     class Generator:
         model = "fake-model"
-        max_output_tokens = 64000
+        planning_output_budget = 64000
 
         async def generate(self, _request, project_name=None):
             return BackendTextGenerationResult(

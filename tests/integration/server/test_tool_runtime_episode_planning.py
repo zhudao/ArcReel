@@ -19,7 +19,7 @@ from lib.episode.episode_deletion import EpisodeDeletionConfirmationRequired, de
 from lib.episode.episode_planner import EpisodePlanner
 from lib.generation.generation_queue import GenerationQueue
 from lib.generation.generation_result import GenerationAction, problem_from_task_failure
-from lib.generation.generation_worker import CapacityTable, GenerationWorker
+from lib.generation.generation_worker import GenerationWorker
 from lib.infra.app_data_dir import reset_for_tests
 from lib.project.project_manager import ProjectManager
 from server.tool_runtime import (
@@ -52,8 +52,8 @@ class _Generator:
 
     model = "fake-model"
 
-    def __init__(self, *, hold: bool = False, max_output_tokens: int = 64000, stuck: bool = False) -> None:
-        self.max_output_tokens = max_output_tokens
+    def __init__(self, *, hold: bool = False, planning_output_budget: int = 64000, stuck: bool = False) -> None:
+        self.planning_output_budget = planning_output_budget
         self.stuck = stuck
         self.prompts: list[str] = []
         self.started = asyncio.Event()
@@ -131,13 +131,8 @@ async def planning(tmp_path: Path, file_db_factory, monkeypatch: pytest.MonkeyPa
         del claimed_provider_id
         return await execute_queued_text_task(task, services=services)
 
-    async def text_provider(_task: dict[str, Any]) -> str:
-        return "text"
-
     worker = GenerationWorker(
         queue=queue,
-        capacity=CapacityTable(_limits={}, _defaults={"text": 1}),
-        provider_projection=text_provider,
         executor=execute,
         lanes=("text",),
         resume_executor=refuse_resume_execution,
@@ -214,7 +209,7 @@ async def test_a_final_window_capped_by_the_batch_size_keeps_planning_to_the_end
     planning, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     projects, services, session_factory = planning
-    _use_generator(monkeypatch, _Generator(max_output_tokens=400), window_chars=len("".join(_CHAPTERS)))
+    _use_generator(monkeypatch, _Generator(planning_output_budget=400), window_chars=len("".join(_CHAPTERS)))
 
     await start_episode_planning(ToolRequest(PlanEpisodesRequest()), _scope(projects), _WEB, services)
     tasks = await _wait_until_idle(session_factory)
@@ -333,7 +328,7 @@ async def test_transient_followup_cancel_error_preserves_capped_window_commit_an
     assert isinstance(queue, _PlanningQueue)
     queue.pause_followup = True
     queue.fail_next_cancel = True
-    generator = _Generator(max_output_tokens=400)
+    generator = _Generator(planning_output_budget=400)
     _use_generator(monkeypatch, generator, window_chars=len("".join(_CHAPTERS)))
     scope = _scope(projects)
     request = ToolRequest(PlanEpisodesRequest())
@@ -352,7 +347,7 @@ async def test_stop_during_a_capped_final_window_does_not_queue_another(
     planning, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     projects, services, session_factory = planning
-    generator = _Generator(hold=True, max_output_tokens=400)
+    generator = _Generator(hold=True, planning_output_budget=400)
     _use_generator(monkeypatch, generator, window_chars=len("".join(_CHAPTERS)))
     await start_episode_planning(ToolRequest(PlanEpisodesRequest()), _scope(projects), _WEB, services)
     await asyncio.wait_for(generator.started.wait(), timeout=5)

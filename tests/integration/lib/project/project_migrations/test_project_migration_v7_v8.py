@@ -48,11 +48,12 @@ from lib.artifacts.visual_artifact_provenance import (
 )
 from lib.project.project_manager import ProjectManager
 from lib.project.project_migrations import CURRENT_SCHEMA_VERSION, MIGRATORS
+from lib.project.project_migrations.legacy_audio import legacy_audio_basis
 from lib.project.project_migrations.runner import cleanup_stale_backups, migrate_project_dir
 from lib.project.project_migrations.v7_to_v8_artifact_manifest import migrate_v7_to_v8
 from lib.script.grid.layout import grid_aspect_ratio_for
 from lib.script.grid.models import GridGeneration, build_frame_chain
-from lib.speech.narration_delivery import TtsSynthesisSettings, build_narration_audio_basis_from_canonical_text
+from lib.speech.narration_delivery import TtsSynthesisSettings
 from lib.speech.speech_artifact_provenance import (
     RenditionVariant,
     SelectedMediaEvidence,
@@ -577,6 +578,7 @@ def test_formal_script_plan_write_serializes_with_schema_last_activation(tmp_pat
 
     for version in range(ARTIFACT_MANIFEST_SCHEMA_VERSION - 1, CURRENT_SCHEMA_VERSION - 1):
         MIGRATORS[version](project_dir)
+    VersionManager(project_dir).enable_sqlite_history()
 
     def _pause_before_schema(project_dir_arg: Path, project: Mapping[str, Any]) -> None:
         activation_ready.set()
@@ -1273,10 +1275,12 @@ def test_v7_activation_retry_refreshes_matching_backups_before_startup_cleanup(
 
 
 def test_workflow_uses_the_activation_asset_identity_for_legacy_whitespace(tmp_path: Path) -> None:
-    project_dir, project, _script_plan, _script = _project(tmp_path)
+    project_dir, project, _script_plan, script = _project(tmp_path)
     raw_name = "  阿离  "
     project["characters"] = {raw_name: project["characters"]["阿离"]}
+    script["segments"][0].update({"novel_text": "雨夜", "duration_seconds": 4, "characters_in_segment": [raw_name]})
     _write_json(project_dir / "project.json", project)
+    _write_json(project_dir / "scripts" / "episode_1.json", script)
 
     migrate_project_dir(project_dir)
 
@@ -1375,7 +1379,7 @@ def test_v7_activation_uses_only_selected_complete_typed_media_facts(tmp_path: P
     typed_audio = project_dir / "audio" / "segment_E1U4.wav"
     typed_audio.write_bytes(b"typed")
     settings = TtsSynthesisSettings("dashscope", "qwen3-tts-flash", "Cherry", None)
-    audio_basis = build_narration_audio_basis_from_canonical_text("新旁白", settings)
+    audio_basis = legacy_audio_basis("新旁白", settings)
     audio_descriptor = ArtifactBasisDescriptor.from_basis(audio_basis)
     versions.add_version(
         "audio",
@@ -1395,7 +1399,7 @@ def test_v7_activation_uses_only_selected_complete_typed_media_facts(tmp_path: P
 
     forged_audio = project_dir / "audio" / "segment_E1U5.wav"
     forged_audio.write_bytes(b"forged")
-    forged_basis = build_narration_audio_basis_from_canonical_text("伪造快照旁白", settings)
+    forged_basis = legacy_audio_basis("伪造快照旁白", settings)
     forged_descriptor = ArtifactBasisDescriptor.from_basis(forged_basis)
     versions.add_version(
         "audio",
@@ -1432,7 +1436,10 @@ def test_v7_activation_uses_only_selected_complete_typed_media_facts(tmp_path: P
     )
     assert ArtifactKey.episode_video(1, "E1U2").encode() not in entries
     assert ArtifactKey.episode_audio(1, "E1U3").encode() not in entries
-    assert entries[ArtifactKey.episode_audio(1, "E1U4").encode()]["basis_digest"] == audio_descriptor.digest
+    assert (
+        entries[ArtifactKey.episode_audio(1, "E1U4").encode()]["basis_digest"]
+        == ArtifactBasis.build("narration-delivery/tts-audio", kind_version=2, inputs={"text": "新旁白"}).digest
+    )
     assert ArtifactKey.episode_audio(1, "E1U5").encode() not in entries
 
     resolver = ArtifactCurrencyResolver(project_dir)

@@ -43,6 +43,7 @@ from lib.infra.json_io import atomic_write_bytes, atomic_write_json
 from lib.project.item_id_history import max_used_item_numbers
 from lib.project.project_migration_report import ArtifactBackfillOutcome
 from lib.project.project_migrations.backups import ensure_versioned_backup
+from lib.project.project_migrations.legacy_audio import V1_AUDIO_RULES
 from lib.project.project_schema import parse_project_schema_version
 from lib.script.item_ids import raise_item_id_high_water
 
@@ -113,7 +114,7 @@ def without_asset_names_in_versions(versions: dict[str, Any]) -> bool:
 
 def _plan(project_dir: Path, project: Mapping[str, Any]) -> ArtifactTargetStatePlan:
     project_bytes = json.dumps(project, ensure_ascii=False).encode("utf-8")
-    return TargetStatePlanner(project_dir, project_bytes=project_bytes).plan()
+    return TargetStatePlanner(project_dir, audio_rules=V1_AUDIO_RULES, project_bytes=project_bytes).plan()
 
 
 def _rebase_entries(

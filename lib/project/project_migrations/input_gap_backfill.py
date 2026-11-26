@@ -31,9 +31,10 @@ from lib.artifacts.artifact_planner import (
 )
 from lib.artifacts.input_gap import GAP_TOLERANT_BASIS_SCHEMA_VERSION
 from lib.infra.json_io import atomic_write_bytes
-from lib.project.legacy_media_provenance import backfill_legacy_media_provenance
 from lib.project.project_migration_report import ArtifactBackfillOutcome
 from lib.project.project_migrations.backups import ensure_versioned_backup
+from lib.project.project_migrations.legacy_audio import V1_AUDIO_RULES
+from lib.project.project_migrations.legacy_media_provenance import backfill_legacy_media_provenance
 
 _FROM_VERSION = GAP_TOLERANT_BASIS_SCHEMA_VERSION - 1
 
@@ -51,8 +52,12 @@ def backfill_input_gap_artifacts(project_dir: Path, project: Mapping[str, Any]) 
     ensure_versioned_backup(versions_path, _FROM_VERSION)
     legacy = backfill_legacy_media_provenance(project_dir, record_gaps=True)
     try:
-        before = plan_artifact_target_state_by_gap_rule(project_dir, project, record_gaps=False)
-        after = plan_artifact_target_state_by_gap_rule(project_dir, project, record_gaps=True)
+        before = plan_artifact_target_state_by_gap_rule(
+            project_dir, project, record_gaps=False, audio_rules=V1_AUDIO_RULES
+        )
+        after = plan_artifact_target_state_by_gap_rule(
+            project_dir, project, record_gaps=True, audio_rules=V1_AUDIO_RULES
+        )
         plans = (before, after)
         for plan in plans:
             assert_artifact_target_state_plan_unchanged(project_dir, plan, expected_project_bytes=project_bytes)

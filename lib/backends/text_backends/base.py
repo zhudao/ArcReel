@@ -14,6 +14,8 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ValidationError
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaMode, JsonSchemaValue
 
+from lib.billing.metering import RequestTokens as RequestTokens
+from lib.capabilities.kernel import CapabilitySnapshot
 from lib.infra.retry import NonRetryableError
 from lib.infra.text_utils import strip_json_code_fences
 
@@ -89,16 +91,7 @@ class TextOutputTruncatedError(NonRetryableError):
 
 
 class StructuredOutputExhaustedError(NonRetryableError):
-    """结构化输出降级链已走完，模型仍未产出满足 schema 的内容。
-
-    各后端把「结构化输出能力不足」的终局失败统一收敛到本异常：Instructor 档内校验重试
-    耗尽、Gemini prompt 注入降级耗尽，都抛它而非各自的内部异常（``InstructorRetryException``、
-    裸 ``ValueError``），调用方据此给用户一句可行动的解释，而不是把 SDK 内部异常原文透出去。
-
-    继承 NonRetryableError 的理由同 :class:`TextOutputTruncatedError`：消息里嵌的失败原因
-    含模型侧动态文本，可能偶然命中 with_retry_async 的瞬态错误字符串模式。语义上也确实
-    不该重试——降级链本身已经把该试的档位与档内重试都试过了。
-    """
+    """结构化输出降级链已走完，模型仍未产出满足 schema 的内容。"""
 
     def __init__(self, *, provider: str, model: str, reason: str):
         self.provider = provider
@@ -107,25 +100,45 @@ class StructuredOutputExhaustedError(NonRetryableError):
         super().__init__(f"{provider}/{model} 的结构化输出能力不足：{reason}。请更换文本模型或供应商后重试。")
 
 
-RAW_OUTPUT_LOG_LIMIT = 500
-
-
-def truncate_for_log(text: str | None, limit: int = RAW_OUTPUT_LOG_LIMIT) -> str:
-    """把模型原始输出压到可入日志的长度。
-
-    结构化输出降级与解析拒绝由「模型实际输出了什么」决定，只记摘要（字段路径、错误类型）
-    事后无法复盘，故这里刻意保留原文片段。与 :func:`summarize_validation_error` 的取舍不同：
-    后者是每次校验失败都会走的高频路径，本函数只用在 warning 级的降级 / 拒绝分支。
-    """
-    if not text:
-        return "<空>"
-    if len(text) > limit:
-        return f"{text[:limit]}…（截断，共 {len(text)} 字符）"
-    return text
-
-
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
+
+
+class StreamingBodyCounter:
+    """Count answer characters while a leading inline reasoning block arrives in fragments."""
+
+    def __init__(self) -> None:
+        self.state = "prefix"
+        self.fragment = ""
+        self.leading_spaces = 0
+
+    def consume(self, text: str) -> tuple[int, bool]:
+        if self.state == "body":
+            return len(text), False
+        value = self.fragment + text
+        self.fragment = ""
+        if self.state == "prefix":
+            trimmed = value.lstrip()
+            self.leading_spaces += len(value) - len(trimmed)
+            if len(trimmed) < len(_THINK_OPEN) and _THINK_OPEN.startswith(trimmed):
+                self.fragment = trimmed
+                return 0, False
+            if not trimmed.startswith(_THINK_OPEN):
+                self.state = "body"
+                return self.leading_spaces + len(trimmed), False
+            self.state = "thinking"
+            value = trimmed[len(_THINK_OPEN) :]
+        if self.state == "thinking":
+            end = value.find(_THINK_CLOSE)
+            if end < 0:
+                self.fragment = value[-(len(_THINK_CLOSE) - 1) :]
+                return 0, True
+            value = value[end + len(_THINK_CLOSE) :]
+            self.state = "after"
+        body = value.lstrip()
+        if body:
+            self.state = "body"
+        return len(body), not body
 
 
 def strip_leading_think_block(text: str) -> str:
@@ -246,6 +259,17 @@ class ImageInput:
     url: str | None = None
 
 
+@dataclass(frozen=True)
+class TextProgress:
+    phase: Literal["waiting", "receiving", "retrying"]
+    model: str
+    characters: int = 0
+    thinking: bool = False
+    attempt: int = 1
+    max_attempts: int = 3
+    error: str | None = None
+
+
 @dataclass
 class TextGenerationRequest:
     """通用文本生成请求。各 Backend 忽略不支持的字段。"""
@@ -255,6 +279,10 @@ class TextGenerationRequest:
     images: list[ImageInput] | None = None
     system_prompt: str | None = None
     max_output_tokens: int | None = None
+    snapshot: CapabilitySnapshot | None = field(default=None, repr=False)
+    on_usage: Callable[[RequestTokens], None] | None = field(default=None, repr=False)
+    on_progress: Callable[[TextProgress], None] | None = field(default=None, repr=False)
+    task_type: str | None = None
 
 
 @dataclass
@@ -295,17 +323,6 @@ class TextGenerationResult:
             cache_write_1h_tokens=self.cache_write_1h_tokens,
         )
         return [] if own == RequestTokens() else [own]
-
-
-@dataclass(frozen=True)
-class RequestTokens:
-    """一次供应商请求的 token 计量，字段语义同 :class:`TextGenerationResult` 的同名字段。"""
-
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    cache_read_tokens: int | None = None
-    cache_write_5m_tokens: int | None = None
-    cache_write_1h_tokens: int | None = None
 
 
 def merge_billed_tokens(kept: int | None, discarded: int | None) -> int | None:
@@ -388,26 +405,6 @@ class _ModelFacingJsonSchema(GenerateJsonSchema):
         return json_schema
 
 
-def model_facing_response_model[M: BaseModel](model: type[M]) -> type[M]:
-    """供自行生成 schema、不经 :func:`resolve_schema` 的库（Instructor、xai_sdk）使用的 ``model`` 子类。
-
-    子类不带 docstring，``model_json_schema`` 默认改用 :class:`_ModelFacingJsonSchema`，库据此生成的 schema
-    与工具说明都不含类 docstring；字段、校验与序列化沿用 ``model``。
-    """
-
-    def model_json_schema(cls: type[M], *args: Any, **kwargs: Any) -> dict[str, Any]:
-        kwargs.setdefault("schema_generator", _ModelFacingJsonSchema)
-        return model.model_json_schema(*args, **kwargs)
-
-    namespace = {
-        "__doc__": None,
-        "__module__": model.__module__,
-        "__qualname__": model.__qualname__,
-        "model_json_schema": classmethod(model_json_schema),
-    }
-    return type(model)(model.__name__, (model,), namespace)
-
-
 def resolve_schema(schema: dict | type[BaseModel]) -> dict:
     """将 response_schema 转为发给模型的、无 $ref 的纯 JSON Schema dict。
 
@@ -457,16 +454,35 @@ def is_valid_json(text: str) -> bool:
         return False
 
 
-def summarize_validation_error(exc: ValidationError) -> str:
+def _schema_field_names(node: object) -> set[str]:
+    names: set[str] = set()
+    if isinstance(node, dict):
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            names.update(properties)
+        for child in node.values():
+            names.update(_schema_field_names(child))
+    elif isinstance(node, list):
+        for child in node:
+            names.update(_schema_field_names(child))
+    return names
+
+
+def summarize_validation_error(exc: ValidationError, *, model: type[BaseModel] | None = None) -> str:
     """把 ValidationError 压成简短的字段定位摘要。
 
     只取字段路径（loc）与错误数，**不含模型原始输入值**——后者可能很大且会把
     模型生成内容写进日志（经诊断日志打包外泄），也避免单条日志膨胀到数 KB。
     用 include_input=False 在源头剔除 input，不让原始值进入 error dict（防御纵深）。
     """
-    locs = [
-        ".".join(str(part) for part in err.get("loc", ())) or "<root>" for err in exc.errors(include_input=False)[:5]
-    ]
+    allowed = _schema_field_names(model.model_json_schema()) if model is not None else None
+    locs = []
+    for err in exc.errors(include_input=False)[:5]:
+        parts = [
+            str(part) if allowed is None or isinstance(part, int) or part in allowed else "*"
+            for part in err.get("loc", ())
+        ]
+        locs.append(".".join(parts) or "<root>")
     suffix = "…" if exc.error_count() > 5 else ""
     return f"{exc.error_count()} 处字段不符（{', '.join(locs)}{suffix}）"
 
@@ -496,7 +512,7 @@ def structured_fallback_reason(text: str, response_schema: dict | type | None, *
         try:
             response_schema.model_validate_json(text, strict=strict)
         except ValidationError as exc:
-            return f"返回内容不满足 response_schema（供应商可能未强制 schema）：{summarize_validation_error(exc)}"
+            return f"返回内容不满足 response_schema（供应商可能未强制 schema）：{summarize_validation_error(exc, model=response_schema)}"
         return None
     if not is_valid_json(text):
         return "返回非 JSON 内容（供应商可能未支持结构化输出）"
@@ -545,9 +561,9 @@ async def prompt_json_fallback(
             return billed
         feedback = f"\n\n上次输出不符合要求（{last_reason}），请严格按上述 JSON Schema 重新输出纯 JSON。"
         _logger.warning(
-            "prompt 注入降级输出校验未通过（%s），带反馈重试；模型原始输出：%s",
+            "prompt 注入降级输出校验未通过（%s），输出长度=%d",
             last_reason,
-            truncate_for_log(text),
+            len(text),
         )
 
     raise StructuredOutputExhaustedError(
@@ -567,7 +583,7 @@ def _validate_fallback_text(text: str, schema_model: type | None) -> tuple[str |
         try:
             return schema_model.model_validate_json(text).model_dump_json(), ""
         except ValidationError as exc:
-            return None, summarize_validation_error(exc)
+            return None, summarize_validation_error(exc, model=schema_model)
     if is_valid_json(text):
         return text, ""
     return None, "输出不是合法 JSON"

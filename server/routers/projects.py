@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 from lib.agent.agent_session_store import default_sdk_config_dir
 from lib.agent.profile_manifest import ContentMode
+from lib.backends.http_status_errors import TextWaitTimeout
 from lib.backends.text_backends.base import TextOutputTruncatedError
 from lib.catalog.errors import ModelNotInCatalogError
 from lib.config.resolver import (
@@ -88,21 +89,19 @@ from lib.speech.narration_config import (
     TTS_VOICE_FIELD,
     NarrationConfigError,
     NarrationDelivery,
-    validate_project_narration_config,
 )
 from lib.speech.speech_rate import MAX_SPEECH_RATE_UPS, MIN_SPEECH_RATE_UPS, SPEECH_RATE_FIELD, is_valid_speech_rate
 from lib.workflow.workflow_plan import WorkflowPlan, WorkflowPlanRequest
 from lib.workflow.workflow_state import (
-    EpisodeNextStep,
+    EpisodeNextSteps,
     ProjectSummary,
     WorkflowRequestError,
     WorkflowStateService,
     WorkflowStatus,
 )
 from server.auth import CurrentUser, create_download_token, reject_embedded_agent, verify_download_token
-from server.dependencies import require_project_migration_ok
-from server.i18n import DisplayNamesCatalog, Locale, Translator
-from server.routers._coalesce import RequestCoalescer
+from server.dependencies import ProjectReads, require_project_migration_ok
+from server.i18n import DisplayNamesCatalog, Translator
 from server.routers._episode_source_errors import episode_source_http_error
 from server.routers._script_edits import (
     execute_current_script_edit,
@@ -116,9 +115,8 @@ from server.services.project.episode_display import present_episode_diagnostics
 from server.services.project.episode_id_records import recorded_episode_ids_on
 from server.services.project.narration_settings import (
     NarrationSettingsInput,
+    apply_project_tts_patch,
     new_project_narration_fields,
-    validate_tts_backend,
-    validate_tts_speed,
 )
 from server.services.project.project_activity import project_last_activity_at
 from server.services.project.project_archive import (
@@ -135,12 +133,6 @@ from server.tool_runtime import truncation_problem
 router = APIRouter()
 
 self_auth_router = APIRouter()
-
-_project_detail_coalescer = RequestCoalescer()
-
-
-def get_project_detail_coalescer() -> RequestCoalescer:
-    return _project_detail_coalescer
 
 
 def get_workflow_state_service() -> WorkflowStateService:
@@ -340,11 +332,8 @@ class UpdateProjectRequest(BaseModel):
     model_settings: dict[str, dict[str, str | None]] | None = None
 
 
-def _apply_narration_patch(project: dict, req: UpdateProjectRequest) -> None:
-    """写入旁白交付方式与 TTS 快照；改完后 TTS 配音项目仍须带完整快照，否则整次 PATCH 422。
-
-    交付方式不进产物的生成依据：切换交付方式不让已有产物过期，改为后期配音时 TTS 快照保留。
-    """
+def _apply_narration_patch(project: dict, req: UpdateProjectRequest, bridge: EventLoopBridge) -> None:
+    """在项目写锁内应用交付方式与整组配音覆盖。"""
 
     fields = req.model_fields_set
     try:
@@ -352,24 +341,14 @@ def _apply_narration_patch(project: dict, req: UpdateProjectRequest) -> None:
             if req.narration_delivery is None:
                 raise NarrationConfigError("narration_delivery_required")
             project[NARRATION_DELIVERY_FIELD] = req.narration_delivery
-        if TTS_BACKEND_FIELD in fields:
-            if req.audio_backend:
-                validate_backend_value(req.audio_backend, TTS_BACKEND_FIELD)
-                project[TTS_BACKEND_FIELD] = validate_tts_backend(req.audio_backend)
-            else:
-                project.pop(TTS_BACKEND_FIELD, None)
-        if TTS_VOICE_FIELD in fields:
-            voice = (req.narration_voice or "").strip()
-            if voice:
-                project[TTS_VOICE_FIELD] = voice
-            else:
-                project.pop(TTS_VOICE_FIELD, None)
-        if TTS_SPEED_FIELD in fields:
-            if req.narration_speed is None:
-                project.pop(TTS_SPEED_FIELD, None)
-            else:
-                project[TTS_SPEED_FIELD] = validate_tts_speed(req.narration_speed)
-        validate_project_narration_config(project)
+        if req.audio_backend:
+            validate_backend_value(req.audio_backend, TTS_BACKEND_FIELD)
+        resolver = ConfigResolver(async_session_factory)
+        apply_project_tts_patch(
+            project,
+            req.model_dump(exclude_unset=True),
+            lambda provider, model: bridge.run(resolver.audio_model_profile(provider, model)),
+        )
     except NarrationConfigError as exc:
         raise UnprocessableError(exc.code) from exc
 
@@ -684,10 +663,6 @@ async def create_project(
                 else _validated_episode_target_duration(req.episode_target_duration, _t)
             )
 
-            try:
-                manager.create_project(project_name, content_mode=req.content_mode or "narration")
-            except FileExistsError as exc:
-                raise HTTPException(status_code=400, detail=_t("project_exists", name=project_name)) from exc
             extras = {field: value for field in _PROJECT_BACKEND_FIELDS if (value := getattr(req, field))}
             if req.model_settings is not None:
                 extras["model_settings"] = req.model_settings
@@ -695,24 +670,32 @@ async def create_project(
             extras["grid_storyboard"] = req.grid_storyboard
             if speech_rate is not None:
                 extras[SPEECH_RATE_FIELD] = speech_rate
-            with project_change_source("webui"):
-                project = manager.create_project_metadata(
-                    project_name,
-                    title or manual_name,
-                    style_prompt,
-                    req.content_mode,
-                    aspect_ratio=req.aspect_ratio,
-                    default_duration=req.default_duration,
-                    episode_target_duration=episode_target_duration,
-                    style_template_id=req.style_template_id,
-                    extras=extras or None,
-                    target_duration=req.target_duration,
-                    brief=req.brief,
-                    narration=narration_fields,
-                )
+            try:
+                with (
+                    manager.creating_project(project_name, content_mode=req.content_mode or "narration", publish=False),
+                    project_change_source("webui"),
+                ):
+                    project = manager.create_project_metadata(
+                        project_name,
+                        title or manual_name,
+                        style_prompt,
+                        req.content_mode,
+                        aspect_ratio=req.aspect_ratio,
+                        default_duration=req.default_duration,
+                        episode_target_duration=episode_target_duration,
+                        style_template_id=req.style_template_id,
+                        extras=extras or None,
+                        target_duration=req.target_duration,
+                        brief=req.brief,
+                        narration=narration_fields,
+                    )
+            except FileExistsError as exc:
+                raise HTTPException(status_code=400, detail=_t("project_exists", name=project_name)) from exc
             return {"success": True, "name": project_name, "project": project}
 
         return await run_sync_transaction(_sync)
+    except ModelNotInCatalogError:
+        raise
     except ValueError as e:
         logger.warning("创建项目参数错误: name=%s (%s)", req.name or req.title, e)
         raise BadRequestError("project_config_invalid") from e
@@ -789,55 +772,72 @@ async def get_video_capabilities(
 async def get_workflow_status(
     name: str,
     _t: Translator,
+    current_user: CurrentUser,
+    reads: ProjectReads,
     episode: Annotated[int | None, Query(ge=1)] = None,
 ):
     """Return the authenticated, server-authoritative project workflow status."""
 
     try:
         manager = get_project_manager()
-        status = await asyncio.to_thread(WorkflowStateService(manager).get_status, name, episode)
-        project = await asyncio.to_thread(manager.load_project, name)
-        return WorkflowStatus.model_validate(present_episode_diagnostics(status.model_dump(mode="json"), project, _t))
+        read = await reads.run(
+            ("workflow-status-v3", id(manager), name, current_user.id, current_user.role, episode),
+            lambda: asyncio.to_thread(WorkflowStateService(manager).read_status, name, episode),
+        )
+        return present_episode_diagnostics(read.value, read.require_project(), _t)
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=name) from exc
     except WorkflowRequestError as exc:
         raise BadRequestError("request_invalid") from exc
 
 
-class EpisodeNextSteps(BaseModel):
-    episodes: list[EpisodeNextStep]
-
-
 @router.get("/projects/{name}/workflow-status/episodes", response_model=EpisodeNextSteps)
-async def get_episode_next_steps(name: str, _t: Translator):
-    """账本顺序中每一集建议的下一步，供项目层的逐集清单使用。"""
+async def get_episode_next_steps(
+    name: str,
+    _t: Translator,
+    reads: ProjectReads,
+    current_user: CurrentUser,
+    episodes: Annotated[list[int] | None, Query()] = None,
+    cursor: str | None = None,
+):
+    """按账本顺序返回最多 32 集。可重复传 episodes 指定集号，或传上一页的 next_cursor 续读。已完成集的 next_action 为 null。"""
 
     try:
         manager = get_project_manager()
-        steps = await asyncio.to_thread(WorkflowStateService(manager).get_episode_next_steps, name)
-        if not steps:
-            return EpisodeNextSteps(episodes=[])
-        project = await asyncio.to_thread(manager.load_project, name)
+        read = await reads.run(
+            (
+                "workflow-episodes-v3",
+                id(manager),
+                name,
+                current_user.id,
+                current_user.role,
+                tuple(sorted(episodes)) if episodes is not None else None,
+                cursor,
+            ),
+            lambda: asyncio.to_thread(WorkflowStateService(manager).read_episode_next_steps, name, episodes, cursor),
+        )
+        return present_episode_diagnostics(read.value, read.require_project(), _t)
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=name) from exc
-    return EpisodeNextSteps.model_validate(
-        present_episode_diagnostics(EpisodeNextSteps(episodes=steps).model_dump(mode="json"), project, _t)
-    )
+    except WorkflowRequestError as exc:
+        raise BadRequestError("request_invalid") from exc
 
 
 @router.post("/projects/{name}/workflow-plan", response_model=WorkflowPlan)
-async def get_workflow_plan(name: str, request: WorkflowPlanRequest, current_user: CurrentUser, _t: Translator):
+async def get_workflow_plan(
+    name: str, request: WorkflowPlanRequest, current_user: CurrentUser, _t: Translator, reads: ProjectReads
+):
     """Return the side-effect-free plan for one transient workflow request."""
 
     try:
         manager = get_project_manager()
-        plan = await workflow_plan_service.get_workflow_planner(manager).get_plan(
+        read = await workflow_plan_service.get_workflow_planner(manager, reads).read_plan(
             name,
             request,
             user_id=current_user.id,
+            visibility=current_user.role,
         )
-        project = await asyncio.to_thread(manager.load_project, name)
-        return WorkflowPlan.model_validate(present_episode_diagnostics(plan.model_dump(mode="json"), project, _t))
+        return present_episode_diagnostics(read.value, read.require_project(), _t)
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=name) from exc
     except WorkflowRequestError as exc:
@@ -848,23 +848,22 @@ async def get_workflow_plan(name: str, request: WorkflowPlanRequest, current_use
 async def get_project(
     name: str,
     _t: Translator,
-    locale: Locale,
     summaries: WorkflowStateServiceDep,
-    coalescer: Annotated[RequestCoalescer, Depends(get_project_detail_coalescer)],
+    current_user: CurrentUser,
+    coalescer: ProjectReads,
 ):
-    """获取项目详情（含实时计算字段）。同一项目、同一语言的并发请求合流计算。"""
+    """获取项目详情（含实时计算字段）。"""
     try:
+        manager = get_project_manager()
 
         def _sync():
-            manager = get_project_manager()
             if not manager.project_exists(name):
-                raise HTTPException(status_code=404, detail=_t("project_not_found", name=name))
+                raise NotFoundError("project_not_found", name=name)
 
             project = manager.load_project(name)
 
             summary = summaries.get_project_summary(name)
             project = _merge_episode_summaries(project, summary)
-            project["status"] = _project_status_payload(summary, project, _t)
 
             scripts = {}
             for ep in project.get("episodes", []):
@@ -886,13 +885,25 @@ async def get_project(
             project_path = manager.get_project_path(name)
             fingerprints = compute_asset_fingerprints(project_path)
 
-            return {
+            return summary, {
                 "project": project,
                 "scripts": scripts,
                 "asset_fingerprints": fingerprints,
             }
 
-        return await coalescer.run((name, locale), lambda: run_sync_transaction(_sync))
+        summary, result = await coalescer.run(
+            (
+                "project-detail-verified",
+                id(manager),
+                name,
+                current_user.id,
+                current_user.role,
+                id(summaries.pm if type(summaries) is WorkflowStateService else summaries),
+            ),
+            lambda: run_sync_transaction(_sync),
+        )
+        project = result["project"]
+        return {**result, "project": {**project, "status": _project_status_payload(summary, project, _t)}}
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=name) from exc
     except (HTTPException, ApiError):
@@ -954,6 +965,7 @@ async def reset_agent_profile(name: str, _t: Translator):
 @router.patch("/projects/{name}")
 async def update_project(name: str, req: UpdateProjectRequest, _t: Translator):
     """更新项目元数据"""
+    bridge = EventLoopBridge.capture()
     try:
 
         def _sync():
@@ -987,7 +999,7 @@ async def update_project(name: str, req: UpdateProjectRequest, _t: Translator):
                         project[CHARACTER_VOICE_BINDING_FIELD] = binding
                     else:
                         raise HTTPException(status_code=422, detail=_t("character_voice_binding_invalid"))
-                _apply_narration_patch(project, req)
+                _apply_narration_patch(project, req, bridge)
                 if "speech_rate_units_per_second" in req.model_fields_set:
                     if req.speech_rate_units_per_second is None:
                         project.pop(SPEECH_RATE_FIELD, None)
@@ -1085,7 +1097,7 @@ async def update_project(name: str, req: UpdateProjectRequest, _t: Translator):
         return await run_sync_transaction(_sync)
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=name) from exc
-    except (HTTPException, ApiError):
+    except (HTTPException, ApiError, ModelNotInCatalogError):
         raise
     except Exception as exc:
         logger.exception("请求处理失败")
@@ -1917,6 +1929,9 @@ async def set_project_source(
                 with project_change_source("webui"):
                     overview = await manager.generate_overview(name)
                 result["overview"] = overview
+            except TextWaitTimeout as exc:
+                result["overview"] = None
+                result["overview_error"] = _t(exc.code)
             except ModelNotInCatalogError as ov_err:
                 logger.warning("上传后概览生成失败：模型不在清单中 (%s)", ov_err)
                 result["overview"] = None
@@ -1982,6 +1997,8 @@ async def generate_overview(name: str, _t: Translator):
     except PydanticValidationError as exc:
         logger.exception("概述生成响应解析失败")
         raise HTTPException(status_code=400, detail=_t("overview_ai_response_invalid")) from exc
+    except TextWaitTimeout as exc:
+        raise ApiError(exc.code, status_code=504).with_diagnostic({"code": exc.code}) from exc
     except TextOutputTruncatedError as exc:
         logger.warning("概述生成输出被截断: name=%s (%s)", name, exc)
         raise UnprocessableError(

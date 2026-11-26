@@ -52,6 +52,7 @@ from lib.project.project_manager import is_episode_number
 from lib.project.project_migration_failure import ProjectMigrationError
 from lib.project.project_migration_report import ArtifactBackfillOutcome, MigrationSkippedArtifact
 from lib.project.project_migrations.backups import ensure_versioned_backup
+from lib.project.project_migrations.legacy_audio import V1_AUDIO_RULES, legacy_narrated_duration
 from lib.project.project_schema import parse_project_schema_version
 from lib.script.script_document import build_materialized_script
 from lib.script.script_models import PENDING_AUTHORING_FIELD
@@ -416,7 +417,9 @@ def migrate_v14_to_v15(project_dir: Path) -> ArtifactBackfillOutcome | None:
 
 
 def _target_plan(project_dir: Path, after_bytes: bytes) -> ArtifactTargetStatePlan:
-    return TargetStatePlanner(project_dir, project_bytes=after_bytes).plan()
+    return TargetStatePlanner(
+        project_dir, duration_override=legacy_narrated_duration, audio_rules=V1_AUDIO_RULES, project_bytes=after_bytes
+    ).plan()
 
 
 def _outcome(project_dir: Path, target: ArtifactTargetStatePlan, plan: _Plan) -> ArtifactBackfillOutcome:

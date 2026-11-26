@@ -72,6 +72,7 @@ from lib.infra.content_digest import canonical_json_digest
 from lib.infra.data_root_layout import PROJECT_FILENAME, PROJECT_NAME_PATTERN, DataRootLayout, list_project_dirs
 from lib.infra.json_io import atomic_write_bytes, atomic_write_json, load_json, load_json_or_none
 from lib.infra.path_safety import PathTraversalError, safe_join
+from lib.infra.project_write_journal import history_recovery_required, track_write
 from lib.infra.schema_guards import is_int, is_shape, is_str
 from lib.infra.validation_messages import ValidationResult, default_translate
 from lib.project.asset_rename import (
@@ -450,6 +451,18 @@ class ProjectManager:
         Returns:
             项目目录路径
         """
+        with self.creating_project(name, content_mode, publish=publish) as project_dir:
+            return project_dir
+
+    @contextmanager
+    def creating_project(
+        self,
+        name: str,
+        content_mode: ContentMode = "narration",
+        *,
+        publish: bool = True,
+    ) -> Generator[Path]:
+        """持有项目名锁直到初始化及调用方的元数据发布完成。"""
         name = self.normalize_project_name(name)
         project_dir = self.projects_dir / name
 
@@ -459,17 +472,16 @@ class ProjectManager:
             except FileExistsError as exc:
                 raise FileExistsError(f"项目 '{name}' 已存在") from exc
 
-        try:
-            for subdir in self.SUBDIRS:
-                (project_dir / subdir).mkdir(exist_ok=True)
-            if publish:
-                atomic_write_json(project_dir / self.PROJECT_FILE, {"content_mode": content_mode})
-            self.sync_agent_profile(project_dir, content_mode=content_mode)
-        except Exception:
-            shutil.rmtree(project_dir, ignore_errors=True)  # hard-delete: rollback -- 创建项目失败时移除刚建的项目目录
-            raise
-
-        return project_dir
+            try:
+                for subdir in self.SUBDIRS:
+                    (project_dir / subdir).mkdir(exist_ok=True)
+                if publish:
+                    atomic_write_json(project_dir / self.PROJECT_FILE, {"content_mode": content_mode})
+                self.sync_agent_profile(project_dir, content_mode=content_mode)
+                yield project_dir
+            except Exception:
+                self.delete_project_directory(name)
+                raise
 
     _DELETE_RETRYABLE_ERRNOS = (errno.ENOTEMPTY, errno.EACCES)
 
@@ -650,6 +662,9 @@ class ProjectManager:
             raise ValueError(f"非法项目名称: '{name}'") from exc
         if not project_dir.exists():
             raise FileNotFoundError(f"项目 '{name}' 不存在")
+        if history_recovery_required(project_dir):
+            with project_metadata_lock(project_dir):
+                pass
         return project_dir
 
     @staticmethod
@@ -1383,9 +1398,12 @@ class ProjectManager:
                 self._persist_script_json(real, script)
         return script
 
-    def load_script_readonly(self, project_name: str, filename: str) -> dict:
+    def load_script_readonly(self, project_name: str, filename: str, *, snapshot: bytes | None = None) -> dict:
         """Load a script with in-memory compatibility migrations but never persist them."""
         norm = self.normalize_script_filename(filename)
+        if snapshot is not None and self._script_reader is None:
+            script, _ = self._migrate_read_script(json.loads(snapshot.decode("utf-8")), norm)
+            return script
         script, _migrated = self._read_script_unlocked(project_name, norm)
         return script
 
@@ -1410,9 +1428,13 @@ class ProjectManager:
         else:
             script = self._script_reader(real)
 
+        return self._migrate_read_script(script, real.name)
+
+    @staticmethod
+    def _migrate_read_script(script: dict, filename: str) -> tuple[dict, bool]:
         migrated, warnings = migrate_script_unit_durations(script)
         for message in warnings:
-            logger.warning("剧本 %s 时长收编迁移: %s", real.name, message.render(default_translate))
+            logger.warning("剧本 %s 时长收编迁移: %s", filename, message.render(default_translate))
         return script, migrated
 
     def list_scripts(self, project_name: str) -> list[str]:
@@ -1424,8 +1446,7 @@ class ProjectManager:
     def _canonical_episode_scripts(self, project_name: str) -> list[str]:
         """``scripts/`` 下文件名为规范名的剧本，排序后返回：批量引用改写的候选集。
 
-        归属只看文件名（见 ``canonical_script_episode``），取锁前后是同一份判据，无需在锁内
-        重算：非规范名的 JSON 不属于任何一集，改写它既无依据，也会在写盘的集号一致性校验处抛
+        归属只看文件名（见 ``canonical_script_episode``）：非规范名的 JSON 不属于任何一集，改写它既无依据，也会在写盘的集号一致性校验处抛
         ``ValueError`` 中断整次改名。
         """
         return sorted(
@@ -2416,8 +2437,7 @@ class ProjectManager:
         `episode_target_duration` 为单集目标时长（秒），取值区间见
         `lib.episode.episode_target_duration`；软偏好，只注入脚本规划提示词与审核面板对比，不做阻断。
 
-        `narration` 是旁白交付配置字段（交付方式与 TTS 快照，见 `lib.speech.narration_config`），
-        缺省为后期配音；TTS 配音必须带完整快照。
+        `narration` 是旁白交付配置字段（交付方式与可选的项目配音覆盖，见 `lib.speech.narration_config`）。
         """
         project_name = self.normalize_project_name(project_name)
         project_title = str(title).strip() if title is not None else ""
@@ -2504,6 +2524,11 @@ class ProjectManager:
         if resolved_mode == "ad" and grid_storyboard:
             raise ValueError("广告/短片项目不支持宫格分镜（grid_storyboard）")
 
+        from lib.artifacts.version_manager import VersionManager
+
+        versions = VersionManager(self.get_project_path(project_name))
+        if not versions.sqlite.is_enabled():
+            versions.enable_sqlite_history()
         self.save_project(project_name, project)
         return project
 
@@ -2839,23 +2864,26 @@ class ProjectManager:
     def _asset_cascade_locks(self, project_name: str) -> Generator[tuple[list[str], list[Path]]]:
         """持有级联改写全部剧本与草稿所需的锁，产出 ``(剧本文件名, 草稿路径)``。
 
-        锁序为「全部剧本锁（按文件名排序）→ 草稿文件锁 → 项目锁」，与 ``locked_episode_script`` 的
-        脚本锁 → 项目锁 一致，避免 ABBA 死锁。重命名、衍生改名与合并共用。
+        锁序为规划文件（按路径排序）→ 剧本（按文件名排序）→ 项目。持规划锁后才枚举剧本，
+        以纳入并发确认新建的正式剧本。若取锁期间文件集合变化，释放全部锁后重新取锁。
         """
-        script_files = self._canonical_episode_scripts(project_name)
         drafts_root = self.get_project_path(project_name) / "drafts"
-        draft_files = (
-            sorted(p for p in drafts_root.glob("episode_*/*.json") if p.name in self._RENAME_DRAFT_FILENAMES)
-            if drafts_root.is_dir()
-            else []
-        )
-        with ExitStack() as stack:
-            for filename in script_files:
-                stack.enter_context(self._script_lock(project_name, filename))
-            for path in draft_files:
-                stack.enter_context(self.file_lock(path))
-            stack.enter_context(self._project_lock(project_name))
-            yield script_files, draft_files
+
+        def current_drafts() -> list[Path]:
+            return sorted(p for p in drafts_root.glob("episode_*/*.json") if p.name in self._RENAME_DRAFT_FILENAMES)
+
+        while True:
+            with ExitStack() as stack:
+                draft_files = current_drafts()
+                for path in draft_files:
+                    stack.enter_context(self.file_lock(path))
+                script_files = self._canonical_episode_scripts(project_name)
+                for filename in script_files:
+                    stack.enter_context(self._script_lock(project_name, filename))
+                stack.enter_context(self._project_lock(project_name))
+                if draft_files == current_drafts() and script_files == self._canonical_episode_scripts(project_name):
+                    yield script_files, draft_files
+                    return
 
     @staticmethod
     def _artifact_manifest_adapter(project_dir: Path):
@@ -2925,7 +2953,7 @@ class ProjectManager:
     ) -> AssetRenameReport:
         """资产级联重命名的单一事务入口（UI 与 Agent 共用，见 docs/adr/0057）。
 
-        在「全部剧本锁（按文件名排序）→ 草稿文件锁 → 项目锁」内一次完成：扫描全部剧集
+        在「规划文件锁 → 剧本锁 → 项目锁」内一次完成：扫描全部剧集
         剧本与 script_plan 草稿的名称引用、规划关联文件迁移、对 project.json 变更做「不更坏」
         结构校验；``dry_run=True`` 时到此为止只返回影响报告（预览与执行共用同一套扫描，
         数字必然一致），否则按 剧本 → 草稿 → 关联文件 → 版本历史 → project.json →
@@ -3108,6 +3136,7 @@ class ProjectManager:
             )
             for src, dst in moves:
                 if src.exists():
+                    track_write(src, dst)
                     os.replace(src, dst)
             version_manager.rename_resource(spec.bucket_key, old_key, new_clean)
             derivatives.relocate()
@@ -3174,7 +3203,7 @@ class ProjectManager:
     ) -> dict:
         """衍生改名的级联事务：本体条目内的衍生表 key，加上全部剧本 / 草稿里的 ``本体名/旧衍生名``。
 
-        与 :meth:`rename_asset` 同一把锁序（剧本 → 草稿 → 项目）与同一套引用改写
+        与 :meth:`rename_asset` 同一把锁序（规划文件 → 剧本 → 项目）与同一套引用改写
         （``rewrite_payload_references``，旧名传 ``本体名/旧衍生名``）：衍生共享本体的名字与
         身份，引用形态只多一段（见 ``docs/adr/0072``），没有理由让它走另一条改写口径。
         返回改名后的本体条目。

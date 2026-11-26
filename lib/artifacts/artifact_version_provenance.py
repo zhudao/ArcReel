@@ -9,7 +9,7 @@ current later.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +21,7 @@ from lib.project.asset_derivatives import DERIVATIVE_ASSET_TYPE
 from lib.project.asset_types import ASSET_SPECS, normalize_asset_name
 from lib.project.resource_paths import CHARACTER_DERIVATIVE_RESOURCE_TYPE
 from lib.script.reference_video.execution_checkpoint import CURRENCY_CHECKPOINT_SCHEMA_VERSIONS
+from lib.speech.narration_config import parse_tts_speed
 from lib.speech.narration_delivery import TtsSynthesisSettings, build_narration_audio_basis_from_canonical_text
 from lib.speech.speech_artifact_provenance import build_video_duration_basis
 
@@ -33,6 +34,11 @@ class TypedMediaVersionTarget:
     script_file: str
     basis: ArtifactBasisDescriptor
     created_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AudioVersionTarget(TypedMediaVersionTarget):
+    settings: TtsSynthesisSettings
 
 
 def uploaded_video_version_basis(record: Mapping[str, Any], *, snapshot_digest: str) -> ArtifactBasis:
@@ -75,44 +81,66 @@ def is_typed_media_resource(resource_type: str) -> bool:
     return resource_type == "audio" or resource_type in _VIDEO_VISUAL_KINDS
 
 
+def read_audio_target(record: Mapping[str, Any]) -> AudioVersionTarget:
+    return validate_audio_target(record, lambda text, _: build_narration_audio_basis_from_canonical_text(text))
+
+
+def validate_audio_target(
+    record: Mapping[str, Any], basis_for: Callable[[str, TtsSynthesisSettings], ArtifactBasis]
+) -> AudioVersionTarget:
+    script_file = record.get("execution_script_file")
+    if not isinstance(script_file, str) or not script_file.strip():
+        raise ValueError("version does not contain complete typed artifact metadata")
+    episode = record.get("artifact_episode")
+    if type(episode) is not int or episode < 1:
+        raise ValueError("version does not contain complete typed artifact metadata")
+    settings = _audio_settings(record)
+    basis = _validated_audio_basis(record, settings, basis_for)
+
+    created_at = record.get("created_at")
+    return AudioVersionTarget(
+        settings=settings,
+        episode=episode,
+        script_file=script_file,
+        basis=basis,
+        created_at=created_at if isinstance(created_at, str) else None,
+    )
+
+
 def parse_typed_media_version_target(
     resource_type: str,
     record: Mapping[str, Any],
+    *,
+    read_audio: Callable[[Mapping[str, Any]], TypedMediaVersionTarget] = read_audio_target,
 ) -> TypedMediaVersionTarget:
     """Validate a version record without consulting mutable runtime config."""
 
+    if resource_type == "audio":
+        return read_audio(record)
     if not is_typed_media_resource(resource_type):
         raise ValueError(f"resource type does not carry typed artifact metadata: {resource_type}")
     script_file = record.get("execution_script_file")
     if not isinstance(script_file, str) or not script_file.strip():
         raise ValueError("version does not contain complete typed artifact metadata")
 
-    if resource_type == "audio":
-        episode = record.get("artifact_episode")
-        if type(episode) is not int or episode < 1:
-            raise ValueError("version does not contain complete typed artifact metadata")
-        basis = _validated_audio_basis(record)
-    else:
-        facts = _validated_video_facts(record, visual_kind=_VIDEO_VISUAL_KINDS[resource_type])
-        episode = facts.episode
-        basis = facts.video_descriptor
-        if VIDEO_CURRENCY_DURATION_FIELD in record:
-            duration = record[VIDEO_CURRENCY_DURATION_FIELD]
-            if (
-                type(duration) is not int
-                or duration not in facts.duration_tiers
-                or duration > facts.request_duration_seconds
-            ):
-                raise ValueError(
-                    "video currency duration must be an execution-frozen tier no higher than the paid tier"
-                )
-            basis = ArtifactBasisDescriptor.from_basis(
-                compose_video_artifact_basis(
-                    visual=facts.visual_basis,
-                    speech=facts.speech_basis,
-                    duration=build_video_duration_basis(duration),
-                )
+    facts = _validated_video_facts(record, visual_kind=_VIDEO_VISUAL_KINDS[resource_type])
+    episode = facts.episode
+    basis = facts.video_descriptor
+    if VIDEO_CURRENCY_DURATION_FIELD in record:
+        duration = record[VIDEO_CURRENCY_DURATION_FIELD]
+        if (
+            type(duration) is not int
+            or duration not in facts.duration_tiers
+            or duration > facts.request_duration_seconds
+        ):
+            raise ValueError("video currency duration must be an execution-frozen tier no higher than the paid tier")
+        basis = ArtifactBasisDescriptor.from_basis(
+            compose_video_artifact_basis(
+                visual=facts.visual_basis,
+                speech=facts.speech_basis,
+                duration=build_video_duration_basis(duration),
             )
+        )
 
     created_at = record.get("created_at")
     return TypedMediaVersionTarget(
@@ -121,13 +149,6 @@ def parse_typed_media_version_target(
         basis=basis,
         created_at=created_at if isinstance(created_at, str) else None,
     )
-
-
-def parse_typed_audio_settings(record: Mapping[str, Any]) -> TtsSynthesisSettings:
-    """Return execution-frozen settings after validating complete audio facts."""
-
-    parse_typed_media_version_target("audio", record)
-    return _audio_settings(record)
 
 
 def parse_image_version_basis(
@@ -182,7 +203,11 @@ def _image_basis_matches_resource(
     return isinstance(cell, Mapping) and cell.get("resource_id") == resource_id
 
 
-def _validated_audio_basis(record: Mapping[str, Any]) -> ArtifactBasisDescriptor:
+def _validated_audio_basis(
+    record: Mapping[str, Any],
+    settings: TtsSynthesisSettings,
+    basis_for: Callable[[str, TtsSynthesisSettings], ArtifactBasis],
+) -> ArtifactBasisDescriptor:
     try:
         basis = ArtifactBasisDescriptor.from_dict(record.get("artifact_audio_basis"))
     except (TypeError, ValueError) as exc:
@@ -201,8 +226,7 @@ def _validated_audio_basis(record: Mapping[str, Any]) -> ArtifactBasisDescriptor
         or duration <= 0
     ):
         raise ValueError("version does not contain complete typed artifact metadata")
-    settings = _audio_settings(record)
-    expected = ArtifactBasisDescriptor.from_basis(build_narration_audio_basis_from_canonical_text(text, settings))
+    expected = ArtifactBasisDescriptor.from_basis(basis_for(text, settings))
     if basis != expected or record.get("tts_basis_digest") != expected.digest:
         raise ValueError("version does not contain complete typed artifact metadata")
     return basis
@@ -214,7 +238,8 @@ def _audio_settings(record: Mapping[str, Any]) -> TtsSynthesisSettings:
     voice = record.get("tts_voice")
     speed = record.get("tts_speed")
     if (
-        not isinstance(provider_id, str)
+        "tts_speed" not in record
+        or not isinstance(provider_id, str)
         or not provider_id.strip()
         or not isinstance(model_id, str)
         or not model_id.strip()
@@ -222,9 +247,7 @@ def _audio_settings(record: Mapping[str, Any]) -> TtsSynthesisSettings:
         or not voice.strip()
         or (
             speed is not None
-            and (
-                isinstance(speed, bool) or not isinstance(speed, (int, float)) or not math.isfinite(speed) or speed <= 0
-            )
+            and (isinstance(speed, bool) or not isinstance(speed, (int, float)) or parse_tts_speed(speed) is None)
         )
     ):
         raise ValueError("version does not contain complete typed artifact metadata")
@@ -266,11 +289,12 @@ def _validated_video_facts(
 __all__ = [
     "IMAGE_ARTIFACT_BASIS_FIELD",
     "VIDEO_CURRENCY_DURATION_FIELD",
+    "AudioVersionTarget",
     "TypedMediaVersionTarget",
     "is_typed_media_resource",
     "is_uploaded_video_version",
     "parse_image_version_basis",
-    "parse_typed_audio_settings",
     "parse_typed_media_version_target",
+    "read_audio_target",
     "uploaded_video_version_basis",
 ]

@@ -15,7 +15,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from lib.catalog import query as catalog
 from lib.catalog.builtin_models import disabled_without_state
-from lib.catalog.errors import ModelNotInCatalogError
 from lib.config.service import ConfigService, ProviderStatus
 from lib.db import get_async_session
 from lib.db.base import Base
@@ -294,6 +293,7 @@ class TestPatchSystemConfig:
         app.dependency_overrides[get_config_service] = lambda: mock_svc
 
         mock_session = AsyncMock()
+        mock_session.get_bind = MagicMock()
         mock_session.commit = AsyncMock()
 
         _exec_result = MagicMock()
@@ -517,7 +517,13 @@ class TestPatchSystemConfig:
                 assert res.status_code == 422, raw
 
     def test_patch_clears_narration_speed_with_null(self):
-        mock_svc = _make_mock_svc(settings={"narration_speed": "1.5"})
+        mock_svc = _make_mock_svc(
+            settings={
+                "default_audio_backend": "gemini-aistudio/gemini-3.8-flash-tts",
+                "narration_voice": "Zephyr",
+                "narration_speed": "1.5",
+            }
+        )
         with TestClient(self._make_patch_app(mock_svc)) as client:
             res = client.patch(
                 "/api/v1/system/config",
@@ -619,9 +625,11 @@ class TestNarrationDefaults:
                 await session.commit()
 
         asyncio.run(_seed())
-        monkeypatch.setattr(system_config_router, "async_session_factory", db_factory)
+        from tests.fakes import use_system_config_router_sessions
+
+        use_system_config_router_sessions(monkeypatch, db_factory)
         with TestClient(_make_app_with_mock(_make_mock_svc())) as client:
-            resp = client.get("/api/v1/system/narration-defaults")
+            resp = client.get("/api/v1/system/global-narration-settings")
         assert resp.status_code == 200
         assert resp.json() == {
             "audio_backend": "dashscope/qwen3-tts-flash",
@@ -638,10 +646,8 @@ class TestTtsModelCapabilities:
             resp = client.get("/api/v1/system/tts-model-capabilities", params={"backend": "dashscope"})
         assert resp.status_code == 422
 
-    def test_model_not_in_catalog_asks_to_reselect(self, monkeypatch):
+    def test_model_not_in_catalog_asks_to_reselect(self):
         """所选语音模型已不在供应商清单中：返回要求重新选择模型的 400，不说成「语音模型无效」。"""
-        error = ModelNotInCatalogError(provider_id="minimax", model_id="speech-retired", media_type="audio")
-        monkeypatch.setattr(system_config_router, "audio_backend_profile", AsyncMock(side_effect=error))
         app = _make_app_with_mock(_make_mock_svc())
         register_error_handlers(app)
         with TestClient(app) as client:

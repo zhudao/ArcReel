@@ -21,7 +21,9 @@ from lib.backends.audio_backends.base import (
     AudioSynthesisResult,
     VoiceOption,
 )
+from lib.backends.audio_profiles import AudioProfile, endpoint_profile
 from lib.backends.gemini_shared import VERTEX_SCOPES, gemini_http_options, resolve_gemini_api_key, with_retry_async
+from lib.backends.providers import is_custom_provider
 from lib.backends.transport_layer import TransportLayer
 from lib.config.system_config import resolve_vertex_credentials_path
 from lib.config.url_utils import normalize_base_url
@@ -33,43 +35,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemini-3.8-flash-tts"
-
-_VOICE_CATALOG: tuple[VoiceOption, ...] = tuple(
-    VoiceOption(id=voice_id, label=voice_id)
-    for voice_id in (
-        "Zephyr",
-        "Puck",
-        "Charon",
-        "Kore",
-        "Fenrir",
-        "Leda",
-        "Orus",
-        "Aoede",
-        "Callirrhoe",
-        "Autonoe",
-        "Enceladus",
-        "Iapetus",
-        "Umbriel",
-        "Algieba",
-        "Despina",
-        "Erinome",
-        "Algenib",
-        "Rasalgethi",
-        "Laomedeia",
-        "Achernar",
-        "Alnilam",
-        "Schedar",
-        "Gacrux",
-        "Pulcherrima",
-        "Achird",
-        "Zubenelgenubi",
-        "Vindemiatrix",
-        "Sadachbia",
-        "Sadaltager",
-        "Sulafat",
-    )
-)
-_VOICE_MODELS = frozenset({"gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"})
 
 _DEFAULT_SAMPLE_RATE = 24000
 _PCM_SAMPLE_WIDTH = 2
@@ -154,10 +119,14 @@ class GeminiAudioBackend:
     def capabilities(self) -> set[AudioCapability]:
         return {AudioCapability.TEXT_TO_SPEECH}
 
+    def _profile(self) -> AudioProfile:
+        return endpoint_profile("gemini-tts", self._model, custom_provider=is_custom_provider(self.name))
+
     def list_voices(self) -> list[VoiceOption]:
-        return list(_VOICE_CATALOG) if self._model in _VOICE_MODELS else []
+        return list(self._profile().voices)
 
     async def synthesize(self, request: AudioSynthesisRequest) -> AudioSynthesisResult:
+        self._profile().validate(request.voice, None)
         if request.speed is not None:
             logger.debug("Gemini TTS 不支持语速参数 speed=%s，已忽略", request.speed)
         data, mime_type, usage = await self._request_speech(request)
