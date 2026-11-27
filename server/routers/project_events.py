@@ -7,9 +7,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Header, Request
 from fastapi.sse import EventSourceResponse, ServerSentEvent
+from pydantic import BaseModel, Field
 
 from lib.infra.api_errors import BadRequestError, NotFoundError
 from server.services.project.project_events import ProjectEventService
@@ -44,6 +46,28 @@ async def _project_events_service(
     return service
 
 
+class ItemLocationBatch(BaseModel):
+    item_ids: list[Annotated[str, Field(min_length=1, max_length=256)]] = Field(max_length=200)
+
+
+class ItemLocation(BaseModel):
+    episode: int | None
+    item_id: str
+    position: int | None
+    status: Literal["found", "deleted", "ambiguous", "unloaded"]
+
+
+class ItemLocations(BaseModel):
+    items: list[ItemLocation]
+
+
+@router.post("/projects/{project_name}/item-locations", response_model=ItemLocations)
+async def locate_project_items(
+    project_name: str, batch: ItemLocationBatch, service: ProjectEventService = Depends(_project_events_service)
+):
+    return {"items": service.locate_items(project_name, batch.item_ids)}
+
+
 @router.get(
     "/projects/{project_name}/events/stream",
     response_class=EventSourceResponse,
@@ -52,9 +76,12 @@ async def stream_project_events(
     project_name: str,
     request: Request,
     service: ProjectEventService = Depends(_project_events_service),
+    episode: Annotated[int | None, Header(alias="X-ArcReel-Active-Episode", ge=1)] = None,
 ) -> AsyncIterator[ServerSentEvent]:
     try:
-        async with service.stream_events(project_name, idle_timeout=PROJECT_EVENTS_SSE_POLL_SECONDS) as stream:
+        async with service.stream_events(
+            project_name, idle_timeout=PROJECT_EVENTS_SSE_POLL_SECONDS, episode=episode
+        ) as stream:
             async for item in stream:
                 if await request.is_disconnected():
                     break

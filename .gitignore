@@ -60,6 +60,8 @@ htmlcov/
 coverage/
 coverage.xml
 coverage-pg.xml
+coverage-backend.xml
+raw.coverage
 .testmondata*
 
 **/*.lock
@@ -77,5 +79,3 @@ deploy/production/claude_data/
 deploy/production/pgdata/
 
 docs/verification-reports/
-
-mutants/

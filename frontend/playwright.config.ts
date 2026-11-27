@@ -1,27 +1,36 @@
+import { existsSync } from "node:fs";
 import { defineConfig } from "@playwright/test";
-import { DEFAULT_E2E_PORT } from "./e2e/support/origin.ts";
-import { projectName, selectedViewports } from "./e2e/support/viewports.ts";
+import {
+  COMPACT_VIEWPORT,
+  DESKTOP_VIEWPORT,
+  projectName,
+  RESPONSIVE_TAG,
+  VIEWPORT_CONTRACT_TAG,
+} from "./e2e/support/viewports.ts";
 
-// 截图基线按默认端口生成，换端口后显示本机地址的截图不参与比对（见 support/scenarios.ts）。
 const live = process.env.E2E_LIVE === "1";
-const PORT = Number(process.env.E2E_PORT ?? (live ? 4174 : DEFAULT_E2E_PORT));
+const PORT = Number(process.env.E2E_PORT ?? (live ? 4174 : 4173));
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const OUTPUT_DIR = process.env.E2E_OUTPUT_DIR ?? "./test-results";
 
 const isCI = Boolean(process.env.CI);
 
+const prebuilt = process.env.E2E_PREBUILT === "1";
+if (prebuilt && !existsSync(new URL("./dist/index.html", import.meta.url))) {
+  throw new Error("Shared browser build is missing frontend/dist/index.html");
+}
+const startServer = live
+  ? `cd .. && uv run --frozen python -m frontend.e2e.live.backend --port ${PORT}`
+  : `node node_modules/vite/bin/vite.js preview --host 127.0.0.1 --port ${PORT} --strictPort`;
+
 export default defineConfig({
   testDir: "./e2e",
   outputDir: OUTPUT_DIR,
-  snapshotPathTemplate: "{testDir}/__screenshots__/{projectName}/{testFilePath}/{arg}{ext}",
   fullyParallel: true,
   forbidOnly: isCI,
   retries: 0,
-  workers: live || isCI ? 1 : undefined,
+  workers: live ? 1 : isCI ? 2 : undefined,
   reporter: isCI ? [["list"], ["html", { open: "never" }]] : [["list"]],
-  expect: {
-    toHaveScreenshot: { animations: "disabled", caret: "hide", scale: "css" },
-  },
   use: {
     baseURL: BASE_URL,
     browserName: "chromium",
@@ -34,25 +43,38 @@ export default defineConfig({
   projects: live ? [{
     name: "live",
     testMatch: "live/**/*.spec.ts",
-    use: { viewport: { width: 1440, height: 900 } },
+    use: { viewport: { width: DESKTOP_VIEWPORT.width, height: DESKTOP_VIEWPORT.height } },
   }] : [
     {
       name: "layout-probe",
       testMatch: "probe/**/*.spec.ts",
       use: { viewport: { width: 1280, height: 720 } },
     },
-    ...selectedViewports().map((viewport) => ({
-      name: projectName(viewport),
+    {
+      name: projectName(DESKTOP_VIEWPORT),
       testMatch: "regions/**/*.spec.ts",
-      use: { viewport: { width: viewport.width, height: viewport.height } },
-    })),
+      grepInvert: new RegExp(VIEWPORT_CONTRACT_TAG),
+      use: { viewport: { width: DESKTOP_VIEWPORT.width, height: DESKTOP_VIEWPORT.height } },
+    },
+    {
+      name: projectName(COMPACT_VIEWPORT),
+      testMatch: "regions/**/*.spec.ts",
+      grep: new RegExp(RESPONSIVE_TAG),
+      grepInvert: new RegExp(VIEWPORT_CONTRACT_TAG),
+      use: { viewport: { width: COMPACT_VIEWPORT.width, height: COMPACT_VIEWPORT.height } },
+    },
+    {
+      name: "viewport-contracts",
+      testMatch: "regions/**/*.spec.ts",
+      grep: new RegExp(VIEWPORT_CONTRACT_TAG),
+      use: { viewport: { width: DESKTOP_VIEWPORT.width, height: DESKTOP_VIEWPORT.height } },
+    },
   ],
   webServer: {
-    command: live
-      ? `pnpm exec vite build && cd .. && uv run --frozen python -m frontend.e2e.live.backend --port ${PORT}`
-      : `pnpm exec vite build && pnpm exec vite preview --host 127.0.0.1 --port ${PORT} --strictPort`,
+    command: prebuilt ? startServer : `pnpm exec vite build && ${startServer}`,
+    stdout: live && isCI ? "pipe" : "ignore",
     url: live ? `${BASE_URL}/health` : BASE_URL,
-    reuseExistingServer: !live && !isCI,
+    reuseExistingServer: !prebuilt && !live && !isCI,
     gracefulShutdown: live ? { signal: "SIGTERM", timeout: 10_000 } : undefined,
     timeout: 180_000,
   },

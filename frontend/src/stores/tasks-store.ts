@@ -1,8 +1,10 @@
+import { episodeNumberFromTaskResource, stripScriptsPrefix } from "@/utils/task-target";
 import { useEffect, useState } from "react";
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import { API } from "@/api";
 import { errMsg } from "@/utils/async";
+import { parseItemIdEpisode } from "@/utils/episode-display";
 import { useAppStore } from "@/stores/app-store";
 import type { TaskItem, TaskProgress, TaskStats, TaskStatus } from "@/types";
 import { isTerminalStatus } from "@/types/task";
@@ -110,14 +112,100 @@ export function useActiveEpisodePlan(projectName: string): TaskItem | undefined 
   });
 }
 
-export function selectProjectTaskFingerprint(s: TaskRows, projectName: string): string {
+const ASSET_TASK_KINDS: ReadonlySet<string> = new Set([
+  "character",
+  "character_derivative",
+  "scene",
+  "prop",
+  "product",
+  "voice_sample",
+]);
+
+const CANONICAL_SCRIPT_PATTERN = /^episode_(\d+)\.json$/;
+
+function taskEpisodeNumber(task: TaskItem): number | null {
+  if (typeof task.episode === "number") return task.episode;
+  const episode = episodeNumberFromTaskResource(task.resource_id);
+  if (episode !== null) return episode;
+  const itemEp = parseItemIdEpisode(task.item_id ?? task.resource_id);
+  if (itemEp !== null) return itemEp;
+  if (task.script_file) {
+    const normalized = stripScriptsPrefix(task.script_file);
+    const fileMatch = CANONICAL_SCRIPT_PATTERN.exec(normalized);
+    if (fileMatch) return Number(fileMatch[1]);
+  }
+  return null;
+}
+
+function taskVisibilityPhase(status: TaskStatus): "active" | TaskStatus {
+  return isActiveStatus(status) ? "active" : status;
+}
+
+function assetMatchesReferenced(resourceId: string, referencedAssets: ReadonlySet<string>): boolean {
+  if (referencedAssets.has(resourceId)) return true;
+  const owner = resourceId.split("/", 1)[0];
+  return owner !== resourceId && referencedAssets.has(owner);
+}
+
+export function selectWorkflowEpisodeTaskSignal(
+  s: TaskRows,
+  projectName: string,
+  episode: number | null,
+  options?: {
+    referencedAssets?: ReadonlySet<string> | null;
+    scriptFile?: string | null;
+  },
+): string {
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  const referencedAssets = options?.referencedAssets ?? null;
+  const targetScriptFile = options?.scriptFile ? stripScriptsPrefix(options.scriptFile) : null;
+  for (const task of [...selectRecentTasks(s), ...selectActiveTasks(s)]) {
+    if (task.project_name !== projectName || seen.has(task.task_id)) continue;
+    seen.add(task.task_id);
+    if (episode !== null) {
+      const kind = taskResourceKind(task);
+      if (kind !== "text_episode_plan") {
+        if (ASSET_TASK_KINDS.has(kind)) {
+          if (referencedAssets && !assetMatchesReferenced(task.resource_id, referencedAssets)) continue;
+        } else {
+          const taskEp = taskEpisodeNumber(task);
+          const matchesScript =
+            targetScriptFile !== null &&
+            task.script_file !== null &&
+            stripScriptsPrefix(task.script_file) === targetScriptFile;
+          if (!matchesScript && taskEp !== null && taskEp !== episode) continue;
+        }
+      }
+    }
+    parts.push(`${task.task_id}:${taskVisibilityPhase(task.status)}`);
+  }
+  parts.sort();
+  return parts.join("|");
+}
+
+export function selectStatusBarTaskSignal(
+  s: TaskRows,
+  projectName: string,
+  targetEpisode: number | null,
+  yieldToPanel: boolean,
+): string {
+  if (yieldToPanel) return "";
   const seen = new Set<string>();
   const parts: string[] = [];
   for (const task of [...selectRecentTasks(s), ...selectActiveTasks(s)]) {
     if (task.project_name !== projectName || seen.has(task.task_id)) continue;
     seen.add(task.task_id);
-    parts.push(`${task.task_id}:${task.status}`);
+    if (targetEpisode !== null) {
+      const kind = taskResourceKind(task);
+      if (kind !== "text_episode_plan" && !ASSET_TASK_KINDS.has(kind)) {
+        const taskEp = taskEpisodeNumber(task);
+        if (taskEp !== null && taskEp !== targetEpisode) continue;
+      }
+    }
+    parts.push(`${task.task_id}:${taskVisibilityPhase(task.status)}`);
   }
+  parts.sort();
   return parts.join("|");
 }
 
@@ -500,10 +588,6 @@ export function selectActiveResourceIds(
 
 export function isResourceBusy(kind: ResourceKind, projectName: string, resourceId: string): boolean {
   return selectActiveResourceIds(useTasksStore.getState(), kind, projectName).has(resourceId);
-}
-
-function stripScriptsPrefix(path: string): string {
-  return path.replace(/^scripts\//, "");
 }
 
 export function selectHasActiveTaskForScriptFile(

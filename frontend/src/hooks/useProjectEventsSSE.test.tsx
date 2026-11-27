@@ -7,12 +7,13 @@ import { LeaveGuardProvider, useLeaveGuard } from "@/components/shared/edit-unit
 import { useProjectEventsSSE } from "./useProjectEventsSSE";
 import { useAppStore } from "@/stores/app-store";
 import { useAssistantStore } from "@/stores/assistant-store";
+import { useItemLocationsStore } from "@/stores/item-locations-store";
 import { useProjectsStore } from "@/stores/projects-store";
 import { useCostStore } from "@/stores/cost-store";
 import { useTasksStore } from "@/stores/tasks-store";
 import type { ProjectChange } from "@/types";
 import { seedTasks } from "@/test/task-state";
-import { makeTask } from "@/test/factories";
+import { makeTask, makeWorkspaceResponse } from "@/test/factories";
 import { createDeferred } from "@/test/deferred";
 import { FakeSseStream } from "@/test/fakeSseStream";
 
@@ -52,21 +53,18 @@ function renderHarness(path = "/") {
   );
 }
 
-type GetProjectResult = Awaited<ReturnType<typeof API.getProject>>;
+type GetWorkspaceResult = Awaited<ReturnType<typeof API.getWorkspace>>;
 
-function makeGetProjectResult(title: string): GetProjectResult {
-  return {
-    project: {
-      title,
-      content_mode: "narration",
-      style: "Anime",
-      episodes: [],
-      characters: { hero: { description: "勇者" } },
-      scenes: { 酒馆: { description: "小镇酒馆" } },
-      props: {},
-    },
-    scripts: {},
-  };
+function makeGetWorkspaceResult(title: string): GetWorkspaceResult {
+  return makeWorkspaceResponse({
+    title,
+    content_mode: "narration",
+    style: "Anime",
+    episodes: [],
+    characters: { hero: { description: "勇者" } },
+    scenes: { 酒馆: { description: "小镇酒馆" } },
+    props: {},
+  });
 }
 
 describe("useProjectEventsSSE", () => {
@@ -74,27 +72,19 @@ describe("useProjectEventsSSE", () => {
     document.body.innerHTML = "";
     useAppStore.setState(useAppStore.getInitialState(), true);
     useProjectsStore.setState(useProjectsStore.getInitialState(), true);
+    useItemLocationsStore.getState().reset(null);
     vi.restoreAllMocks();
-    vi.spyOn(API, "getProject").mockResolvedValue({
-      project: {
+    vi.spyOn(API, "getWorkspace").mockResolvedValue(
+      makeWorkspaceResponse({
         title: "Demo",
         content_mode: "narration",
         style: "Anime",
-        episodes: [{ episode: 1, title: "第一集", script_file: "scripts/episode_1.json" }],
+        episodes: [{ episode: 1, title: "第一集", script_file: "scripts/episode_1.json", script_status: "generated" }],
         characters: { hero: { description: "勇者" } },
         scenes: {},
         props: {},
-      },
-      scripts: {
-        "episode_1.json": {
-          episode: 1,
-          title: "第一集",
-          content_mode: "narration",
-          novel: { title: "", chapter: "" },
-          segments: [],
-        },
-      },
-    });
+      }),
+    );
   });
 
   it("refreshes and navigates to the focused workspace target for remote changes", async () => {
@@ -133,7 +123,7 @@ describe("useProjectEventsSSE", () => {
     });
 
     await waitFor(() => {
-      expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+      expect(API.getWorkspace).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
       expect(screen.getByTestId("location")).toHaveTextContent("/characters");
     });
     expect(useAppStore.getState().scrollTarget).toEqual(
@@ -228,7 +218,7 @@ describe("useProjectEventsSSE", () => {
     });
 
     await waitFor(() => {
-      expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+      expect(API.getWorkspace).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
       expect(useAppStore.getState().scrollTarget).toEqual(
         expect.objectContaining({
           type: "reference_unit",
@@ -284,7 +274,7 @@ describe("useProjectEventsSSE", () => {
     });
 
     await waitFor(() => {
-      expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+      expect(API.getWorkspace).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
       expect(useAppStore.getState().workspaceNotifications[0]?.target?.id).toBe("酒馆");
     });
     expect(screen.getByTestId("location")).toHaveTextContent("/");
@@ -310,7 +300,7 @@ describe("useProjectEventsSSE", () => {
 
   it("invalidates episode script plan views when a reconnect snapshot shows missed changes", () => {
     useProjectsStore.setState({
-      currentProjectData: { ...makeGetProjectResult("Demo").project, episodes: [{ episode: 4, title: "雨夜" }] },
+      currentProjectData: { ...makeGetWorkspaceResult("Demo").project, episodes: [{ episode: 4, title: "雨夜" }] },
     } as never);
     const stream = mockProjectEventStream();
     renderHarness("/");
@@ -325,7 +315,7 @@ describe("useProjectEventsSSE", () => {
 
   it("invalidates episode script_plan revisions when script_plan or dependency assets change", async () => {
     useProjectsStore.setState({
-      currentProjectData: { ...makeGetProjectResult("Demo").project, episodes: [{ episode: 1, title: "第一集" }] },
+      currentProjectData: { ...makeGetWorkspaceResult("Demo").project, episodes: [{ episode: 1, title: "第一集" }] },
     } as never);
     const stream = mockProjectEventStream();
     renderHarness("/");
@@ -457,7 +447,7 @@ describe("useProjectEventsSSE", () => {
   });
 
   it("does not announce changes from a stale script when the refresh fails", async () => {
-    vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+    vi.spyOn(API, "getWorkspace").mockRejectedValue(new Error("network down"));
     const stream = mockProjectEventStream();
 
     renderHarness("/");
@@ -492,9 +482,9 @@ describe("useProjectEventsSSE", () => {
   });
 
   it("does not navigate or scroll and clears stale focus when refresh fails with a non-null focus target", async () => {
-    vi.spyOn(API, "getProject")
+    vi.spyOn(API, "getWorkspace")
       .mockRejectedValueOnce(new Error("network down"))
-      .mockResolvedValueOnce(makeGetProjectResult("Recovered"));
+      .mockResolvedValueOnce(makeGetWorkspaceResult("Recovered"));
     const stream = mockProjectEventStream();
 
     renderHarness("/");
@@ -540,17 +530,17 @@ describe("useProjectEventsSSE", () => {
     await waitFor(() => {
       expect(useProjectsStore.getState().currentProjectData?.title).toBe("Recovered");
     });
-    expect(API.getProject).toHaveBeenCalledTimes(2);
+    expect(API.getWorkspace).toHaveBeenCalledTimes(2);
     expect(screen.getByTestId("location")).toHaveTextContent("/");
     expect(useAppStore.getState().scrollTarget).toBeNull();
   });
 
   it("stays silent and clears stale focus when refresh is cancelled with a non-null focus target", async () => {
-    const d1 = createDeferred<GetProjectResult>();
+    const d1 = createDeferred<GetWorkspaceResult>();
     const getProjectSpy = vi
-      .spyOn(API, "getProject")
+      .spyOn(API, "getWorkspace")
       .mockReturnValueOnce(d1.promise)
-      .mockResolvedValueOnce(makeGetProjectResult("Recovered"));
+      .mockResolvedValueOnce(makeGetWorkspaceResult("Recovered"));
     const stream = mockProjectEventStream();
 
     renderHarness("/");
@@ -607,10 +597,10 @@ describe("useProjectEventsSSE", () => {
 
   it("preserves a newer queued focus target when an earlier in-flight refresh fails", async () => {
     const stream = mockProjectEventStream();
-    const d1 = createDeferred<GetProjectResult>();
-    const d2 = createDeferred<GetProjectResult>();
+    const d1 = createDeferred<GetWorkspaceResult>();
+    const d2 = createDeferred<GetWorkspaceResult>();
     const getProjectSpy = vi
-      .spyOn(API, "getProject")
+      .spyOn(API, "getWorkspace")
       .mockReturnValueOnce(d1.promise)
       .mockReturnValueOnce(d2.promise);
 
@@ -670,7 +660,7 @@ describe("useProjectEventsSSE", () => {
     expect(useAppStore.getState().scrollTarget).toBeNull();
 
     await act(async () => {
-      d2.resolve(makeGetProjectResult("R2"));
+      d2.resolve(makeGetWorkspaceResult("R2"));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -687,8 +677,14 @@ describe("useProjectEventsSSE", () => {
     expect(getProjectSpy).toHaveBeenCalledTimes(2);
   });
 
-  it("shows a toast without navigation for generation completion batches", async () => {
+  it.each([false, true])("delivers generation completion when the active episode view closes: %s", async (closeEpisode) => {
     const stream = mockProjectEventStream();
+    const store = useProjectsStore.getState();
+    const snapshot = { script: { episode: 1, segments: [] } as never, revision: "r1" };
+    const reread = createDeferred<typeof snapshot>();
+    expect(await store.refreshProject("demo")).toBe("success");
+    vi.spyOn(API, "getScript").mockResolvedValueOnce(snapshot).mockReturnValueOnce(reread.promise);
+    expect(await store.loadEpisodeScript("demo", 1, "episode_1.json")).toBe("success");
 
     renderHarness("/episodes/1");
 
@@ -715,8 +711,13 @@ describe("useProjectEventsSSE", () => {
       );
     });
 
+    await waitFor(() => expect(API.getScript).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      if (closeEpisode) store.clearActiveEpisodeScript();
+      reread.resolve(snapshot);
+    });
     await waitFor(() => {
-      expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+      expect(API.getWorkspace).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
       expect(useAppStore.getState().toast?.text).toBe("分镜「E1S01」的分镜图已生成");
     });
     expect(useAppStore.getState().toast?.tone).toBe("success");
@@ -785,7 +786,7 @@ describe("useProjectEventsSSE", () => {
       });
 
       await waitFor(() => {
-        expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+        expect(API.getWorkspace).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
         expect(useAppStore.getState().toast?.text).toBe(expectedText);
       });
       expect(useAppStore.getState().toast?.tone).toBe("success");
@@ -841,7 +842,7 @@ describe("useProjectEventsSSE", () => {
     });
 
     await waitFor(() => {
-      expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+      expect(API.getWorkspace).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
       expect(useAppStore.getState().toast?.text).toBe("旁白「E1S01」已生成");
     });
   });
@@ -902,7 +903,7 @@ describe("useProjectEventsSSE", () => {
     });
 
     await waitFor(() => {
-      expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+      expect(API.getWorkspace).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
       expect(useAppStore.getState().toast?.text).toBe("道具「玉佩」已更新");
     });
 
@@ -964,7 +965,7 @@ describe("useProjectEventsSSE", () => {
     });
 
     await waitFor(() => {
-      expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+      expect(API.getWorkspace).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
     });
     expect(screen.getByTestId("location")).toHaveTextContent("/props");
     expect(useAppStore.getState().scrollTarget).toBeNull();
@@ -1060,10 +1061,10 @@ describe("useProjectEventsSSE", () => {
   it("一次不带聚焦目标的刷新（如 onSnapshot）落定时，不应抢先消费更晚一批 onChanges 排队的目标", async () => {
     const stream = mockProjectEventStream();
 
-    const d1 = createDeferred<GetProjectResult>();
-    const d2 = createDeferred<GetProjectResult>();
+    const d1 = createDeferred<GetWorkspaceResult>();
+    const d2 = createDeferred<GetWorkspaceResult>();
     const getProjectSpy = vi
-      .spyOn(API, "getProject")
+      .spyOn(API, "getWorkspace")
       .mockReturnValueOnce(d1.promise)
       .mockReturnValueOnce(d2.promise);
 
@@ -1107,14 +1108,14 @@ describe("useProjectEventsSSE", () => {
     expect(getProjectSpy).toHaveBeenCalledTimes(1);
 
     await act(async () => {
-      d1.resolve(makeGetProjectResult("R1"));
+      d1.resolve(makeGetWorkspaceResult("R1"));
       await Promise.resolve();
       await Promise.resolve();
     });
     expect(screen.getByTestId("location")).toHaveTextContent("/");
 
     await act(async () => {
-      d2.resolve(makeGetProjectResult("R2"));
+      d2.resolve(makeGetWorkspaceResult("R2"));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -1127,10 +1128,10 @@ describe("useProjectEventsSSE", () => {
   it("does not navigate to a stale focus target once a later SSE batch has queued a newer one", async () => {
     const stream = mockProjectEventStream();
 
-    const d1 = createDeferred<GetProjectResult>();
-    const d2 = createDeferred<GetProjectResult>();
+    const d1 = createDeferred<GetWorkspaceResult>();
+    const d2 = createDeferred<GetWorkspaceResult>();
     const getProjectSpy = vi
-      .spyOn(API, "getProject")
+      .spyOn(API, "getWorkspace")
       .mockReturnValueOnce(d1.promise)
       .mockReturnValueOnce(d2.promise);
 
@@ -1183,14 +1184,14 @@ describe("useProjectEventsSSE", () => {
     expect(getProjectSpy).toHaveBeenCalledTimes(1);
 
     await act(async () => {
-      d1.resolve(makeGetProjectResult("R1"));
+      d1.resolve(makeGetWorkspaceResult("R1"));
       await Promise.resolve();
       await Promise.resolve();
     });
     expect(screen.getByTestId("location")).toHaveTextContent("/");
 
     await act(async () => {
-      d2.resolve(makeGetProjectResult("R2"));
+      d2.resolve(makeGetWorkspaceResult("R2"));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -1317,7 +1318,7 @@ describe("useProjectEventsSSE", () => {
       const refreshTasksSpy = vi
         .spyOn(useTasksStore.getState(), "refreshTasks")
         .mockResolvedValue(undefined);
-      const getProjectSpy = vi.spyOn(API, "getProject");
+      const getProjectSpy = vi.spyOn(API, "getWorkspace");
 
       renderHarness("/");
       emit(stream, [
@@ -1350,7 +1351,7 @@ describe("useProjectEventsSSE", () => {
       ]);
 
       await waitFor(() => {
-        expect(API.getProject).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+        expect(API.getWorkspace).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
       });
       expect(refreshTasksSpy).toHaveBeenCalled();
     });
@@ -1509,8 +1510,8 @@ describe("useProjectEventsSSE", () => {
     it("任务终态到达不清掉前一批实体变更排队中的聚焦目标", async () => {
       const stream = mockProjectEventStream();
       vi.spyOn(useTasksStore.getState(), "refreshTasks").mockResolvedValue(undefined);
-      const d1 = createDeferred<GetProjectResult>();
-      vi.spyOn(API, "getProject").mockReturnValue(d1.promise);
+      const d1 = createDeferred<GetWorkspaceResult>();
+      vi.spyOn(API, "getWorkspace").mockReturnValue(d1.promise);
 
       renderHarness("/");
 
@@ -1539,7 +1540,7 @@ describe("useProjectEventsSSE", () => {
       emit(stream, [taskChange()]);
 
       await act(async () => {
-        d1.resolve(makeGetProjectResult("R1"));
+        d1.resolve(makeGetWorkspaceResult("R1"));
         await Promise.resolve();
         await Promise.resolve();
       });
@@ -1610,6 +1611,171 @@ describe("useProjectEventsSSE", () => {
       expect(useAppStore.getState().toast).toBeNull();
       expect(useAppStore.getState().workspaceNotifications).toHaveLength(0);
       expect(screen.getByTestId("location")).toHaveTextContent("/");
+    });
+  });
+
+  describe("按集刷新、位置事实与前后台收口", () => {
+    it("第 N 集分镜变更在未打开该集时不拉剧本，并用事件自带 position 渲染通知", async () => {
+      const stream = mockProjectEventStream();
+      const getScriptSpy = vi.spyOn(API, "getScript");
+
+      renderHarness("/");
+      act(() => {
+        stream.options?.onChanges?.({
+          project_name: "demo",
+          batch_id: "batch-ep1-pos",
+          fingerprint: "fp-ep1-pos",
+          generated_at: "2026-03-01T00:00:00Z",
+          source: "worker",
+          changes: [
+            {
+              entity_type: "segment",
+              action: "storyboard_ready",
+              entity_id: "E1S02",
+              item_id: "E1S02",
+              episode: 1,
+              position: 2,
+              label: "分镜「E1S02」",
+              label_key: "skeleton_segments",
+              label_params: { id: "E1S02" },
+              focus: null,
+              important: true,
+            },
+          ],
+        });
+      });
+
+      await waitFor(() => {
+        expect(useAppStore.getState().toast?.text).toContain("第一集 · 2");
+      });
+      expect(getScriptSpy).not.toHaveBeenCalled();
+    });
+
+    it("隐藏期间立即失效位置，前台恢复失败后下次可见时补取", async () => {
+      const originalVisibility = Object.getOwnPropertyDescriptor(document, "visibilityState");
+      let visibility: DocumentVisibilityState = "visible";
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => visibility,
+      });
+      try {
+        const stream = mockProjectEventStream();
+        useProjectsStore.getState().setCurrentProject("demo", {
+          ...makeGetWorkspaceResult("Demo").project,
+          episodes: [1, 2].map((episode) => ({ episode, title: String(episode), script_file: `scripts/episode_${episode}.json` })),
+        });
+        renderHarness("/");
+
+        const locate = vi.spyOn(API, "locateItems").mockResolvedValue({
+          items: [{ episode: 1, item_id: "E1S01", position: 1, status: "found" }],
+        });
+        const locations = useItemLocationsStore.getState();
+        const release = locations.registerVisible("demo", ["E1S01"]);
+        await waitFor(() => expect(locations.getLocation("demo", "E1S01")?.position).toBe(1));
+        const firstRefresh = createDeferred<GetWorkspaceResult>();
+        vi.mocked(API.getWorkspace).mockReturnValueOnce(firstRefresh.promise).mockRejectedValueOnce(new Error("503"));
+        visibility = "hidden";
+
+        const changeEpisode = (episode: number) => act(() => {
+          stream.options?.onChanges?.({
+            project_name: "demo",
+            batch_id: `batch-bg-${episode}`,
+            fingerprint: `fp-bg-${episode}`,
+            generated_at: "2026-03-01T00:00:00Z",
+            source: "filesystem",
+            changes: [
+              {
+                entity_type: "episode",
+                episode,
+                action: "updated",
+                entity_id: String(episode),
+                label: `第 ${episode} 集`,
+                focus: null,
+                important: false,
+              },
+            ],
+          });
+        });
+
+        changeEpisode(1);
+        await Promise.resolve();
+        expect(locations.getLocation("demo", "E1S01")).toBeUndefined();
+        expect(locate).toHaveBeenCalledTimes(1);
+        expect(API.getWorkspace).not.toHaveBeenCalled();
+
+        visibility = "visible";
+        act(() => {
+          document.dispatchEvent(new Event("visibilitychange"));
+        });
+
+        await waitFor(() => {
+          expect(API.getWorkspace).toHaveBeenCalledTimes(1);
+        });
+        expect(locate).toHaveBeenCalledTimes(2);
+        visibility = "hidden";
+        document.dispatchEvent(new Event("visibilitychange"));
+        changeEpisode(2);
+        await act(async () => { firstRefresh.reject(new Error("503")); });
+        expect(API.getWorkspace).toHaveBeenCalledTimes(1);
+        visibility = "visible";
+        document.dispatchEvent(new Event("visibilitychange"));
+        await waitFor(() => expect(API.getWorkspace).toHaveBeenCalledTimes(2));
+        expect(API.getWorkspace).toHaveBeenLastCalledWith("demo", {
+          episodes: expect.arrayContaining([1, 2]), signal: expect.any(AbortSignal),
+        });
+        act(() => {
+          stream.options?.onSnapshot?.({
+            project_name: "demo", fingerprint: "fp-bg-2", generated_at: "2026-03-01T00:01:00Z",
+          });
+        });
+        await waitFor(() => expect(API.getWorkspace).toHaveBeenCalledTimes(3));
+        expect(API.getWorkspace).toHaveBeenLastCalledWith("demo", {
+          episodes: expect.arrayContaining([1, 2]), signal: expect.any(AbortSignal),
+        });
+        release();
+      } finally {
+        if (originalVisibility) {
+          Object.defineProperty(document, "visibilityState", originalVisibility);
+        } else {
+          delete (document as { visibilityState?: DocumentVisibilityState }).visibilityState;
+        }
+      }
+    });
+
+    it("SSE snapshot 到来后唤醒 item-locations 中处于 unloaded 的条目重查", async () => {
+      const stream = mockProjectEventStream();
+      const locateSpy = vi
+        .spyOn(API, "locateItems")
+        .mockResolvedValueOnce({
+          items: [{ episode: 2, item_id: "E2S01", position: null, status: "unloaded" }],
+        })
+        .mockResolvedValueOnce({
+          items: [{ episode: 2, item_id: "E2S01", position: 1, status: "found" }],
+        });
+
+      renderHarness("/");
+      const release = useItemLocationsStore.getState().registerVisible("demo", ["E2S01"]);
+      await waitFor(() => expect(locateSpy).toHaveBeenCalledTimes(1));
+      expect(useItemLocationsStore.getState().getLocation("demo", "E2S01")?.status).toBe("unloaded");
+
+      act(() => {
+        stream.options?.onSnapshot?.({
+          project_name: "demo",
+          fingerprint: "fp-snap-1",
+          generated_at: "2026-03-01T00:00:00Z",
+        });
+      });
+
+      await waitFor(() => {
+        expect(locateSpy).toHaveBeenCalledTimes(2);
+        expect(useItemLocationsStore.getState().getLocation("demo", "E2S01")).toEqual({
+          episode: 2,
+          item_id: "E2S01",
+          position: 1,
+          status: "found",
+        });
+      });
+      release();
     });
   });
 });

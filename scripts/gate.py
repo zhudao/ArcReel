@@ -1,41 +1,46 @@
 #!/usr/bin/env python3
-"""按域运行完整质量闸门，整机同一时刻只跑一份。
+"""按改动快检，或运行受影响域的完整闸门。
 
-    uv run python scripts/gate.py --changed            # 按相对 origin/main 的改动选域
-    uv run python scripts/gate.py backend frontend     # 直接点名域
-    uv run python scripts/gate.py --list               # 各域的触发路径与步骤
+    uv run python scripts/gate.py --changed            # 开发快检
+    uv run python scripts/gate.py --changed --full     # push 前完整闸门
+    uv run python scripts/gate.py backend frontend     # 点名的域总是完整运行
+    uv run python scripts/gate.py --list               # 触发路径与完整步骤
 
-完整闸门里的 pytest 与 vitest 都按整机核数并行；几个 worktree 同时跑时互相抢核，
-vitest 的 jsdom 用例会先超时。本脚本用机器级文件锁把各次闸门排成队：谁拿到锁谁独占
-整机跑完，排队的只打印等待信息。各域的命令与触发路径只在这里定义一次。
-
-锁文件默认在用户目录下（同一台机器上的所有 worktree 都看得到），`ARCREEL_GATE_LOCK`
-可改路径。命令任一失败即停止并以其退出码退出，与 `&&` 串联一致。
+全量 pytest / Vitest 步骤跨 worktree 排队。ARCREEL_GATE_LOCK 可覆盖机器锁路径。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
+import hashlib
 import os
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import IO
+from typing import IO, Literal
 
 import portalocker
 
 ROOT = Path(__file__).resolve().parent.parent
 LOCK_PATH = Path(os.environ.get("ARCREEL_GATE_LOCK") or Path.home() / ".cache" / "arcreel" / "gate.lock")
+_PYTEST_NO_TESTS_COLLECTED = 5
 
 
 @dataclass(frozen=True)
 class Step:
     argv: tuple[str, ...]
     cwd: Path = ROOT
+    heavy: bool = False
+    junit_runner: Literal["pytest", "vitest"] | None = None
+    testmon_sources: tuple[str, ...] = ()
 
     def describe(self) -> str:
         command = " ".join(self.argv)
@@ -43,6 +48,15 @@ class Step:
 
 
 UV = ("uv", "run")
+PYTEST = (*UV, "python", "-m", "pytest")
+BACKEND_SUITE = Step((*PYTEST, "-n", "4", "--dist", "loadfile", "--max-worker-restart=0"), heavy=True)
+FRONT = ROOT / "frontend"
+FRONTEND_SUITE = Step(("pnpm", "test"), FRONT, heavy=True)
+FULL_SUITES: dict[str, Step] = {
+    "backend": BACKEND_SUITE,
+    "frontend": FRONTEND_SUITE,
+}
+
 DOMAINS: dict[str, tuple[Step, ...]] = {
     "backend": (
         Step((*UV, "ruff", "check", ".")),
@@ -50,7 +64,8 @@ DOMAINS: dict[str, tuple[Step, ...]] = {
         Step((*UV, "basedpyright", "--warnings")),
         Step((*UV, "lint-imports")),
         Step((*UV, "deptry", "lib", "server", "alembic", "scripts", "tests")),
-        Step((*UV, "python", "-m", "pytest", "-n", "4", "--dist", "loadfile", "--max-worker-restart=0")),
+        Step((*UV, "python", "-m", "scripts.audit_capability_codes")),
+        BACKEND_SUITE,
     ),
     "market-core": (
         Step((*UV, "deptry", "src", "tests"), ROOT / "packages" / "arcreel-market-core"),
@@ -69,21 +84,24 @@ DOMAINS: dict[str, tuple[Step, ...]] = {
         Step((*UV, "pre-commit", "run", "--all-files", "actionlint")),
         Step((*UV, "pre-commit", "run", "--all-files", "zizmor")),
     ),
-    "frontend": (Step(("pnpm", "check"), ROOT / "frontend"),),
+    "frontend": (Step(("pnpm", "check:static"), FRONT), FRONTEND_SUITE),
     "website": (Step(("pnpm", "check"), ROOT / "website"),),
+    "e2e-live": (
+        Step(("pnpm", "exec", "vite", "build"), FRONT),
+        Step(("env", "E2E_PREBUILT=1", "pnpm", "e2e:live"), FRONT),
+    ),
+    "e2e-freshness": (Step(("pnpm", "e2e:record:freshness"), FRONT),),
     "e2e-record": (Step(("pnpm", "e2e:record:check"), ROOT / "frontend"),),
 }
 
 # 域 → 触发路径，fnmatch 通配（`*` 也跨目录分隔符）。与 CI 的 .github/actions/domain-filter/action.yml
 # 对照维护：CI 的 backend 域对应这里的 backend、market-core 与 catalog-core，workflow 域对应 workflows；
-# CI 的 docker 域（Dockerfile、public/）没有本地闸门；e2e-record 对应 CI 的 e2e-record-drift job（backend 或
-# frontend 域命中时运行，本地只在录制脚本及其引用的文件变化时随前端触发）。tests 与 conventions 两个域是秒级的
-# 结构审计，触发条件含「新增豁免注释」这类看路径判断不了的情况，按改动选域时总是跑。
 BACKEND_TRIGGERS = (
     "lib/*",
     "server/*",
     "alembic/*",
     "alembic.ini",
+    "conftest.py",
     "scripts/*",
     "tests/*",
     "agent_runtime_profile/*",
@@ -104,8 +122,23 @@ TRIGGERS: dict[str, tuple[str, ...]] = {
     "workflows": (".github/*", ".pre-commit-config.yaml"),
     "frontend": ("frontend/*",),
     "website": ("website/*", "CONTRIBUTING.md", "README.md", "README.en.md"),
+    "e2e-live": (
+        "frontend/e2e/live/*",
+        "frontend/playwright.config.ts",
+        "frontend/e2e/support/viewports.ts",
+        "frontend/package.json",
+        "frontend/pnpm-lock.yaml",
+    ),
+    "e2e-freshness": (*BACKEND_TRIGGERS, "frontend/e2e/fixtures/recorded/*"),
     "e2e-record": (
-        *BACKEND_TRIGGERS,
+        "scripts/e2e_record_backend.py",
+        "tests/fixtures/catalog.json",
+        "lib/app_version.py",
+        "lib/catalog/lifecycle.py",
+        "lib/catalog/query.py",
+        "frontend/pnpm-lock.yaml",
+        "pyproject.toml",
+        "uv.lock",
         "frontend/e2e/record-fixtures.ts",
         "frontend/e2e/support/recorded.ts",
         "frontend/e2e/fixtures/comfyui.ts",
@@ -113,6 +146,16 @@ TRIGGERS: dict[str, tuple[str, ...]] = {
     ),
 }
 ALWAYS_WHEN_CHANGED = ("tests", "conventions")
+
+
+def _matches(path: str, patterns: Iterable[str]) -> bool:
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+
+def _unknown(path: str) -> bool:
+    if path.endswith(".md") or path.startswith("docs/"):
+        return False
+    return not any(_matches(path, patterns) for patterns in TRIGGERS.values())
 
 
 def select_domains(paths: Iterable[str]) -> list[str]:
@@ -123,6 +166,10 @@ def select_domains(paths: Iterable[str]) -> list[str]:
         for name, patterns in TRIGGERS.items()
         if any(fnmatch.fnmatchcase(path, pattern) for path in changed for pattern in patterns)
     }
+    if any(_unknown(path) for path in changed):
+        hit.update(("backend", "frontend", "e2e-freshness"))
+    if "e2e-record" in hit:
+        hit.add("e2e-freshness")
     hit.update(ALWAYS_WHEN_CHANGED)
     return [name for name in DOMAINS if name in hit]
 
@@ -193,26 +240,184 @@ def _acquire_gate_lock() -> portalocker.Lock:
 def _run(step: Step) -> int:
     started = time.monotonic()
     print(f"\n$ {step.describe()}", flush=True)
-    code = subprocess.run(step.argv, cwd=step.cwd, check=False).returncode
+    env = {**os.environ, "TESTMON_DATAFILE": str(ROOT / ".testmondata")} if "--testmon" in step.argv else None
+    code = subprocess.run(step.argv, cwd=step.cwd, env=env, check=False).returncode
     print(f"[gate] {'ok' if code == 0 else f'exit {code}'} in {time.monotonic() - started:.0f}s", flush=True)
     return code
 
 
-def run_domains(domains: list[str]) -> int:
-    steps = [step for name in domains for step in DOMAINS[name]]
+def _execute(step: Step) -> int:
+    if not step.heavy:
+        return _run(step)
     lock = _acquire_gate_lock()
     try:
-        _write_holder(lock.fh, f"pid {os.getpid()} · {ROOT} · {' '.join(domains)}")
-        started = time.monotonic()
-        for step in steps:
-            code = _run(step)
-            if code != 0:
-                return code
-        print(f"\n[gate] {' '.join(domains)} 全部通过，用时 {time.monotonic() - started:.0f}s", flush=True)
-        return 0
+        _write_holder(lock.fh, f"pid {os.getpid()} · {ROOT} · {step.describe()}")
+        return _run(step)
     finally:
         _write_holder(lock.fh, "")
         lock.release()
+
+
+BACKEND_SHARED = (
+    "*/__init__.py",
+    "*/__main__.py",
+    "lib/db/*",
+    "lib/i18n/*",
+    "lib/config/*",
+    "lib/project/project_migrations/*",
+    "lib/project/data_validator.py",
+    "lib/artifacts/artifact_manifest.py",
+    "server/app.py",
+    "server/shutdown.py",
+    "server/i18n.py",
+    "server/remote_mcp.py",
+)
+FRONTEND_SHARED = (
+    "frontend/src/i18n/*",
+    "frontend/src/branding.*",
+    "frontend/src/test/*",
+    "frontend/src/__mocks__/*",
+    "frontend/src/main.tsx",
+    *BACKEND_TRIGGERS,
+)
+
+
+def select_tests(name: str, paths: list[str], root: Path = ROOT) -> list[Step]:
+    """为已命中的前端或后端域选择定向测试，遇到共享边界返回完整套件。"""
+    suite = FULL_SUITES[name]
+    sources = []
+    tests = []
+    for path in paths:
+        if _unknown(path):
+            return [suite]
+        if not _matches(path, TRIGGERS[name]):
+            continue
+        if not (root / path).is_file():
+            return [suite]
+        if name == "backend":
+            if _matches(path, ("tests/*/test_*.py",)):
+                tests.append(path)
+            elif _matches(path, ("server/*.py", "lib/*.py")) and not _matches(path, BACKEND_SHARED):
+                sources.append(path)
+            else:
+                return [suite]
+        elif not _matches(path, ("frontend/src/*.ts", "frontend/src/*.tsx")) or _matches(path, FRONTEND_SHARED):
+            return [suite]
+        elif _matches(path, ("*.test.ts", "*.test.tsx")):
+            tests.append(path.removeprefix("frontend/"))
+        else:
+            sources.append(path.removeprefix("frontend/"))
+    steps = []
+    if name == "backend":
+        if sources and not (root / ".testmondata").is_file():
+            return [
+                replace(
+                    suite,
+                    argv=(*suite.argv, "--testmon", "--testmon-noselect", "--blocking-guard-expect-all-exemptions"),
+                )
+            ]
+        if sources:
+            steps.append(Step((*PYTEST, "--testmon"), junit_runner="pytest", testmon_sources=tuple(sources)))
+        if tests:
+            steps.append(Step((*PYTEST, *tests), junit_runner="pytest"))
+    else:
+        vitest = ("pnpm", "exec", "vitest")
+        if sources:
+            steps.append(Step((*vitest, "related", "--run", "--maxWorkers=1", *sources), FRONT, junit_runner="vitest"))
+        if tests:
+            steps.append(Step((*vitest, "run", "--maxWorkers=1", *tests), FRONT, junit_runner="vitest"))
+    return steps or [suite]
+
+
+def _source_fshas(path: Path) -> set[str]:
+    """计算与 testmon 兼容的文件指纹（覆盖 git blob 与 read_source_sha 两种格式）。"""
+    raw = path.read_bytes()
+    git_blob = hashlib.sha1(b"blob %d\0" % len(raw) + raw, usedforsecurity=False).hexdigest()
+    normalized = raw.replace(b"\f", b" ").replace(b"\r\n", b"\n")
+    text = normalized.decode("utf-8", "replace")
+    testmon_blob = hashlib.sha1(b"blob %d\0" % len(text) + normalized, usedforsecurity=False).hexdigest()
+    return {git_blob, testmon_blob}
+
+
+def _testmon_covers_current_sources(sources: Iterable[str], root: Path = ROOT) -> bool:
+    """确认改动源码均已在 .testmondata 中以当前内容通过覆盖且库中无失败用例。"""
+    source_list = list(sources)
+    db_path = root / ".testmondata"
+    if not source_list or not db_path.is_file():
+        return False
+    try:
+        with contextlib.closing(sqlite3.connect(db_path)) as con:
+            if con.execute("SELECT 1 FROM test_execution WHERE failed != 0 LIMIT 1").fetchone():
+                return False
+            rows = con.execute(
+                """
+                SELECT DISTINCT f.filename, f.fsha
+                FROM file_fp f
+                JOIN test_execution_file_fp tef ON tef.fingerprint_id = f.id
+                JOIN test_execution te ON te.id = tef.test_execution_id
+                WHERE te.failed = 0 AND f.fsha IS NOT NULL
+                """
+            ).fetchall()
+    except sqlite3.Error:
+        return False
+    recorded: dict[str, set[str]] = {}
+    for filename, fsha in rows:
+        recorded.setdefault(Path(filename).as_posix(), set()).add(fsha)
+    for source in source_list:
+        try:
+            expected = _source_fshas(root / source)
+        except OSError:
+            return False
+        if not (recorded.get(source, set()) & expected):
+            return False
+    return True
+
+
+def _run_selected(step: Step) -> tuple[int, bool]:
+    """运行定向测试并返回 (退出码, 是否实际执行了至少一条用例)。"""
+    with tempfile.TemporaryDirectory() as directory:
+        report = Path(directory) / "selected.xml"
+        options = (
+            ("--passWithNoTests", "--reporter=default", "--reporter=junit", f"--outputFile.junit={report}")
+            if step.junit_runner == "vitest"
+            else (f"--junitxml={report}",)
+        )
+        code = _execute(replace(step, argv=(*step.argv, *options)))
+        if code:
+            return code, False
+        ran_tests = report.is_file() and ET.parse(report).find(".//testcase") is not None
+        return 0, ran_tests
+
+
+def _run_quick_tests(name: str, paths: list[str], root: Path = ROOT) -> int:
+    for step in select_tests(name, paths, root):
+        if step.heavy:
+            return _execute(step)
+        code, ran_tests = _run_selected(step)
+        if code == 0 and ran_tests:
+            continue
+        if code == 0 and step.testmon_sources and _testmon_covers_current_sources(step.testmon_sources, root):
+            print(f"[gate] {name} 增量缓存已覆盖当前改动，无需重跑", flush=True)
+            continue
+        if code in {0, _PYTEST_NO_TESTS_COLLECTED}:
+            print(f"[gate] {name} 零命中，运行完整测试", flush=True)
+            return _execute(FULL_SUITES[name])
+        return code
+    return 0
+
+
+def run_domains(domains: list[str], paths: list[str], complete: set[str], root: Path = ROOT) -> int:
+    started = time.monotonic()
+    for name in domains:
+        steps = DOMAINS[name]
+        quick = name in FULL_SUITES and name not in complete
+        for step in (step for step in steps if not (quick and step.heavy)):
+            if code := _execute(step):
+                return code
+        if quick and (code := _run_quick_tests(name, paths, root)):
+            return code
+    print(f"[gate] {' '.join(domains)} 全部通过，用时 {time.monotonic() - started:.0f}s", flush=True)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -226,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
         help="按相对 BASE（默认 origin/main）的改动选域，可与点名的域合并",
     )
     parser.add_argument("--list", action="store_true", help="列出各域的触发路径与步骤后退出")
+    parser.add_argument("--full", action="store_true", help="完整运行所有命中域")
     args = parser.parse_args(argv)
     if args.list:
         for name, steps in DOMAINS.items():
@@ -238,6 +444,9 @@ def main(argv: list[str] | None = None) -> int:
     if unknown:
         parser.error(f"未知的域：{', '.join(unknown)}；可选 {', '.join(DOMAINS)}")
     selected: set[str] = set(args.domains)
+    paths: list[str] = []
+    if args.changed is None and not args.domains:
+        args.changed = "origin/main"
     if args.changed is not None:
         try:
             paths = changed_paths(args.changed)
@@ -247,9 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[gate] 相对 {args.changed} 改动 {len(paths)} 个文件，命中域：{' '.join(picked)}", flush=True)
         selected.update(picked)
     domains = [name for name in DOMAINS if name in selected]
-    if not domains:
-        parser.error("至少给一个域名或 --changed，或用 --list 查看")
-    return run_domains(domains)
+    return run_domains(domains, paths, selected if args.full else set(args.domains))
 
 
 if __name__ == "__main__":

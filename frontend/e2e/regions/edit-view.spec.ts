@@ -1,21 +1,16 @@
 import { box, viewport, waitForEntrance, clearAgentOverlay } from "../support/region-helpers.ts";
 import type { Locator, Page } from "@playwright/test";
 import { defineRegionScenarios } from "../support/scenarios.ts";
-import { FIXED_NOW, recorded } from "../support/recorded.ts";
+import { FIXED_NOW } from "../support/recorded.ts";
 import { expect, type ApiOverrides } from "../support/test.ts";
+import { recordedDemoScript, workspaceOverride } from "../support/workspace-override.ts";
 
 const EDIT_PATH = "/app/projects/demo/episodes/1?view=edit";
 const API: ApiOverrides = {
   "GET /api/v1/projects/demo/events/stream": { status: 404, body: { detail: "页面级套件不回放事件流" } },
 };
 
-
-interface RecordedProject {
-  project: Record<string, unknown>;
-  scripts: Record<string, Record<string, unknown>>;
-}
-
-const recordedProject = recorded<RecordedProject>("project-demo.json");
+const recordedScript = recordedDemoScript().script;
 
 const TIMELINE_ID = "tl-00000006";
 const unit = (index: number) => `E1S${String(index + 1).padStart(2, "0")}`;
@@ -154,28 +149,25 @@ const videoMissing = (index: number) => ({
   [`GET /api/v1/files/demo/videos/scene_${unit(index)}.mp4?v=1`]: { status: 404, body: { detail: "页面级套件不回放媒体" } },
 });
 
-const project: RecordedProject = {
-  ...recordedProject,
-  scripts: {
-    "episode_1.json": {
-      ...recordedProject.scripts["episode_1.json"],
-      segments: Array.from({ length: 66 }, (_, index) => ({
-        segment_id: unit(index),
-        episode: 1,
-        duration_seconds: 4,
-        segment_break: false,
-        novel_text: `第 ${index + 1} 段原文。`,
-        characters_in_segment: [],
-        image_prompt: null,
-        video_prompt: null,
-      })),
-    },
+const EDIT_SCRIPTS = {
+  "episode_1.json": {
+    ...recordedScript,
+    segments: Array.from({ length: 66 }, (_, index) => ({
+      segment_id: unit(index),
+      episode: 1,
+      duration_seconds: 4,
+      segment_break: false,
+      novel_text: `第 ${index + 1} 段原文。`,
+      characters_in_segment: [],
+      image_prompt: null,
+      video_prompt: null,
+    })),
   },
 };
 
 const TIMELINE: ApiOverrides = {
   ...API,
-  "GET /api/v1/projects/demo": { status: 200, body: project },
+  ...workspaceOverride({}, { scripts: EDIT_SCRIPTS }),
   "GET /api/v1/projects/demo/edit-timelines?episode=1": { status: 200, body: { timelines } },
   [`GET ${TIMELINE_BASE}`]: { status: 200, body: readout },
   [`GET ${TIMELINE_BASE}/preview-media`]: { status: 200, body: previewMedia },
@@ -199,10 +191,7 @@ const TIMELINE: ApiOverrides = {
 
 const TTS_TIMELINE: ApiOverrides = {
   ...TIMELINE,
-  "GET /api/v1/projects/demo": {
-    status: 200,
-    body: { ...project, project: { ...project.project, narration_delivery: "use_tts" } },
-  },
+  ...workspaceOverride({ narration_delivery: "use_tts" }, { scripts: EDIT_SCRIPTS }),
   [`GET ${TIMELINE_BASE}/final-cut?narration=with_narration&subtitles=burned_subtitles`]: {
     status: 200,
     body: finalCut("current", "with_narration"),
@@ -264,6 +253,8 @@ defineRegionScenarios("剪辑视图", [
     name: "播放器、详情栏与四条轨道同屏，只有详情栏滚动",
     path: EDIT_PATH,
     api: TIMELINE,
+    viewports: "both",
+    a11y: true,
     ready: timelineReady,
     act: async (page) => {
       await clearAgentOverlay(page);
@@ -282,10 +273,10 @@ defineRegionScenarios("剪辑视图", [
       expect(scrollable).toBe(true);
       expect((await box(player(page))).height).toBeGreaterThan(0);
     },
-    screenshot: { name: "edit-view", target: editView },
   },
   {
     name: "出片对话框：成片过时，以重新渲染为主动作",
+    viewports: "both",
     path: EDIT_PATH,
     api: TIMELINE,
     ready: timelineReady,
@@ -294,12 +285,13 @@ defineRegionScenarios("剪辑视图", [
       await expect(renderDialog(page)).toContainText("已落后于剪辑时间线");
       await expectInViewport(page, renderDialog(page).getByRole("button", { name: "重新渲染" }));
     },
-    screenshot: { name: "edit-render-dialog", target: renderDialog },
   },
   {
     name: "出片对话框：TTS 配音项目的剪映草稿选项最多，主操作仍在视口内",
     path: EDIT_PATH,
     api: TTS_TIMELINE,
+    viewports: "both",
+    a11y: true,
     ready: timelineReady,
     act: async (page) => {
       await openRenderDialog(page);

@@ -41,6 +41,8 @@ async function expectAllLinesReachable(field: Locator) {
 defineRegionScenarios("自动撑高输入框", [
   {
     name: "弹层中写入 9 行文本后撑开到上限并可内部滚动",
+    viewports: "both",
+    a11y: true,
     path: EPISODE_PATH,
     api: API,
     ready: async (page) => {
@@ -51,7 +53,6 @@ defineRegionScenarios("自动撑高输入框", [
       await narrationField(page).fill(NINE_LINES);
       await expectAllLinesReachable(narrationField(page));
     },
-    screenshot: { name: "auto-textarea-nine-lines", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "容器变窄后重新计算高度",

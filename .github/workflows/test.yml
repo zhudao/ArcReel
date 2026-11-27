@@ -10,10 +10,6 @@ on:
         description: 忽略路径裁剪，全量运行所有 job
         type: boolean
         default: false
-    secrets:
-      CODECOV_TOKEN:
-        description: Codecov 上传令牌；缺失时覆盖率上传步骤不阻断
-        required: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -26,55 +22,48 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     outputs:
-      workflow: ${{ steps.domains.outputs.workflow }}
-      backend: ${{ steps.domains.outputs.backend }}
-      frontend: ${{ steps.domains.outputs.frontend }}
-      docker: ${{ steps.domains.outputs.docker }}
-      website: ${{ steps.domains.outputs.website }}
+      recording: ${{ steps.reuse.outputs.reused != 'true' && steps.domains.outputs.recording || 'false' }}
+      workflow: ${{ steps.reuse.outputs.reused != 'true' && steps.domains.outputs.workflow || 'false' }}
+      backend: ${{ steps.reuse.outputs.reused != 'true' && steps.domains.outputs.backend || 'false' }}
+      frontend: ${{ steps.reuse.outputs.reused != 'true' && steps.domains.outputs.frontend || 'false' }}
+      docker: ${{ steps.reuse.outputs.reused != 'true' && steps.domains.outputs.docker || 'false' }}
+      website: ${{ steps.reuse.outputs.reused != 'true' && steps.domains.outputs.website || 'false' }}
       full: ${{ steps.scope.outputs.full }}
-      coverage: ${{ steps.scope.outputs.coverage }}
-      e2e_viewports: ${{ steps.scope.outputs.e2e_viewports }}
-      e2e_shards: ${{ steps.scope.outputs.e2e_shards }}
-      e2e_shard_total: ${{ steps.scope.outputs.e2e_shard_total }}
+      reused: ${{ steps.reuse.outputs.reused }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - name: Decide run scope
-        # 分片数按每片约 115 条用例定：单 worker 下 2560×1440 一档约 3 秒一条，最慢一片约 7 分钟，
-        # 与 Backend tests (integration) 相当。三档 921 条分 8 片，五档 1521 条分 13 片。
-        # 用例数明显变化时重算。
         id: scope
         env:
           FULL: ${{ inputs.full == true || (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')) }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [[ "$FULL" == "true" ]]; then
-            viewports=all
-            shard_total=13
-          else
-            viewports=screenshot
-            shard_total=8
-          fi
-          if [[ "$FULL" == "true" || "$EVENT_NAME" != "pull_request" ]]; then
-            coverage=true
-          else
-            coverage=false
-          fi
-          {
-            echo "full=$FULL"
-            echo "coverage=$coverage"
-            echo "e2e_viewports=$viewports"
-            echo "e2e_shards=$(jq -cn --argjson total "$shard_total" '[range(1; $total + 1)]')"
-            echo "e2e_shard_total=$shard_total"
-          } >> "$GITHUB_OUTPUT"
+        run: echo "full=$FULL" >> "$GITHUB_OUTPUT"
       - uses: ./.github/actions/domain-filter
         id: domains
         with:
           full: ${{ steps.scope.outputs.full }}
+      - name: PR checkout ${{ github.event.number }} ${{ github.sha }}
+        if: github.event_name == 'pull_request'
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Verify equivalent PR checks
+        id: reuse
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.forced && steps.scope.outputs.full != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          DOMAINS: ${{ toJSON(steps.domains.outputs) }}
+        run: python3 scripts/ci_reuse.py || echo "reused=false" >> "$GITHUB_OUTPUT"
+      - name: Observe static gate changes
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          git diff --name-only --no-renames -z HEAD^1 HEAD | python3 scripts/observe_gates.py >> "$GITHUB_STEP_SUMMARY"
 
   workflow-static:
     needs: changes
@@ -123,10 +112,13 @@ jobs:
       - name: Classification marker gate (collect-only)
         # 必须不带 -n：xdist 的收集发生在各 worker 内，conftest 的 UsageError 会撞上
         # dsession 断言并丢失违规清单。-qq 保留收集错误且避免输出上万条 nodeid。
-        run: uv run python -m pytest --collect-only -qq
+        run: uv run python -m pytest --collect-only --assert=plain -qq
 
       - name: Lint & format check
         run: uv run ruff check . && uv run ruff format --check .
+
+      - name: Capability error codes and template parameters
+        run: uv run python -m scripts.audit_capability_codes
 
       - name: Type check (basedpyright)
         run: uv run basedpyright --warnings
@@ -149,6 +141,8 @@ jobs:
         run: uv run python scripts/lint_agent_runtime_profile.py
 
   conventions:
+    needs: changes
+    if: needs.changes.outputs.reused != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -249,55 +243,29 @@ jobs:
         timeout-minutes: 20
         env:
           ARCREEL_TEST_HANG_DUMP_DIR: ${{ runner.temp }}/pytest-hang
-          COVERAGE: ${{ needs.changes.outputs.coverage }}
-          SUITE: ${{ matrix.suite }}
         run: |
-          coverage_args=()
-          if [[ "$COVERAGE" == "true" ]]; then
-            coverage_args=(
-              --cov=lib --cov=server --cov=arcreel_market_core --cov=arcreel_catalog_core
-              --cov-report=term-missing "--cov-report=xml:coverage-${SUITE}.xml"
-            )
-          fi
           uv run python -m pytest ${{ matrix.path }} ${{ matrix.extra_args }} \
-            -n 4 --dist loadfile --max-worker-restart=0 "${coverage_args[@]}"
+            -n 4 --dist loadfile --max-worker-restart=0
 
       - name: Hang and crash diagnostics
         if: failure() || cancelled()
         env:
           DUMP_DIR: ${{ runner.temp }}/pytest-hang
-        run: |
-          shopt -s nullglob
-          for f in "$DUMP_DIR"/*.progress; do
-            echo "::group::$(basename "$f") 最后的进展"
-            tail -n 5 "$f"
-            echo "::endgroup::"
-          done
-          for f in "$DUMP_DIR"/*.stacks "$DUMP_DIR"/*.SIG*; do
-            [ -s "$f" ] || continue
-            echo "===== $(basename "$f")"
-            cat "$f"
-          done
-          sudo dmesg --ctime | grep -iE 'out of memory|oom|killed process|segfault' || echo "内核日志里没有 OOM 或段错误记录"
-
-      - name: Upload backend coverage
-        # unit/integration 使用同一 flag；Codecov 按 commit 合并，无需本地聚合作业。
-        if: needs.changes.outputs.coverage == 'true'
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage-${{ matrix.suite }}.xml
-          flags: backend
-          fail_ci_if_error: false
+        run: bash .github/scripts/pytest-diagnostics.sh
 
   postgres-compat:
+    name: postgres-compat (${{ matrix.postgres }})
     needs: changes
     if: needs.changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ${{ fromJSON(needs.changes.outputs.full == 'true' && '[16,17,18]' || '[16]') }}
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: arcreel
           POSTGRES_PASSWORD: arcreel
@@ -336,29 +304,11 @@ jobs:
           uv run alembic upgrade head
 
       - name: Run dialect-sensitive tests against Postgres
-        env:
-          COVERAGE: ${{ needs.changes.outputs.coverage }}
-        run: |
-          coverage_args=()
-          if [[ "$COVERAGE" == "true" ]]; then
-            coverage_args=(--cov=lib --cov=server --cov-report=xml:coverage-pg.xml)
-          fi
-          uv run python -m pytest -v \
-            -m "uses_db and not sqlite_only" \
-            -n 4 --dist loadfile --max-worker-restart=0 "${coverage_args[@]}"
-
-      - name: Upload PG coverage
-        if: needs.changes.outputs.coverage == 'true'
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage-pg.xml
-          flags: postgres
-          fail_ci_if_error: false
+        run: uv run python -m pytest -v -m "uses_db and not sqlite_only" -n 4 --dist loadfile --max-worker-restart=0
 
   frontend-static:
     needs: changes
-    if: needs.changes.outputs.frontend == 'true'
+    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -381,16 +331,30 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Lint
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: frontend
         run: pnpm lint
 
       - name: Knip
+        if: needs.changes.outputs.frontend == 'true'
         working-directory: frontend
         run: pnpm knip
 
       - name: Build
         working-directory: frontend
-        run: pnpm build
+        run: |
+          pnpm build
+          node e2e/build-artifact.ts pack "$RUNNER_TEMP/browser-build"
+
+      - name: Upload shared browser build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-build-${{ github.run_id }}-${{ github.sha }}
+          path: ${{ runner.temp }}/browser-build/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 7
 
   frontend-tests:
     needs: changes
@@ -418,36 +382,18 @@ jobs:
 
       - name: Run tests
         working-directory: frontend
-        env:
-          COVERAGE: ${{ needs.changes.outputs.coverage }}
-        run: |
-          if [[ "$COVERAGE" == "true" ]]; then
-            pnpm test:coverage
-          else
-            pnpm test
-          fi
-
-      - name: Upload frontend coverage
-        if: needs.changes.outputs.coverage == 'true'
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: frontend/coverage/lcov.info
-          flags: frontend
-          fail_ci_if_error: false
+        run: pnpm test
 
   frontend-e2e:
-    # 页面级验收套件（溢出探针 + axe + 区域截图比对）。镜像版本必须与 frontend/package.json 的
-    # @playwright/test 一致，否则找不到浏览器；升级 @playwright/test 时同步改这里。
-    name: frontend-e2e (${{ matrix.shard }}/${{ needs.changes.outputs.e2e_shard_total }})
-    needs: changes
+    name: frontend-e2e (${{ matrix.shard }}/2)
+    needs: [changes, frontend-static]
     if: needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.changes.outputs.e2e_shards) }}
+        shard: [1, 2]
     container:
       image: mcr.microsoft.com/playwright:v1.63.0-noble
       options: --user 1001 --ipc=host
@@ -456,27 +402,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-        with:
-          version: 10
-
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-          cache: "pnpm"
-          cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - name: Install dependencies
-        working-directory: frontend
-        run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/restore-browser-build
 
       - name: Run page-level suite
         working-directory: frontend
         env:
-          E2E_SCREENSHOTS: "1"
-          E2E_VIEWPORTS: ${{ needs.changes.outputs.e2e_viewports }}
-          SHARD: ${{ matrix.shard }}/${{ needs.changes.outputs.e2e_shard_total }}
-        run: pnpm e2e --shard="$SHARD"
+          SHARD: ${{ matrix.shard }}/2
+        run: node node_modules/@playwright/test/cli.js test --grep-invert "@viewport-contract" --shard="$SHARD"
+
+      - name: Run single-worker viewport contracts
+        if: matrix.shard == 1
+        working-directory: frontend
+        run: node node_modules/@playwright/test/cli.js test --project=viewport-contracts --workers=1
 
       - name: Upload Playwright report
         if: failure()
@@ -486,10 +427,61 @@ jobs:
           path: frontend/playwright-report/
           retention-days: 30
 
-  e2e-record-drift:
-    name: E2E fixture recording drift
-    needs: changes
+  e2e-live:
+    needs: [changes, frontend-static]
     if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      UV_NO_DEV: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - uses: ./.github/actions/restore-browser-build
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install browser and backend dependencies
+        working-directory: frontend
+        run: |
+          node node_modules/@playwright/test/cli.js install --with-deps --only-shell chromium
+          sudo apt-get install -y bubblewrap socat
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          uv sync --frozen
+
+      - name: Run live business flows
+        working-directory: frontend
+        shell: bash
+        env:
+          E2E_LIVE: "1"
+        run: |
+          set -o pipefail
+          node node_modules/@playwright/test/cli.js test --project=live --global-timeout=180000 2>&1 | tee "$RUNNER_TEMP/e2e-live.log"
+
+      - name: Upload live diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-live-diagnostics
+          path: |
+            ${{ runner.temp }}/e2e-live.log
+            frontend/test-results/
+            frontend/playwright-report/
+          retention-days: 7
+
+  e2e-record-drift:
+    name: E2E fixture freshness and determinism
+    needs: changes
+    if: needs.changes.outputs.reused != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -517,7 +509,12 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Compare committed fixtures with current backend
+        working-directory: frontend
+        run: node e2e/record-fixtures.ts --freshness
+
       - name: Record twice and compare
+        if: needs.changes.outputs.recording == 'true'
         working-directory: frontend
         run: node e2e/record-fixtures.ts --check
 
@@ -615,7 +612,8 @@ jobs:
           exit-code: "0"
 
   release-integrity:
-    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -662,6 +660,7 @@ jobs:
         frontend-static,
         frontend-tests,
         frontend-e2e,
+        e2e-live,
         e2e-record-drift,
         docker-verify,
         website-checks,
@@ -669,10 +668,11 @@ jobs:
       ]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Verify required jobs
-        run: |
-          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more required jobs failed"
-            exit 1
-          fi
-          echo "All required jobs passed or were skipped (domain not affected)"
+        env:
+          JOBS: ${{ toJSON(needs) }}
+        run: python3 -m scripts.ci_required

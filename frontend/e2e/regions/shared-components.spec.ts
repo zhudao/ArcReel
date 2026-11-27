@@ -1,22 +1,16 @@
 import type { Page } from "@playwright/test";
 import { clearAgentOverlay, waitForEntrance } from "../support/region-helpers.ts";
-import { FIXED_NOW, recorded } from "../support/recorded.ts";
+import { FIXED_NOW } from "../support/recorded.ts";
 import { defineRegionScenarios } from "../support/scenarios.ts";
 import { expect, type ApiOverrides } from "../support/test.ts";
+import { recordedDemoScript, workspaceOverride } from "../support/workspace-override.ts";
 
 const EPISODE_PATH = "/app/projects/demo/episodes/1";
 const PLAN_PATH = `${EPISODE_PATH}?view=plan`;
-const PROJECT = "GET /api/v1/projects/demo";
 const SCRIPT_REVIEW = "GET /api/v1/projects/demo/episodes/1/script-review";
 const TASKS = "GET /api/v1/tasks?page_size=200&project_name=demo";
 
-interface RecordedProject {
-  project: Record<string, unknown> & { episodes: Record<string, unknown>[] };
-  scripts: Record<string, Record<string, unknown>>;
-}
-
-const recordedProject = recorded<RecordedProject>("project-demo.json");
-const recordedScript = recordedProject.scripts["episode_1.json"];
+const recordedScript = recordedDemoScript().script;
 
 const BASE: ApiOverrides = {
   "GET /api/v1/projects/demo/events/stream": { status: 404, body: { detail: "页面级套件不回放事件流" } },
@@ -59,13 +53,7 @@ const segments = Array.from({ length: SHOT_COUNT }, (_, i) => ({
 
 const SCRIPTED: ApiOverrides = {
   ...BASE,
-  [PROJECT]: {
-    status: 200,
-    body: {
-      ...recordedProject,
-      scripts: { "episode_1.json": { ...recordedScript, segments } },
-    },
-  },
+  ...workspaceOverride({}, { scripts: { "episode_1.json": { ...recordedScript, segments } } }),
 };
 
 function task(overrides: Record<string, unknown>) {
@@ -213,21 +201,16 @@ const NEW_ASSETS: ApiOverrides = {
 
 const AD_PROJECT: ApiOverrides = {
   ...BASE,
-  [PROJECT]: {
-    status: 200,
-    body: {
-      ...recordedProject,
-      project: {
-        ...recordedProject.project,
-        content_mode: "ad",
-        target_duration: 30,
-        brief: "面向通勤年轻人的气泡水，调性轻快，结尾引导到小程序领券。",
-        products: {},
-        overview: null,
-      },
-      scripts: { "episode_1.json": { ...recordedScript, content_mode: "ad", segments } },
+  ...workspaceOverride(
+    {
+      content_mode: "ad",
+      target_duration: 30,
+      brief: "面向通勤年轻人的气泡水，调性轻快，结尾引导到小程序领券。",
+      products: {},
+      overview: null,
     },
-  },
+    { scripts: { "episode_1.json": { ...recordedScript, content_mode: "ad", segments } } },
+  ),
 };
 
 const reviewBar = (page: Page) => page.locator("header").filter({ hasText: "确认阻断项" });
@@ -244,6 +227,8 @@ async function reviewBlockingReady(page: Page) {
 defineRegionScenarios("共享组件：确认阻断项与新增资产", [
   {
     name: "确认阻断项：状态条列出逐条跳转并禁用确认，整集阻断置顶，长规划只在视图内滚动",
+    viewports: "both",
+    a11y: true,
     path: PLAN_PATH,
     api: BLOCKING_ISSUES,
     ready: reviewBlockingReady,
@@ -257,7 +242,6 @@ defineRegionScenarios("共享组件：确认阻断项与新增资产", [
       await expect(page.getByText("本集缺少结尾钩子。")).toBeVisible();
       await expect(page.getByText("降级提示")).toBeVisible();
     },
-    screenshot: { name: "shared-review-blocking-bar", target: reviewBar },
   },
   {
     name: "确认阻断项：空规划无条目时仍置顶展示整集阻断并支持交给 Agent 增量修复",
@@ -309,13 +293,13 @@ defineRegionScenarios("共享组件：确认阻断项与新增资产", [
       await expect(section.getByRole("combobox", { name: "本体角色" })).toBeVisible();
       await section.getByRole("heading", { name: "本集新增资产" }).scrollIntoViewIfNeeded();
     },
-    screenshot: { name: "shared-new-assets", target: (page) => newAssets(page).getByRole("region", { name: "角色", exact: true }) },
   },
 ]);
 
 defineRegionScenarios("共享组件：集页对话框与提示", [
   {
     name: "「编写提示词」：自选多条列出四十条分镜，只在列表内滚动",
+    viewports: "both",
     path: EPISODE_PATH,
     api: SCRIPTED,
     ready: async (page) => {
@@ -331,7 +315,6 @@ defineRegionScenarios("共享组件：集页对话框与提示", [
       await expect(list.getByRole("checkbox")).toHaveCount(SHOT_COUNT);
       await expect(dialog.getByRole("button", { name: "交给 Agent" })).toBeInViewport();
     },
-    screenshot: { name: "shared-prompt-authoring", target: authoringDialog },
   },
   {
     name: "分镜图查看大图：占满视口的查看器，按 Esc 关闭",
@@ -349,7 +332,6 @@ defineRegionScenarios("共享组件：集页对话框与提示", [
       await waitForEntrance(dialog);
       await expect(dialog.getByRole("img")).toBeVisible();
     },
-    screenshot: { name: "shared-image-viewer", target: viewer },
   },
   {
     name: "文本任务失败：集页顶部给出原因与去登记最大输出长度的链接",
@@ -364,10 +346,10 @@ defineRegionScenarios("共享组件：集页对话框与提示", [
       await expect(note.getByRole("link", { name: "去登记最大输出长度" })).toBeVisible();
       await expect(note.getByRole("button", { name: "关闭" })).toBeVisible();
     },
-    screenshot: { name: "shared-text-task-failure", target: failureNote },
   },
   {
     name: "广告项目「重新生成脚本」对话框：附加指令只随本次提交",
+    a11y: true,
     path: EPISODE_PATH,
     api: AD_PROJECT,
     ready: async (page) => {
@@ -381,7 +363,6 @@ defineRegionScenarios("共享组件：集页对话框与提示", [
       await dialog.getByRole("textbox").fill(LONG_TEXT.repeat(3));
       await expect(dialog.getByRole("button", { name: "交给 Agent" })).toBeInViewport();
     },
-    screenshot: { name: "shared-ad-script-dialog", target: adScriptDialog },
   },
   {
     name: "交给 Agent 预填多行附加指令后输入框自动撑高",

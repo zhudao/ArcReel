@@ -152,6 +152,23 @@ test("drama script review loads blocking issues inline, unlocks confirm after sa
   await expect(page.getByText("确认阻断项")).toHaveCount(0);
   await expect(confirmButton).toBeEnabled();
 
+  const workspacePath = `${API}/projects/${project}/workspace`;
+  const beforeConfirm = await request.get(workspacePath, { params: { episodes: 1 } });
+  await expect(beforeConfirm).toBeOK();
+  const segmented = await beforeConfirm.json() as { summary: { episodes: { script_status: string }[] } };
+  expect(segmented.summary.episodes[0].script_status).toBe("segmented");
+  let committed = false;
+  await page.route(`**${workspacePath}?episodes=1`, async (route) => {
+    if (committed) await route.continue();
+    else await route.fulfill({ json: segmented });
+  });
+  await page.route(`**/episodes/1/script-review/confirm`, async (route) => {
+    const response = await route.fetch();
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    committed = true;
+    await route.fulfill({ response });
+  });
+
   const confirmResponse = page.waitForResponse(
     (reply) =>
       reply.request().method() === "POST" &&
@@ -161,6 +178,7 @@ test("drama script review loads blocking issues inline, unlocks confirm after sa
   expect((await confirmResponse).ok()).toBe(true);
 
   await expect(page.getByRole("tab", { name: "分镜" })).toHaveAttribute("aria-selected", "true", { timeout: 15_000 });
+  await expect(page.getByRole("navigation", { name: "分镜列表" }).getByText("待编写", { exact: true })).toBeVisible();
 
   const projectResp = await request.get(`${API}/projects/${project}`);
   await expect(projectResp).toBeOK();
@@ -353,7 +371,10 @@ test("v20 project migrated to v21 moves retired invalid drafts to trash and proc
   });
 
   await page.goto(`/app/projects/${project}/episodes/1?view=plan`);
-  await expect(page.getByRole("button", { name: "本次升级调整了 1 项内容" })).toBeVisible({ timeout: 15_000 });
+  await page.getByRole("button", { name: /^本次升级调整了 \d+ 项内容$/ }).click();
+  const report = page.getByRole("dialog");
+  await expect(report.getByText(/script_plan_segments\.invalid\.json/)).toBeVisible();
+  await report.getByRole("button", { name: "关闭", exact: true }).click();
   await expect(page.getByText("待确认", { exact: true })).toBeVisible();
   await expect(page.getByRole("textbox", { name: "小说原文" })).toHaveValue(sourceText);
 

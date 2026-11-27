@@ -317,6 +317,7 @@ class EpisodeSummary(BaseModel):
     episode: int
     script_status: EpisodeScriptStatus
     status: EpisodeProductionStatus
+    needs_replan: int = Field(default=0, exclude=True)
     item_count: int
     duration_seconds: int
     storyboards: ArtifactCount
@@ -814,6 +815,7 @@ class WorkflowStateService:
         episode: int,
         resolver: ArtifactComparer | None,
         issues: list[WorkflowBlocker],
+        count_replan_as_stale: bool = True,
     ) -> Iterator[tuple[str, str]]:
         if kind is None:
             return
@@ -822,7 +824,7 @@ class WorkflowStateService:
             resource_id = item.get(id_field)
             if not isinstance(resource_id, str) or not resource_id:
                 continue
-            if kind == "video_units" and item.get("needs_replan") is True:
+            if count_replan_as_stale and kind == "video_units" and item.get("needs_replan") is True:
                 yield resource_id, "stale"
                 continue
             artifact_path = get_generated_assets(item).get(field)
@@ -858,9 +860,18 @@ class WorkflowStateService:
         episode: int,
         resolver: ArtifactComparer | None,
         issues: list[WorkflowBlocker],
+        count_replan_as_stale: bool = True,
     ) -> dict[str, Any]:
         return cls._collect_media(
-            cls._media_states(items, kind, field, episode=episode, resolver=resolver, issues=issues)
+            cls._media_states(
+                items,
+                kind,
+                field,
+                episode=episode,
+                resolver=resolver,
+                issues=issues,
+                count_replan_as_stale=count_replan_as_stale,
+            )
         )
 
     def get_status(self, project_name: str, episode: int | None = None) -> WorkflowStatus:
@@ -960,7 +971,12 @@ class WorkflowStateService:
         self,
         project_name: str,
         *,
-        preloaded_scripts: Mapping[str, dict[str, Any]] | None = None,
+        preloaded_scripts: Mapping[str, dict[str, Any] | None] | None = None,
+        detail_scripts: dict[str, dict[str, Any] | None] | None = None,
+        project: dict[str, Any] | None = None,
+        workspace: bool = False,
+        episode_numbers: list[int] | None = None,
+        media_paths: set[str] | None = None,
         currency: ProjectSummaryCurrency = "verified",
     ) -> ProjectSummary:
         """项目在广度视图上的投影（见 ``ProjectSummary``）。
@@ -973,12 +989,22 @@ class WorkflowStateService:
         与在场，不读产物内容（在场检查只探一个字节）。列表页取后者，其余取前者。
         """
 
-        project = self.pm.load_project(project_name)
+        project = self.pm.load_project(project_name) if project is None else project
         project_path = self.pm.get_project_path(project_name)
+        episodes = self._episodes(project, [])
+        if episode_numbers is not None:
+            requested = set(episode_numbers)
+            episodes = [pair for pair in episodes if pair[0] in requested]
+            if (
+                not requested
+                or min(requested) < 1
+                or len(requested) != len(episode_numbers)
+                or len(episodes) != len(requested)
+            ):
+                raise WorkflowRequestError("expected distinct positive episode numbers from the current ledger")
         failure = load_migration_verdict(project_path, project=project)
         if failure is not None:
-            return self._migration_blocked_summary(project, self._episodes(project, []), failure)
-        episodes = self._episodes(project, [])
+            return self._migration_blocked_summary(project, episodes, failure)
         try:
             resolver: ArtifactComparer | None = (
                 RegisteredArtifactResolver(project_path, project)
@@ -987,9 +1013,19 @@ class WorkflowStateService:
             )
         except (ArtifactManifestError, OSError, RuntimeError, sqlite3.DatabaseError, TypeError, ValueError):
             resolver = None
-        assets = self._asset_counts(project_path, project, resolver)
+        assets = self._asset_counts(project_path, project, resolver) if episode_numbers is None else {}
         episode_summaries = []
         for number, entry in episodes:
+            script_file = entry.get("script_file")
+            if detail_scripts is not None and script_file and script_file not in detail_scripts:
+                path = f"scripts/{self.pm.normalize_script_filename(script_file)}"
+                snapshot = resolver.script_snapshot(path) if isinstance(resolver, ArtifactCurrencyResolver) else None
+                try:
+                    detail_scripts[script_file] = self.pm.load_script(
+                        project_name, script_file, snapshot=snapshot.content_bytes if snapshot else None
+                    )
+                except FileNotFoundError:
+                    detail_scripts[script_file] = None
             episode_summaries.append(
                 self._episode_summary(
                     project_name,
@@ -997,8 +1033,10 @@ class WorkflowStateService:
                     project_path,
                     number,
                     entry,
+                    workspace=workspace,
+                    media_paths=media_paths,
                     resolver=resolver,
-                    preloaded_scripts=preloaded_scripts,
+                    preloaded_scripts=detail_scripts if detail_scripts is not None else preloaded_scripts,
                 )
             )
             if isinstance(resolver, ArtifactCurrencyResolver):
@@ -1035,10 +1073,13 @@ class WorkflowStateService:
         number: int,
         entry: dict[str, Any],
         *,
+        workspace: bool,
+        media_paths: set[str] | None = None,
         resolver: ArtifactComparer | None,
-        preloaded_scripts: Mapping[str, dict[str, Any]] | None,
+        preloaded_scripts: Mapping[str, dict[str, Any] | None] | None,
     ) -> EpisodeSummary:
         script_status = self._episode_script_status(project, project_path, number, entry, resolver)
+        script = None
         items: list[dict[str, Any]] = []
         kind: str | None = None
         if script_status == "generated":
@@ -1053,6 +1094,11 @@ class WorkflowStateService:
                     items = (
                         [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
                     )
+        if media_paths is not None:
+            for item in items:
+                generated = item.get("generated_assets")
+                if isinstance(generated, dict):
+                    media_paths.update(path for path in generated.values() if isinstance(path, str))
         storyboards = (
             ArtifactCount.of(
                 self._media_collection(
@@ -1068,6 +1114,7 @@ class WorkflowStateService:
             if project.get("generation_mode") == "storyboard"
             else ArtifactCount.zero()
         )
+        replan = sum(item.get("needs_replan") is True for item in items) if kind == "video_units" else 0
         videos = ArtifactCount.of(
             self._media_collection(
                 items,
@@ -1076,18 +1123,26 @@ class WorkflowStateService:
                 episode=number,
                 resolver=resolver,
                 issues=[],
+                count_replan_as_stale=not workspace,
             ),
             total=len(items),
         )
+        status = _episode_production_status(
+            script_status,
+            storyboards,
+            videos,
+            has_edit_timeline=not workspace and EditTimelineStore(self.pm, project_name).has_documents(number),
+        )
+        if workspace and script is not None and items and videos.available + replan >= len(items):
+            active = _ActiveScript(None, path=entry["script_file"], payload=script)
+            facts = self._episode_facts(project_name, project, project_path, (number, entry), resolver, active)
+            if facts.complete:
+                status = "completed"
         return EpisodeSummary(
             episode=number,
             script_status=script_status,
-            status=_episode_production_status(
-                script_status,
-                storyboards,
-                videos,
-                has_edit_timeline=EditTimelineStore(self.pm, project_name).has_documents(number),
-            ),
+            status=status,
+            needs_replan=replan,
             item_count=len(items),
             duration_seconds=script_duration_total(kind, items) if kind is not None else 0,
             storyboards=storyboards,
@@ -1098,7 +1153,7 @@ class WorkflowStateService:
         self,
         project_name: str,
         entry: dict[str, Any],
-        preloaded_scripts: Mapping[str, dict[str, Any]] | None,
+        preloaded_scripts: Mapping[str, dict[str, Any] | None] | None,
     ) -> dict[str, Any] | None:
         script_file = entry.get("script_file")
         if not isinstance(script_file, str) or not script_file:

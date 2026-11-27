@@ -1,11 +1,13 @@
 
 import type {
   FailureObservation,
+  ItemLocationStatus,
   ReferenceProjectionAdmission,
 } from "@/types";
 import i18n from "@/i18n";
 import { useProjectsStore } from "@/stores/projects-store";
-import { findEpisodeItem } from "@/utils/episode-item";
+import { useItemLocationsStore } from "@/stores/item-locations-store";
+import { findEpisodeItem, isLocatableItemId } from "@/utils/episode-item";
 
 export interface ErrorResponse {
   code?: string;
@@ -27,6 +29,10 @@ export interface SpeechAdmissionLocation {
 export interface SpeechAdmissionProblem {
   code: "mixed_speech" | "needs_replan" | "parse_failed" | "empty_speaker";
   unit_id: string;
+  episode?: number | null;
+  item_id?: string | null;
+  position?: number | null;
+  location_status?: ItemLocationStatus;
   locations: SpeechAdmissionLocation[];
   reason: string;
   action: string;
@@ -35,6 +41,10 @@ export interface SpeechAdmissionProblem {
 export interface SpeechAdmission {
   allowed: false;
   unit_id: string;
+  episode?: number | null;
+  item_id?: string | null;
+  position?: number | null;
+  location_status?: ItemLocationStatus;
   mode: null;
   problems: SpeechAdmissionProblem[];
 }
@@ -43,6 +53,10 @@ export interface ScriptEditProblem {
   code: string;
   operation_index: number | null;
   unit_id: string | null;
+  episode?: number | null;
+  item_id?: string | null;
+  position?: number | null;
+  location_status?: ItemLocationStatus;
   locations: SpeechAdmissionLocation[];
   reason: string;
   next_action: string;
@@ -56,6 +70,20 @@ export interface ScriptEditResult {
   revision: string;
   affected_ids: string[];
   problems: ScriptEditProblem[];
+}
+
+export async function locateDiagnosticItems(
+  project: string | null, result: SpeechAdmission | ScriptEditResult, signal?: AbortSignal,
+): Promise<void> {
+  const { currentProjectName, currentScripts } = useProjectsStore.getState();
+  if (!project || project !== currentProjectName || signal?.aborted) return;
+  const ids = result.problems.flatMap((problem) => {
+    const id = problem.unit_id;
+    if (problem.location_status === "deleted" || problem.location_status === "ambiguous") return [];
+    if (!id || typeof problem.position === "number" || !isLocatableItemId(id) || findEpisodeItem(currentScripts, id)) return [];
+    return [id];
+  });
+  if (ids.length) await useItemLocationsStore.getState().locateNow(project, ids, signal);
 }
 
 export class ScriptEditCommandError extends Error {
@@ -258,8 +286,15 @@ function formatSpeechAdmission(admission: SpeechAdmission): string {
     parse_failed: "speech_admission_parse_failed",
     empty_speaker: "speech_admission_empty_speaker",
   }[problem.code];
-  const position = findEpisodeItem(useProjectsStore.getState().currentScripts, problem.unit_id)?.position;
-  return i18n.t(`dashboard:${key}`, { position: position ?? i18n.t("common:deleted"), location });
+  const position =
+    typeof problem.position === "number"
+      ? problem.position
+      : typeof admission.position === "number" && (admission.item_id ?? admission.unit_id) === problem.unit_id
+        ? admission.position
+        : findEpisodeItem(useProjectsStore.getState().currentScripts, problem.unit_id)?.position;
+  const projectName = useProjectsStore.getState().currentProjectName;
+  const cached = projectName ? useItemLocationsStore.getState().getLocation(projectName, problem.unit_id) : undefined;
+  return i18n.t(`dashboard:${key}`, { position: position ?? cached?.position ?? problem.unit_id, location });
 }
 
 function formatScriptEditResult(result: ScriptEditResult): string {
@@ -280,11 +315,22 @@ function formatScriptEditResult(result: ScriptEditResult): string {
       .map((problem) => ({
         code: problem.code as SpeechAdmissionProblem["code"],
         unit_id: problem.unit_id ?? unitId,
+        episode: problem.episode,
+        item_id: problem.item_id,
+        position: problem.position,
         locations: problem.locations,
         reason: problem.reason,
         action: problem.next_action,
       }));
-    return formatSpeechAdmission({ allowed: false, unit_id: unitId, mode: null, problems });
+    return formatSpeechAdmission({
+      allowed: false,
+      unit_id: unitId,
+      episode: first.episode,
+      item_id: first.item_id,
+      position: first.position,
+      mode: null,
+      problems,
+    });
   }
   const key = {
     revision_conflict: "script_edit_revision_conflict",

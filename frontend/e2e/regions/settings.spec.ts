@@ -139,16 +139,18 @@ async function settingsReady(page: Page) {
 defineRegionScenarios("全局设置", [
   {
     name: "默认落在全出血档的供应商，侧栏与供应商列表各自滚动",
+    viewports: "both",
+    a11y: true,
     path: "/app/settings",
     ready: async (page) => {
       await settingsReady(page);
       const sidebar = page.getByRole("navigation", { name: "设置" });
       await expect(sidebar.getByRole("link", { name: "供应商" })).toHaveAttribute("aria-current", "page");
     },
-    screenshot: { name: "settings-sidebar", target: (page) => page.getByRole("navigation", { name: "设置" }) },
   },
   {
     name: "限宽档的保存栏固定在外壳底行，表单滚动时保存按钮始终可见",
+    viewports: "both",
     path: settings("default-models"),
     ready: async (page) => {
       await settingsReady(page);
@@ -165,6 +167,7 @@ defineRegionScenarios("全局设置", [
   },
   {
     name: "通用分区没有保存栏，外壳不显示底行",
+    a11y: true,
     path: settings("general"),
     ready: async (page) => {
       await settingsReady(page);
@@ -173,7 +176,6 @@ defineRegionScenarios("全局设置", [
     act: async (page) => {
       await expect(page.getByRole("button", { name: "保存" })).toHaveCount(0);
     },
-    screenshot: { name: "settings-general", target: (page) => page.getByRole("main") },
   },
   {
     name: "打开界面语言下拉，选项留在视口内",
@@ -202,10 +204,6 @@ defineRegionScenarios("全局设置", [
       await expect(flagged).toHaveText(["供应商", "ArcReel Agent"]);
       await expect(page.getByRole("note", { name: "配置不完整" })).toBeInViewport();
     },
-    screenshot: {
-      name: "settings-config-issue-notice",
-      target: (page) => page.getByRole("note", { name: "配置不完整" }),
-    },
   },
   {
     name: "没有可用供应商时，默认模型各通道显示空状态并链接到供应商",
@@ -219,7 +217,6 @@ defineRegionScenarios("全局设置", [
       await expect(page.getByRole("note", { name: "配置不完整" })).toHaveCount(0);
       await expect(main.getByRole("link", { name: "前往「供应商」配置" })).toHaveCount(4);
     },
-    screenshot: { name: "settings-default-models-empty", target: (page) => page.getByRole("main") },
   },
   {
     name: "模型多且名称长时，默认模型的细分区展开、长名称截断不撑宽内容列",
@@ -238,7 +235,6 @@ defineRegionScenarios("全局设置", [
       await main.evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
       await expect(main.getByRole("spinbutton", { name: "配音语速（可选）" })).toBeInViewport();
     },
-    screenshot: { name: "settings-default-models", target: (page) => page.getByRole("main") },
   },
   {
     name: "打开模型多的默认视频模型下拉，列表在弹层里滚动到底，弹层留在视口内",
@@ -256,7 +252,6 @@ defineRegionScenarios("全局设置", [
       await listbox.evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
       await expect(listbox.getByRole("option").last()).toBeInViewport();
     },
-    screenshot: { name: "settings-default-models-combobox" },
   },
   {
     name: "编辑默认模型后切换分区，弹出未保存修改的拦截对话框",
@@ -287,7 +282,6 @@ defineRegionScenarios("全局设置", [
       await main.evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
       await expect(main.getByRole("link", { name: "https://github.com/ArcReel/ArcReel" })).toBeInViewport();
     },
-    screenshot: { name: "settings-about-version", target: (page) => page.getByRole("region", { name: "当前版本" }) },
   },
   {
     name: "关于：展开很长的发布说明，内容随分区滚动到底，长链接不撑宽",
@@ -317,6 +311,7 @@ defineRegionScenarios("全局设置", [
   },
   {
     name: "素材库与存储：新增图片保存到对象存储，长桶名截断不撑宽内容列",
+    a11y: true,
     path: ASSET_LIBRARY,
     api: REMOTE_STORAGE,
     ready: assetLibraryReady,
@@ -324,10 +319,10 @@ defineRegionScenarios("全局设置", [
       const targets = page.getByRole("radiogroup", { name: "新增图片保存位置" });
       await expect(targets.getByRole("radio", { name: /^对象存储/ })).toHaveAttribute("aria-checked", "true");
     },
-    screenshot: { name: "settings-asset-library-remote", target: (page) => page.getByRole("main") },
   },
   {
     name: "素材库与存储：改桶时确认清理并提示进行中的入库任务",
+    viewports: "both",
     path: ASSET_LIBRARY,
     api: REMOTE_STORAGE,
     ready: assetLibraryReady,
@@ -381,7 +376,6 @@ defineRegionScenarios("全局设置", [
       await contentMode.getByRole("button", { name: "旁白/解说" }).click();
       await expect(contentMode.getByRole("button", { name: "旁白/解说" })).toHaveAttribute("aria-pressed", "true");
     },
-    screenshot: { name: "settings-prompt-templates", target: (page) => page.getByRole("main") },
   },
   {
     name: "提示词模板详情：展开片段与输出结构后滚动到底",
@@ -397,7 +391,6 @@ defineRegionScenarios("全局设置", [
       await main.evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
       await expect(main.getByRole("table")).toBeInViewport();
     },
-    screenshot: { name: "settings-prompt-template-detail", target: (page) => page.getByRole("main") },
   },
   {
     name: "提示词模板详情：打开片段的取值下拉",

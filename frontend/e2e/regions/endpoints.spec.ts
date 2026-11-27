@@ -1,15 +1,11 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { Page } from "@playwright/test";
 import { defineRegionScenarios } from "../support/scenarios.ts";
-import { RECORDED_DIR, type RecordedResponse } from "../support/recorded.ts";
+import { recorded } from "../support/recorded.ts";
 import { expect, type ApiOverrides } from "../support/test.ts";
 
 
 const ENDPOINTS_PATH = "/app/settings?section=endpoints";
-const recordedCatalog = (
-  JSON.parse(readFileSync(join(RECORDED_DIR, "custom-providers-endpoints.json"), "utf8")) as RecordedResponse
-).body as { endpoints: unknown[] };
+const recordedCatalog = recorded<{ endpoints: unknown[] }>("custom-providers-endpoints.json");
 
 const LONG_NAME = "华东二区备用线路 · 可灵 2.1 Master 图生视频（按量计费，月底结算）";
 
@@ -137,6 +133,8 @@ async function detailReady(page: Page) {
 defineRegionScenarios("调用端点", [
   {
     name: "我的端点详情：模型多、定义长时正文在详情栏里滚动，底部保存栏始终可见",
+    viewports: "both",
+    a11y: true,
     path: `${ENDPOINTS_PATH}&endpoint=ce-1`,
     api: MANY_ENDPOINTS,
     ready: detailReady,
@@ -149,7 +147,6 @@ defineRegionScenarios("调用端点", [
       await expect(save).toBeInViewport({ ratio: 1 });
       await expect(save).toBeEnabled();
     },
-    screenshot: { name: "endpoints-detail", target: (page) => page.getByRole("main") },
   },
   {
     name: "内置端点详情：页头并排「复制为我的端点」与主按钮「新建供应商并使用」，都在视口内",
@@ -162,7 +159,6 @@ defineRegionScenarios("调用端点", [
       await expect(page.getByRole("button", { name: "复制为我的端点" })).toBeInViewport({ ratio: 1 });
       await expect(page.getByRole("button", { name: "新建供应商并使用" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "endpoints-builtin-detail", target: (page) => page.getByRole("main") },
   },
   {
     name: "自定义端点多且名称长：二级栏滚动到「新建端点」，它在视口内",
@@ -174,7 +170,6 @@ defineRegionScenarios("调用端点", [
       await create.scrollIntoViewIfNeeded();
       await expect(create).toBeInViewport();
     },
-    screenshot: { name: "endpoints-rail", target: rail },
   },
   {
     name: "打开页头「更多操作」菜单，菜单项留在视口内",
@@ -200,10 +195,10 @@ defineRegionScenarios("调用端点", [
       await expect(dialog.getByRole("button", { name: "取消" })).toBeFocused();
       await expect(dialog.getByRole("button", { name: "删除" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "endpoints-delete-dialog", target: (page) => page.getByRole("alertdialog") },
   },
   {
     name: "新建端点页打开导入对话框，标题与操作按钮留在视口内",
+    a11y: true,
     path: `${ENDPOINTS_PATH}&endpoint=new`,
     api: MANY_ENDPOINTS,
     ready: async (page) => {
@@ -215,13 +210,10 @@ defineRegionScenarios("调用端点", [
       await expect(dialog).toBeInViewport({ ratio: 1 });
       await expect(dialog.getByRole("button", { name: "取消" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "endpoints-import-dialog", target: (page) => page.getByRole("dialog") },
   },
 ]);
 
-const comfyuiRecord = (
-  JSON.parse(readFileSync(join(RECORDED_DIR, "comfyui-audio-aspect-create.json"), "utf8")) as RecordedResponse
-).body;
+const comfyuiRecord = recorded("comfyui-audio-aspect-create.json");
 
 defineRegionScenarios("ComfyUI 节点绑定", [{
   name: "参考音频排序与画幅对应值展开后仍可编辑，分辨率保持固定",

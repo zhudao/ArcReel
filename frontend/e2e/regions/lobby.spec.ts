@@ -1,7 +1,7 @@
 import type { Page } from "@playwright/test";
 import type { DeletedProjectListing } from "../../src/types/file-view.ts";
 import { FIXED_NOW, recorded } from "../support/recorded.ts";
-import { defineRegionScenarios } from "../support/scenarios.ts";
+import { defineRegionScenarios, defineViewportContracts } from "../support/scenarios.ts";
 import { expect, type ApiOverrides } from "../support/test.ts";
 
 
@@ -76,7 +76,6 @@ const DELETED: ApiOverrides = {
   },
 };
 
-const main = (page: Page) => page.getByRole("main");
 const projectList = (page: Page) => page.getByRole("list", { name: "项目" });
 const firstCardActions = (page: Page) => page.getByRole("button", { name: `「${LONG_TITLE} 第 1 部」的更多操作` });
 
@@ -92,30 +91,23 @@ defineRegionScenarios("项目大厅", [
   {
     name: "打开大厅：问候区、筛选工具栏与项目卡",
     path: LOBBY_PATH,
+    a11y: true,
     ready: async (page) => {
       await lobbyReady(page);
       await page.getByRole("heading", { level: 1 }).waitFor();
     },
-    screenshot: { name: "lobby-default" },
   },
   {
     name: "项目多、标题与待修复原因长：首行海报、标题与进度行在首屏内",
     path: LOBBY_PATH,
     api: MANY,
+    viewports: "both",
     ready: manyReady,
     act: async (page) => {
       const first = projectList(page).getByRole("listitem").first();
       await expect(first.getByRole("heading", { level: 3 })).toBeInViewport({ ratio: 1 });
       await expect(first.getByText("制作中", { exact: true })).toBeInViewport({ ratio: 1 });
-
-      if (page.viewportSize()?.width === 2560) {
-        const lefts = await projectList(page)
-          .getByRole("listitem")
-          .evaluateAll((items) => new Set(items.map((item) => Math.round(item.getBoundingClientRect().left))).size);
-        expect(lefts).toBe(8);
-      }
     },
-    screenshot: { name: "lobby-many", target: main },
   },
   {
     name: "滚到网格底部时，筛选工具栏吸顶留在视口内",
@@ -134,7 +126,6 @@ defineRegionScenarios("项目大厅", [
     ready: async (page) => {
       await page.getByText("还没有项目").waitFor();
     },
-    screenshot: { name: "lobby-empty", target: main },
   },
   {
     name: "搜索没有匹配的项目",
@@ -165,12 +156,12 @@ defineRegionScenarios("项目大厅", [
       await firstCardActions(page).click();
       await expect(page.getByRole("menuitem", { name: "删除" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "lobby-card-menu", target: (page) => projectList(page).getByRole("listitem").first() },
   },
   {
     name: "重命名项目的对话框说明项目 ID 不变",
     path: LOBBY_PATH,
     api: MANY,
+    a11y: true,
     ready: manyReady,
     act: async (page) => {
       await firstCardActions(page).click();
@@ -179,7 +170,6 @@ defineRegionScenarios("项目大厅", [
       await expect(dialog.getByRole("textbox", { name: "项目标题" })).toHaveValue(`${LONG_TITLE} 第 1 部`);
       await expect(dialog.getByRole("button", { name: "保存" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "lobby-rename-dialog", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "删除项目的确认，按钮留在视口内",
@@ -204,7 +194,6 @@ defineRegionScenarios("项目大厅", [
       await expect(dialog.getByRole("button", { name: `恢复「${LONG_TITLE} 1」` })).toBeInViewport({ ratio: 1 });
       await expect(dialog.getByRole("button", { name: `彻底删除「${LONG_TITLE} 1」` })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "lobby-deleted-projects", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "从项目卡导出：导出范围对话框的操作按钮留在视口内",
@@ -224,6 +213,8 @@ defineRegionScenarios("项目大厅", [
     api: { ...MANY, "DELETE /api/v1/projects/project-0": {
       status: 500, body: { detail: "无法删除项目，存储系统返回诊断：".repeat(120) },
     } },
+    viewports: "both",
+    a11y: true,
     ready: manyReady,
     act: async (page) => {
       await firstCardActions(page).click();
@@ -236,6 +227,22 @@ defineRegionScenarios("项目大厅", [
       await body.press("End");
       await expect.poll(() => body.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
       await expect(dialog.getByRole("button", { name: "取消" })).toBeInViewport({ ratio: 1 });
+    },
+  },
+]);
+
+defineViewportContracts("项目大厅", [
+  {
+    name: "宽屏下项目卡网格排成八列",
+    viewport: { width: 2560, height: 1440 },
+    path: LOBBY_PATH,
+    api: MANY,
+    ready: manyReady,
+    act: async (page) => {
+      const lefts = await projectList(page)
+        .getByRole("listitem")
+        .evaluateAll((items) => new Set(items.map((item) => Math.round(item.getBoundingClientRect().left))).size);
+      expect(lefts).toBe(8);
     },
   },
 ]);

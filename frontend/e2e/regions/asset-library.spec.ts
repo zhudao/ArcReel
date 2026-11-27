@@ -79,8 +79,8 @@ const SHEET_SVG = `data:image/svg+xml,${encodeURIComponent(
 )}`;
 
 function projectWithCharacter() {
-  const recorded = loadRecordedResponses().get(recordedKey("GET", "/api/v1/projects/demo"));
-  if (!recorded) throw new Error("没有录制 GET /api/v1/projects/demo");
+  const recorded = loadRecordedResponses().get(recordedKey("GET", "/api/v1/projects/demo/workspace"));
+  if (!recorded) throw new Error("没有录制 GET /api/v1/projects/demo/workspace");
   const body = structuredClone(recorded.body) as { project: Record<string, unknown> };
   body.project.characters = {
     林夕: {
@@ -101,13 +101,14 @@ async function galleryReady(page: Page) {
 defineRegionScenarios("资产库", [
   {
     name: "类型标签显示当前搜索下各类型的数量，网格铺满内容区",
+    viewports: "both",
+    a11y: true,
     path: LIBRARY_PATH,
     ready: libraryReady,
     act: async (page) => {
       await expect(page.getByRole("tab", { name: /场景\s*1/ })).toBeVisible();
       await expect(page.getByRole("button", { name: "林夕", exact: true })).toBeVisible();
     },
-    screenshot: { name: "asset-library", target: (page) => page.getByRole("main") },
   },
   {
     name: "条目多且文字长时，滚动到底自动加载下一页",
@@ -142,7 +143,6 @@ defineRegionScenarios("资产库", [
       await expect(close).toBeInViewport({ ratio: 1 });
       await sheet.getByRole("heading", { name: LONG_NAME }).scrollIntoViewIfNeeded();
     },
-    screenshot: { name: "asset-library-detail", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "在详情里进入编辑后，保存栏固定在 Sheet 底部",
@@ -161,6 +161,7 @@ defineRegionScenarios("资产库", [
   },
   {
     name: "从卡片菜单打开「应用到项目」对话框",
+    a11y: true,
     path: LIBRARY_PATH,
     ready: libraryReady,
     act: async (page) => {
@@ -170,10 +171,10 @@ defineRegionScenarios("资产库", [
       await dialog.waitFor();
       await expect(dialog.getByRole("button", { name: "应用", exact: true })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "asset-library-apply", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "画廊「从资产库导入」：条目多时只有正文滚动，显示匹配总数",
+    viewports: "both",
     path: GALLERY_PATH,
     api: { ...EVENT_STREAM, ...MANY_ASSETS },
     ready: galleryReady,
@@ -190,14 +191,13 @@ defineRegionScenarios("资产库", [
       await expect(dialog.getByRole("button", { name: "取消" })).toBeInViewport({ ratio: 1 });
       await dialog.getByRole("searchbox").scrollIntoViewIfNeeded();
     },
-    screenshot: { name: "asset-library-picker", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "画廊「加入资产库」：只读预览，重名时提供覆盖",
     path: GALLERY_PATH,
     api: {
       ...EVENT_STREAM,
-      "GET /api/v1/projects/demo": projectWithCharacter(),
+      "GET /api/v1/projects/demo/workspace": projectWithCharacter(),
     },
     ready: galleryReady,
     act: async (page) => {
@@ -209,7 +209,6 @@ defineRegionScenarios("资产库", [
       await expect(dialog.getByRole("button", { name: "覆盖已有" })).toBeInViewport({ ratio: 1 });
       await expect(dialog.getByText("2 个衍生")).toBeVisible();
     },
-    screenshot: { name: "asset-library-add-preview", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "删除失败原因很长：正文可聚焦并用键盘滚动，取消仍可达",

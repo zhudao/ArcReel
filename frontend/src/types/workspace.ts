@@ -1,3 +1,4 @@
+import type { ItemLocationStatus } from "./project";
 import type { PresentationResourceType } from "./presentation";
 
 export type ProjectEventSource = "webui" | "worker" | "filesystem";
@@ -52,6 +53,9 @@ export interface ProjectChange {
   label_params?: Record<string, string | number>;
   script_file?: string;
   episode?: number;
+  item_id?: string | null;
+  position?: number | null;
+  location_status?: ItemLocationStatus;
   task_type?: string;
   status?: string;
   focus?: ProjectChangeFocus | null;
@@ -69,6 +73,7 @@ export interface ProjectChangeBatchPayload {
 }
 
 export interface ProjectEventSnapshotPayload {
+  episode_script?: { episode: number; filename: string | null; file_version: string | null };
   project_name: string;
   fingerprint: string;
   generated_at: string;

@@ -1,9 +1,12 @@
+import { createDeferred } from "@/test/deferred";
 import { seedTaskState } from "@/test/task-state";
 import { act, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import { useTaskFailureNotifications } from "@/hooks/useTaskFailureNotifications";
 import { useTasksStore } from "@/stores/tasks-store";
+import { API } from "@/api";
+import { useItemLocationsStore } from "@/stores/item-locations-store";
 import { useProjectsStore } from "@/stores/projects-store";
 import { useAppStore } from "@/stores/app-store";
 import type { ProjectData, TaskItem } from "@/types";
@@ -296,4 +299,134 @@ describe("useTaskFailureNotifications", () => {
       route: "/episodes/1",
     });
   });
+
+  it("formats failed task directly from top-level position without currentScripts or locateItems", async () => {
+    useItemLocationsStore.getState().reset(null);
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: {
+        title: "Demo",
+        content_mode: "narration",
+        style: "",
+        characters: {},
+        episodes: [{ episode: 2, title: "雨夜", script_file: "scripts/episode_2.json" }],
+      },
+      currentScripts: {},
+    });
+    const locateSpy = vi.spyOn(API, "locateItems");
+    seedTaskState({
+      tasks: [task({ task_id: "pos-1", task_type: "storyboard", resource_id: "E2S03", episode: 2, item_id: "E2S03", position: 3, status: "running" })],
+    });
+    render(<Harness project="demo" />);
+    act(() => {
+      seedTaskState({
+        tasks: [task({ task_id: "pos-1", task_type: "storyboard", resource_id: "E2S03", episode: 2, item_id: "E2S03", position: 3, status: "failed", error_message: "boom" })],
+      });
+    });
+
+    await waitFor(() => expect(useAppStore.getState().workspaceNotifications).toHaveLength(1));
+    expect(useAppStore.getState().workspaceNotifications[0].text).toContain("雨夜 · 3");
+    expect(locateSpy).not.toHaveBeenCalled();
+  });
+
+  it("falls back to locateItems for legacy failed tasks lacking position and resource_ref", async () => {
+    useItemLocationsStore.getState().reset(null);
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: {
+        title: "Demo",
+        content_mode: "narration",
+        style: "",
+        characters: {},
+        episodes: [{ episode: 2, title: "雨夜", script_file: "scripts/episode_2.json" }],
+      },
+      currentScripts: {},
+    });
+    const locateSpy = vi.spyOn(API, "locateItems").mockResolvedValue({
+      items: [{ episode: 2, item_id: "E2S04", position: 4, status: "found" }],
+    });
+    seedTaskState({
+      tasks: [task({ task_id: "leg-1", task_type: "storyboard", resource_id: "E2S04", status: "running" })],
+    });
+    render(<Harness project="demo" />);
+    act(() => {
+      seedTaskState({
+        tasks: [task({ task_id: "leg-1", task_type: "storyboard", resource_id: "E2S04", status: "failed", error_message: "boom" })],
+      });
+    });
+
+    await waitFor(() => expect(useAppStore.getState().workspaceNotifications[0]?.text).toContain("雨夜 · 4"));
+    expect(locateSpy).toHaveBeenCalledWith("demo", ["E2S04"], expect.anything());
+    expect(useAppStore.getState().workspaceNotifications[0].text).toContain("雨夜 · 4");
+  });
+  it("updates the same legacy failure after a cold lookup and a snapshot", async () => {
+    const store = useItemLocationsStore.getState();
+    store.reset("demo");
+    useProjectsStore.setState({ currentScripts: {} });
+    const locate = vi.spyOn(API, "locateItems")
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValueOnce({ items: [{ item_id: "E1S01", episode: null, position: null, status: "unloaded" }] })
+      .mockResolvedValue({ items: [{ item_id: "E1S01", episode: 1, position: 7, status: "found" }] });
+    seedTaskState({ tasks: [task({})] });
+    render(<Harness project="demo" />);
+    act(() => seedTaskState({ tasks: [task({ status: "failed" })] }));
+    await waitFor(() => expect(useAppStore.getState().workspaceNotifications).toHaveLength(1));
+    const { id } = useAppStore.getState().workspaceNotifications[0];
+    act(() => store.notifySnapshotReady("demo", false));
+    await waitFor(() => expect(store.getLocation("demo", "E1S01")?.status).toBe("unloaded"));
+    act(() => store.notifySnapshotReady("demo", false));
+    await waitFor(() => expect(useAppStore.getState().workspaceNotifications).toMatchObject([
+      { id, text: expect.stringContaining("E1 · 7") },
+    ]));
+    act(() => store.notifySnapshotReady("demo", false));
+    expect(locate).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the item ID after an episode invalidates an in-flight lookup", async () => {
+    const store = useItemLocationsStore.getState();
+    store.reset("demo");
+    useProjectsStore.setState({
+      currentScripts: {
+        "ep1.json": { episode: 1, title: "E1", content_mode: "narration", novel: { title: "", chapter: "" }, segments: [] },
+      },
+    });
+    const stale = createDeferred<Awaited<ReturnType<typeof API.locateItems>>>();
+    const locate = vi.spyOn(API, "locateItems")
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValue({ items: [{ item_id: "E1S01", episode: 1, position: 7, status: "found" }] });
+    seedTaskState({ tasks: [task({})] });
+    render(<Harness project="demo" />);
+    act(() => seedTaskState({ tasks: [task({ status: "failed" })] }));
+    expect(locate).toHaveBeenCalledTimes(1);
+    act(() => store.invalidateEpisodes("demo", [1]));
+    const { id } = useAppStore.getState().workspaceNotifications[0];
+    await act(async () => stale.resolve({ items: [{ item_id: "E1S01", episode: 1, position: 5, status: "found" }] }));
+    expect(useAppStore.getState().workspaceNotifications).toMatchObject([
+      { id, text: expect.stringContaining("E1 · S01") },
+    ]);
+    act(() => store.notifySnapshotReady("demo", false));
+    await waitFor(() => expect(useAppStore.getState().workspaceNotifications).toMatchObject([
+      { id, text: expect.stringContaining("E1 · 7") },
+    ]));
+    act(() => store.notifySnapshotReady("demo", false));
+    expect(locate).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["unmount", "switch project"])("cancels a pending snapshot retry on %s", async (action) => {
+    const store = useItemLocationsStore.getState();
+    store.reset("demo");
+    useProjectsStore.setState({ currentScripts: {} });
+    const locate = vi.spyOn(API, "locateItems").mockResolvedValue({
+      items: [{ item_id: "E1S01", episode: null, position: null, status: "unloaded" }],
+    });
+    seedTaskState({ tasks: [task({})] });
+    const view = render(<Harness project="demo" />);
+    act(() => seedTaskState({ tasks: [task({ status: "failed" })] }));
+    await waitFor(() => expect(useAppStore.getState().workspaceNotifications).toHaveLength(1));
+    if (action === "unmount") view.unmount();
+    else view.rerender(<Harness project="other" />);
+    act(() => store.notifySnapshotReady("demo", false));
+    expect(locate).toHaveBeenCalledTimes(1);
+  });
+
 });

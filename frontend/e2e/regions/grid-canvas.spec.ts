@@ -1,19 +1,13 @@
 import { box, clearAgentOverlay } from "../support/region-helpers.ts";
 import type { Page } from "@playwright/test";
 import { defineRegionScenarios } from "../support/scenarios.ts";
-import { FIXED_NOW, recorded } from "../support/recorded.ts";
+import { FIXED_NOW } from "../support/recorded.ts";
 import { expect, type ApiOverrides } from "../support/test.ts";
+import { recordedDemoScript, workspaceOverride } from "../support/workspace-override.ts";
 
 const GRID_PATH = "/app/projects/demo/episodes/1?view=grid";
 
-
-interface RecordedProject {
-  project: Record<string, unknown>;
-  scripts: Record<string, Record<string, unknown>>;
-}
-
-const project = recorded<RecordedProject>("project-demo.json");
-const recordedScript = project.scripts["episode_1.json"];
+const recordedScript = recordedDemoScript().script;
 
 const shotId = (n: number) => `E1S${String(n).padStart(2, "0")}`;
 
@@ -112,14 +106,7 @@ const GRIDS = [
 
 const API: ApiOverrides = {
   "GET /api/v1/projects/demo/events/stream": { status: 404, body: { detail: "页面级套件不回放事件流" } },
-  "GET /api/v1/projects/demo": {
-    status: 200,
-    body: {
-      ...project,
-      project: { ...project.project, grid_storyboard: true },
-      scripts: { "episode_1.json": { ...recordedScript, segments } },
-    },
-  },
+  ...workspaceOverride({ grid_storyboard: true }, { scripts: { "episode_1.json": { ...recordedScript, segments } } }),
   "GET /api/v1/projects/demo/grids": { status: 200, body: GRIDS },
   ...Object.fromEntries(GRIDS.map((g) => [`GET /api/v1/projects/demo/grids/${g.id}`, { status: 200, body: g }])),
 };
@@ -137,6 +124,8 @@ async function gridReady(page: Page) {
 defineRegionScenarios("多宫格分镜图", [
   {
     name: "每组一张卡片，联合图占媒体栏，页头只有「补齐联合图」",
+    viewports: "both",
+    a11y: true,
     path: GRID_PATH,
     api: API,
     ready: gridReady,
@@ -160,7 +149,6 @@ defineRegionScenarios("多宫格分镜图", [
       await expect(groupCard(page, 4).getByText("这一组还没有联合图")).toBeVisible();
       await expect(groupCard(page, 4).getByRole("button", { name: "生成这一组" })).toBeEnabled();
     },
-    screenshot: { name: "grid-canvas-group", target: (page) => groupCard(page, 1) },
   },
   {
     name: "切到一组里的第二张联合图，长错误说明完整显示",
@@ -179,6 +167,5 @@ defineRegionScenarios("多宫格分镜图", [
       await expect(second.getByRole("button", { name: "重新生成", exact: true })).toBeEnabled();
       await expect(second.getByRole("button", { name: "上传联合图" })).toBeEnabled();
     },
-    screenshot: { name: "grid-canvas-failed", target: (page) => groupCard(page, 2) },
   },
 ]);

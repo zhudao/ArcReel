@@ -1,7 +1,9 @@
+import { clearAgentOverlay } from "../support/region-helpers.ts";
 import type { Page } from "@playwright/test";
 import { defineRegionScenarios } from "../support/scenarios.ts";
 import { recorded } from "../support/recorded.ts";
 import { expect, type ApiOverrides } from "../support/test.ts";
+import { recordedDemoEpisode, workspaceOverride } from "../support/workspace-override.ts";
 
 const PATH = "/app/projects/demo/files";
 const LISTING = "GET /api/v1/projects/demo/file-view";
@@ -22,7 +24,7 @@ interface TrashListing {
 
 const root = recorded<Listing>("project-demo-file-view.json");
 const trash = recorded<TrashListing>("project-demo-trash.json");
-const project = recorded<{ project: { episodes: Record<string, unknown>[] } }>("project-demo.json");
+const firstEpisode = recordedDemoEpisode();
 const scripts = recorded<Listing>("project-demo-file-view-scripts.json");
 const scriptFile = scripts.entries[0];
 
@@ -135,6 +137,7 @@ defineRegionScenarios("文件视图", [
         body: JSON.stringify({ episode: 1, segments: [] }),
       },
     },
+    a11y: true,
     ready: (page) => tree(page).getByRole("button", { name: /scripts/ }).waitFor(),
     act: async (page) => {
       await tree(page).getByRole("button", { name: /scripts/ }).click();
@@ -143,12 +146,12 @@ defineRegionScenarios("文件视图", [
       await expect(page.getByRole("link", { name: "打开这一集" })).toBeVisible();
       await expect(page.getByLabel(`${String(scriptFile.name)} 的内容`)).toContainText('"segments": []');
     },
-    screenshot: { name: "file-view-script", target: (page) => page.getByRole("main") },
   },
   {
     name: "大目录与长正文（压力）：目录树与预览各自滚动",
     path: PATH,
     api: STRESS,
+    viewports: "both",
     slow: true,
     ready: (page) => tree(page).getByRole("button", { name: /storyboards/ }).waitFor(),
     act: async (page) => {
@@ -210,17 +213,20 @@ defineRegionScenarios("文件视图", [
       await page.keyboard.press("Escape");
       await expect(dialog).toBeHidden();
     },
-    screenshot: { name: "file-view-trash", target: (page) => page.getByRole("main") },
   },
   {
     name: "项目回收站分区：长集名不遮住删除时的位置和正文",
     path: PATH,
     api: {
       ...EVENT_STREAM,
-      "GET /api/v1/projects/demo": {
+      ...workspaceOverride({ episodes: [{ ...firstEpisode, title: LONG_EPISODE_TITLE }] }),
+      "POST /api/v1/projects/demo/trash/deleted-shot-5/restore": {
         status: 200,
-        body: { ...project, project: { ...project.project, episodes: [{ ...project.project.episodes[0], title: LONG_EPISODE_TITLE }] } },
+        body: { object: { episode: 1, item_id: "E1S09", position: 2 }, restored: [], download_only: [], degraded: false },
       },
+      "GET /api/v1/projects/demo/workspace?episodes=1": workspaceOverride({
+        episodes: [{ ...firstEpisode, title: LONG_EPISODE_TITLE }],
+      })["GET /api/v1/projects/demo/workspace"],
       "GET /api/v1/projects/demo/trash": {
         status: 200,
         body: {
@@ -242,12 +248,16 @@ defineRegionScenarios("文件视图", [
         await expect(title).toBeVisible();
         await expect.poll(() => title.evaluate((el) => el.scrollWidth <= el.clientWidth && el.scrollHeight <= el.clientHeight)).toBe(true);
       }
+      await clearAgentOverlay(page);
+      await page.getByRole("button", { name: "恢复", exact: true }).first().click();
+      await expect(page.getByText(`${LONG_EPISODE_TITLE} · 2 已恢复`, { exact: true })).toBeVisible();
     },
   },
   {
     name: "项目回收站分区：降级恢复后只能下载的记录",
     path: PATH,
     api: TRASH_DEGRADED,
+    a11y: true,
     ready: (page) => sections(page).waitFor(),
     act: async (page) => {
       await sections(page).getByRole("tab", { name: "项目回收站" }).click();

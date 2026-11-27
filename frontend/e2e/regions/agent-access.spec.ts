@@ -70,6 +70,8 @@ async function openCreateDialog(page: Page) {
 defineRegionScenarios("外部 Agent 接入与访问令牌", [
   {
     name: "外部 Agent 接入按三步展示，滚到底时给 AI Agent 的提示词与复制按钮可达",
+    viewports: "both",
+    a11y: true,
     path: EXTERNAL_AGENT,
     ready: externalAgentReady,
     act: async (page) => {
@@ -77,10 +79,10 @@ defineRegionScenarios("外部 Agent 接入与访问令牌", [
       await main.evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
       await expect(page.getByRole("button", { name: "复制提示词" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "external-agent", target: (page) => page.getByRole("main"), showsOrigin: true },
   },
   {
     name: "第三步打开创建访问令牌对话框，表单与按钮留在视口内",
+    a11y: true,
     path: EXTERNAL_AGENT,
     ready: externalAgentReady,
     act: async (page) => {
@@ -89,7 +91,6 @@ defineRegionScenarios("外部 Agent 接入与访问令牌", [
       await expect(dialog).toBeInViewport({ ratio: 1 });
       await expect(dialog.getByRole("textbox", { name: "名称" })).toBeFocused();
     },
-    screenshot: { name: "access-token-create", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "创建成功后对话框一次性展示完整令牌，长令牌折行不撑出视口",
@@ -105,10 +106,10 @@ defineRegionScenarios("外部 Agent 接入与访问令牌", [
       await expect(created.getByRole("button", { name: "复制访问令牌" })).toBeVisible();
       await expect(created).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "access-token-created", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "访问令牌多且名称长时，列表在外壳主体里滚动到底，吊销按钮可达",
+    viewports: "both",
     path: ACCESS_TOKENS,
     api: MANY_TOKENS,
     ready: async (page) => {
@@ -129,7 +130,6 @@ defineRegionScenarios("外部 Agent 接入与访问令牌", [
       await settingsReady(page);
       await page.getByRole("table", { name: "访问令牌列表" }).waitFor();
     },
-    screenshot: { name: "access-tokens", target: (page) => page.getByRole("table", { name: "访问令牌列表" }) },
   },
   {
     name: "吊销确认对话框打开时，焦点在取消上且按钮留在视口内",

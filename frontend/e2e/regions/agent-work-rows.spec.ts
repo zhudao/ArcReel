@@ -1,8 +1,9 @@
 import type { Page } from "@playwright/test";
 import { defineRegionScenarios } from "../support/scenarios.ts";
-import { expect, type ApiOverrides } from "../support/test.ts";
+import { RECORDED_ACCESS_TOKEN } from "../support/recorded.ts";
+import { expect, test, type ApiOverrides } from "../support/test.ts";
 import { idleSessionApi } from "../support/assistant-session.ts";
-import { recorded } from "../support/recorded.ts";
+import { recordedDemoScript, workspaceOverride } from "../support/workspace-override.ts";
 
 const EPISODE_PATH = "/app/projects/demo/episodes/1";
 const SESSION_ID = "session-work-rows";
@@ -131,11 +132,7 @@ const SESSION = {
   updated_at: "2026-01-01T07:00:00.000Z",
 };
 
-interface RecordedProject {
-  project: Record<string, unknown>;
-  scripts: Record<string, Record<string, unknown>>;
-}
-const project = recorded<RecordedProject>("project-demo.json");
+const recordedScript = recordedDemoScript().script;
 
 const segments = Array.from({ length: 6 }, (_, i) => ({
   segment_id: `E1S0${i + 1}`,
@@ -150,10 +147,7 @@ const segments = Array.from({ length: 6 }, (_, i) => ({
 
 const API: ApiOverrides = {
   "GET /api/v1/projects/demo/events/stream": { status: 404, body: { detail: "页面级套件不回放事件流" } },
-  "GET /api/v1/projects/demo": {
-    status: 200,
-    body: { ...project, scripts: { "episode_1.json": { ...project.scripts["episode_1.json"], segments } } },
-  },
+  ...workspaceOverride({}, { scripts: { "episode_1.json": { ...recordedScript, segments } } }),
   [`GET ${SESSIONS_PATH}`]: { status: 200, body: { sessions: [SESSION] } },
   [`GET ${SESSIONS_PATH}/${SESSION_ID}`]: { status: 200, body: { session: SESSION } },
   ...idleSessionApi(SESSIONS_PATH, SESSION_ID, buildEntries()),
@@ -192,6 +186,7 @@ async function expectNoInnerScroll(page: Page, rowName: RegExp) {
 defineRegionScenarios("Agent 工序行", [
   {
     name: "工序行默认收起：工具显示本地化名称与摘要，失败与运行中在收起状态即可辨认",
+    a11y: true,
     path: EPISODE_PATH,
     api: API,
     ready: rowsReady,
@@ -201,7 +196,6 @@ defineRegionScenarios("Agent 工序行", [
       await expect(row(page, /修改剪辑时间线.*压低开场原声/)).toBeVisible();
       await expect(transcript(page).getByText(/mcp__arcreel__/)).toHaveCount(0);
     },
-    screenshot: { name: "agent-work-rows-collapsed", target: agentPanel },
   },
   {
     name: "展开长结果：只显示前 10 行，「显示全部」后整段展开，不产生内层滚动",
@@ -238,6 +232,37 @@ defineRegionScenarios("Agent 工序行", [
       await expect(transcript(page).getByText("子智能体结论")).toBeVisible();
       await expect(transcript(page).getByText(/建议重新生成 E1S03/)).toBeVisible();
     },
-    screenshot: { name: "agent-work-rows-subagent", target: agentPanel },
   },
 ]);
+
+test("概览页旧聊天遇到冷索引，事件流重连后显示当前集内位置", async ({ page, api }) => {
+  api.override(API);
+  await page.addInitScript((token) => localStorage.setItem("arcreel_auth_token", token), RECORDED_ACCESS_TOKEN);
+  const scriptReads: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().includes("/projects/demo/scripts/")) scriptReads.push(request.url());
+  });
+  let ready = false;
+  let connections = 0;
+  let coldLookup = () => {};
+  const lookedUp = new Promise<void>((resolve) => { coldLookup = resolve; });
+  await page.route("**/projects/demo/item-locations", async (route) => {
+    const { item_ids: ids } = route.request().postDataJSON() as { item_ids: string[] };
+    const items = ids.map((id) => ({ item_id: id, episode: 1, position: ready ? 9 : null, status: ready ? "found" : "unloaded" }));
+    await route.fulfill({ json: { items } });
+    if (ids.includes("E1S03")) coldLookup();
+  });
+  await page.route("**/projects/demo/events/stream", async (route) => {
+    connections += 1;
+    if (connections > 2) return route.fulfill({ status: 404, json: {} });
+    if (connections === 2) {
+      await lookedUp;
+      ready = true;
+    }
+    await route.fulfill({ contentType: "text/event-stream", body: 'retry: 100\nevent: snapshot\ndata: {"fingerprint":"same"}\n\n' });
+  });
+  await page.goto("/app/projects/demo");
+  await expect(row(page, /生成视频.*第一集 · 9.*运行中/)).toBeVisible({ timeout: 15000 });
+  expect(connections).toBeGreaterThanOrEqual(2);
+  expect(scriptReads).toEqual([]);
+});

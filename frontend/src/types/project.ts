@@ -14,7 +14,7 @@ export interface ProjectOverview {
 export interface CharacterDerivative {
   description: string;
   character_sheet?: string;
-  referenced?: boolean;
+  referenced?: boolean | null;
 }
 
 export interface CharacterDerivativeStatus extends CharacterDerivative {
@@ -72,15 +72,52 @@ export interface EpisodesSummary {
 export interface ArtifactCount {
   total: number;
   available: number;
-  stale: number;
+  stale?: number;
 }
 
 export interface ProjectStatus {
+  currency?: "registered" | "verified";
   needs_repair: boolean;
   repair_reason: string | null;
   assets: Record<string, ArtifactCount>;
   episodes_summary: EpisodesSummary;
   source_remaining: boolean;
+}
+
+export interface WorkspaceEpisodeSummary {
+  episode: number;
+  script_status: "none" | "segmented" | "generated";
+  status: "draft" | "scripted" | "in_production" | "completed" | "missing";
+  item_count: number;
+  duration_seconds: number;
+  needs_replan: number;
+  videos: ArtifactCount;
+  storyboards: ArtifactCount;
+}
+
+export interface WorkspaceSummary extends Omit<ProjectStatus, "episodes_summary"> {
+  episodes_summary: EpisodesSummary | null;
+  currency: "registered";
+  episodes: WorkspaceEpisodeSummary[];
+}
+
+export interface WorkspaceResponse {
+  project: ProjectData;
+  summary: WorkspaceSummary;
+  asset_fingerprints?: Record<string, number>;
+}
+
+export type ItemLocationStatus = "found" | "deleted" | "ambiguous" | "unloaded";
+
+export interface ItemLocation {
+  episode: number | null;
+  item_id: string;
+  position: number | null;
+  status: ItemLocationStatus;
+}
+
+export interface ItemLocationsResponse {
+  items: ItemLocation[];
 }
 
 export interface EpisodeItemRef {
@@ -101,6 +138,8 @@ export interface EpisodeMeta {
   source_origin?: "whole_source" | "own" | "none";
   source_kind?: "novel" | "screenplay";
   ledger_status?: "planned" | "consumed" | "stale";
+  stale_script_plan_revision?: string | null;
+  stale_script_plan_rebuilt_revision?: string | null;
   outline?: { story_beats?: string[]; next_episode_teaser?: string };
   prompt_authoring_instructions?: string;
   script_plan_instructions?: string;
@@ -108,6 +147,7 @@ export interface EpisodeMeta {
   script_status?: "none" | "segmented" | "generated";
   status?: "draft" | "scripted" | "in_production" | "completed" | "missing";
   duration_seconds?: number;
+  needs_replan?: number;
   storyboards?: ArtifactCount;
   videos?: ArtifactCount;
 }

@@ -2,6 +2,7 @@ import { API, derivativeResourceId } from "@/api";
 import i18n from "@/i18n";
 import { useAppStore } from "@/stores/app-store";
 import { useAssetSheetBatchStore } from "@/stores/asset-sheet-batch-store";
+import { useItemLocationsStore } from "@/stores/item-locations-store";
 import { useProjectsStore } from "@/stores/projects-store";
 import type {
   AssetSheetBatchScope,
@@ -23,10 +24,28 @@ import {
   type ResourceKind,
 } from "@/stores/tasks-store";
 import { episodeItemLabel } from "@/utils/episode-display";
+import { findEpisodeItem, isLocatableItemId } from "@/utils/episode-item";
 
-function itemLabel(itemId: string): string {
-  const { currentProjectData, currentScripts } = useProjectsStore.getState();
-  return episodeItemLabel(itemId, currentScripts, currentProjectData?.episodes ?? [], i18n.t);
+function notifyItemEnqueued(
+  projectName: string, itemId: string, deduped: boolean,
+  key: "dashboard:storyboard_task_submitted_toast" | "dashboard:video_task_submitted_toast" | "dashboard:narration_task_submitted_toast",
+): void {
+  if (deduped) return notifyEnqueued(true, null);
+  const state = useProjectsStore.getState();
+  if (state.currentProjectName !== projectName) return notifyEnqueued(false, i18n.t(key, { id: itemId }));
+  const locations = useItemLocationsStore.getState();
+  const cached = locations.projectName === projectName ? locations.locations : undefined;
+  const episodes = state.currentProjectData?.episodes ?? [];
+  const label = episodeItemLabel(itemId, state.currentScripts, episodes, i18n.t, cached);
+  notifyEnqueued(false, i18n.t(key, { id: label }));
+  const toastId = useAppStore.getState().toast?.id;
+  if (!toastId || !isLocatableItemId(itemId) || cached?.has(itemId) || findEpisodeItem(state.currentScripts, itemId)) return;
+  void locations.locateNow(projectName, [itemId]).then((updated) => {
+    const latest = useProjectsStore.getState();
+    if (latest.currentProjectName !== projectName || useAppStore.getState().toast?.id !== toastId || !updated.has(itemId)) return;
+    const id = episodeItemLabel(itemId, latest.currentScripts, latest.currentProjectData?.episodes ?? episodes, i18n.t, updated);
+    useAppStore.getState().updateNotificationText(toastId, i18n.t(key, { id }));
+  });
 }
 
 export interface EnqueueResult {
@@ -107,7 +126,7 @@ export async function enqueueStoryboard(
     () => API.generateStoryboard(projectName, segmentId, prompt, scriptFile),
     oneTaskId,
   );
-  notifyEnqueued(res.deduped, i18n.t("dashboard:storyboard_task_submitted_toast", { id: itemLabel(segmentId) }));
+  notifyItemEnqueued(projectName, segmentId, res.deduped, "dashboard:storyboard_task_submitted_toast");
   return { taskIds: [res.task_id], deduped: res.deduped };
 }
 
@@ -123,7 +142,7 @@ export async function enqueueVideo(
     () => API.generateVideo(projectName, segmentId, prompt, scriptFile, durationSeconds),
     oneTaskId,
   );
-  notifyEnqueued(res.deduped, i18n.t("dashboard:video_task_submitted_toast", { id: itemLabel(segmentId) }));
+  notifyItemEnqueued(projectName, segmentId, res.deduped, "dashboard:video_task_submitted_toast");
   return { taskIds: [res.task_id], deduped: res.deduped };
 }
 
@@ -137,7 +156,7 @@ export async function enqueueNarration(
     () => API.generateNarrationAudio(projectName, segmentId, scriptFile),
     oneTaskId,
   );
-  notifyEnqueued(res.deduped, i18n.t("dashboard:narration_task_submitted_toast", { id: itemLabel(segmentId) }));
+  notifyItemEnqueued(projectName, segmentId, res.deduped, "dashboard:narration_task_submitted_toast");
   return { taskIds: [res.task_id], deduped: res.deduped };
 }
 

@@ -53,12 +53,13 @@ function diagnosticsDialog(page: Page): Locator {
 defineRegionScenarios("弹层与提示", [
   {
     name: "诊断条目多且长时，标题与关闭按钮留在视口内，只有正文滚动",
+    viewports: "both",
+    a11y: true,
     path: EPISODE_PATH,
     api: MANY_DIAGNOSTICS,
     ready: episodeReady,
     act: async (page) => {
       await exportProject(page);
-      // 先关掉同时发出的下载提示：它 5 秒后自动消失，留着会让截图不稳定。
       const region = page.getByRole("region", { name: "提示" });
       await region.hover();
       await region.getByRole("button", { name: "关闭提示" }).click();
@@ -76,7 +77,6 @@ defineRegionScenarios("弹层与提示", [
       await expect(title).toBeInViewport({ ratio: 1 });
       await expect(close).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "overlays-export-diagnostics", target: (page) => diagnosticsDialog(page) },
   },
   {
     name: "下载提示显示在诊断对话框之上，减少动态效果时出现过程不位移",
@@ -116,10 +116,10 @@ defineRegionScenarios("弹层与提示", [
 
       await expect(region.getByRole("button", { name: "关闭提示" })).toBeVisible();
     },
-    screenshot: { name: "overlays-toast-over-dialog", target: (page) => page.getByRole("region", { name: "提示" }) },
   },
   {
     name: "打开侧栏「添加一集」菜单",
+    a11y: true,
     path: EPISODE_PATH,
     api: EVENT_STREAM,
     ready: episodeReady,
@@ -129,6 +129,5 @@ defineRegionScenarios("弹层与提示", [
       await expect(menu.getByRole("menuitem", { name: "新建一集" })).toBeInViewport({ ratio: 1 });
       await expect(menu.getByRole("menuitem", { name: "上传集原文" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "overlays-action-menu", target: (page) => page.getByRole("menu", { name: "添加一集" }) },
   },
 ]);

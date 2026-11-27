@@ -228,6 +228,7 @@ async function openHistory(page: Page) {
 defineRegionScenarios("Agent 输入区", [
   {
     name: "Agent 提问时问卷占用输入框的位置，待办进度显示在它上方",
+    a11y: true,
     path: EPISODE_PATH,
     api: ASK_API,
     ready: questionReady,
@@ -236,7 +237,6 @@ defineRegionScenarios("Agent 输入区", [
       await expect(questionnaire(page).getByRole("radio", { name: /雨夜城墙远景/ })).toBeVisible();
       await expect(questionnaire(page).getByRole("radio", { name: "其他" })).toHaveCount(0);
     },
-    screenshot: { name: "agent-composer-question", target: agentPanel },
   },
   {
     name: "面板最窄 320px 时，问卷与待办进度同时出现，上方仍能看到消息",
@@ -280,6 +280,7 @@ defineRegionScenarios("Agent 输入区", [
   },
   {
     name: "Agent 提问期间排队 20 条消息：托盘与问卷都在面板内，托盘里没有立即发送",
+    viewports: "both",
     path: EPISODE_PATH,
     api: QUEUE_ASK_API,
     ready: async (page) => {
@@ -307,7 +308,6 @@ defineRegionScenarios("Agent 输入区", [
         "true",
       );
     },
-    screenshot: { name: "agent-composer-history", target: agentPanel },
   },
   {
     name: "搜索会话没有匹配时说明原因",
@@ -322,6 +322,7 @@ defineRegionScenarios("Agent 输入区", [
   },
   {
     name: "删除会话前确认",
+    a11y: true,
     path: EPISODE_PATH,
     api: HISTORY_API,
     ready: historyReady,
@@ -347,7 +348,6 @@ defineRegionScenarios("Agent 输入区", [
       await waitForEntrance(menu);
       await expect(agentInput(page)).toHaveAttribute("aria-expanded", "true");
     },
-    screenshot: { name: "agent-composer-slash", target: agentPanel },
   },
   {
     name: "附加 5 张图片并写入长文本",
@@ -363,6 +363,5 @@ defineRegionScenarios("Agent 输入区", [
       await agentInput(page).fill(`${LONG_PARAGRAPH}\n${LONG_PARAGRAPH}`);
       await expect(page.getByRole("button", { name: "附加图片" })).toHaveCount(0);
     },
-    screenshot: { name: "agent-composer-attachments", target: agentPanel },
   },
 ]);

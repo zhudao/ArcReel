@@ -1,8 +1,11 @@
+import { stripScriptsPrefix } from "@/utils/task-target";
 
 import type {
   CharacterDerivativeStatus,
+  ItemLocationsResponse,
   ProjectData,
   ProjectSummary,
+  WorkspaceResponse,
   ImportConflictPolicy,
   ImportProjectResponse,
   ExportDiagnostics,
@@ -526,6 +529,16 @@ class API {
     });
   }
 
+  static async getWorkspace(
+    name: string,
+    options: { signal?: AbortSignal; episodes?: readonly number[] } = {}
+  ): Promise<WorkspaceResponse> {
+    const params = new URLSearchParams();
+    for (const episode of [...new Set(options.episodes)].sort((a, b) => a - b)) params.append("episodes", String(episode));
+    const query = params.size ? `?${params}` : "";
+    return this.request(`/projects/${encodeURIComponent(name)}/workspace${query}`, { signal: options.signal });
+  }
+
   static async getProject(
     name: string,
     options: { signal?: AbortSignal } = {}
@@ -535,6 +548,18 @@ class API {
     asset_fingerprints?: Record<string, number>;
   }> {
     return this.request(`/projects/${encodeURIComponent(name)}`, { signal: options.signal });
+  }
+
+  static async locateItems(
+    projectName: string,
+    itemIds: string[],
+    options: { signal?: AbortSignal } = {}
+  ): Promise<ItemLocationsResponse> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/item-locations`, {
+      method: "POST",
+      body: JSON.stringify({ item_ids: itemIds }),
+      signal: options.signal,
+    });
   }
 
   static async updateProject(
@@ -1094,9 +1119,10 @@ class API {
 
   static async getAssetSheetStatus(
     projectName: string,
-    options?: { signal?: AbortSignal }
+    options?: { signal?: AbortSignal; include?: "derivative_references" }
   ): Promise<{ assets: AssetSheetStatusRow[] }> {
-    return this.request(`/projects/${encodeURIComponent(projectName)}/asset-sheets/status`, {
+    const query = options?.include ? `?include=${encodeURIComponent(options.include)}` : "";
+    return this.request(`/projects/${encodeURIComponent(projectName)}/asset-sheets/status${query}`, {
       signal: options?.signal,
     });
   }
@@ -1326,11 +1352,34 @@ class API {
 
   static async getScript(
     projectName: string,
-    scriptFile: string
-  ): Promise<EpisodeScriptSnapshot> {
+    scriptFile: string,
+    options: { signal?: AbortSignal; speculative?: boolean; onVersion?: (version: string | null) => void } = {}
+  ): Promise<EpisodeScriptSnapshot | null> {
+    const normalized = stripScriptsPrefix(scriptFile);
+    const endpoint = `/projects/${encodeURIComponent(projectName)}/scripts/${encodeURIComponent(normalized)}`;
+    if (options.onVersion) {
+      return requestJson(endpoint, {
+        signal: options.signal,
+        cache: "no-store",
+        headers: { "X-ArcReel-Optional-Read": "1", "X-ArcReel-Script-Version": "include" },
+      }, (headers) => {
+        const version = headers.get("X-ArcReel-Script-Version");
+        if (version) options.onVersion?.(version === "missing" ? null : version);
+      });
+    }
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/scripts/${encodeURIComponent(scriptFile)}`
+      endpoint,
+      {
+        signal: options.signal,
+        ...(options.speculative && { headers: { "X-ArcReel-Optional-Read": "1" } }),
+      }
     );
+  }
+
+  static getScriptVersion(projectName: string, filename: string, signal: AbortSignal): Promise<{ file_version: string | null }> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/scripts/${encodeURIComponent(filename)}`, {
+      signal, headers: { "X-ArcReel-Script-Version": "only" }, cache: "no-store",
+    });
   }
 
   static async editScriptBatch(
@@ -2539,7 +2588,12 @@ class API {
     const url = `${API_BASE}/projects/${encodeURIComponent(options.projectName)}/events/stream`;
     return openSseStream({
       url,
-      headers: sseHeaders,
+      headers: () => {
+        const headers = new Headers(sseHeaders());
+        const episode = options.activeEpisode?.();
+        if (episode) headers.set("X-ArcReel-Active-Episode", String(episode));
+        return headers;
+      },
       onMessage(message) {
         const payload = parseSseJson(message.data, "project event");
         if (!payload) return;

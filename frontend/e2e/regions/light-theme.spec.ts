@@ -12,35 +12,38 @@ defineRegionScenarios("浅色主题", [
     name: "项目大厅",
     path: "/app/projects",
     colorScheme: "light",
+    viewports: "both",
+    a11y: true,
     ready: async (page) => {
       await page.getByRole("heading", { level: 1 }).waitFor();
     },
-    screenshot: { name: "light-lobby" },
   },
   {
     name: "设置的通用分区",
     path: "/app/settings?section=general",
     colorScheme: "light",
+    a11y: true,
     ready: async (page) => {
       await page.getByRole("combobox", { name: "主题" }).waitFor();
     },
-    screenshot: { name: "light-settings-general" },
   },
   {
     name: "工作区的剧集页",
     path: EPISODE_PATH,
     api: EVENT_STREAM,
     colorScheme: "light",
+    viewports: "both",
+    a11y: "all-viewports",
     ready: async (page) => {
       await page.getByRole("button", { name: "添加一集" }).waitFor();
     },
-    screenshot: { name: "light-episode" },
   },
   {
     name: "导出范围对话框",
     path: EPISODE_PATH,
     api: EVENT_STREAM,
     colorScheme: "light",
+    a11y: true,
     ready: async (page) => {
       await page.getByRole("button", { name: "添加一集" }).waitFor();
     },
@@ -48,6 +51,5 @@ defineRegionScenarios("浅色主题", [
       await page.getByRole("button", { name: "导出项目归档" }).click();
       await page.getByRole("dialog", { name: "选择导出范围" }).waitFor();
     },
-    screenshot: { name: "light-export-dialog" },
   },
 ]);

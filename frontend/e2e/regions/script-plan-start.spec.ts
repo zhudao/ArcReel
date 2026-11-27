@@ -3,16 +3,12 @@ import type { Page } from "@playwright/test";
 import { defineRegionScenarios } from "../support/scenarios.ts";
 import { FIXED_NOW, recorded } from "../support/recorded.ts";
 import { expect, type ApiOverrides } from "../support/test.ts";
+import { buildWorkspaceBody, recordedDemoEpisode } from "../support/workspace-override.ts";
 
 const EPISODE_PATH = "/app/projects/demo/episodes/1";
 const SOURCE_PATH = "GET /api/v1/projects/demo/source/episode_1.txt";
 const TASKS_PATH = "GET /api/v1/tasks/active?project_name=demo";
 
-
-interface RecordedProject {
-  project: { episodes: Record<string, unknown>[] } & Record<string, unknown>;
-  scripts: Record<string, unknown>;
-}
 interface RecordedPlan {
   status: {
     content: Record<string, unknown>;
@@ -22,7 +18,7 @@ interface RecordedPlan {
   steps: ({ id: string } & Record<string, unknown>)[];
 }
 
-const project = recorded<RecordedProject>("project-demo.json");
+const recordedEpisode = recordedDemoEpisode();
 const plan = recorded<RecordedPlan>("project-demo-workflow-plan.json");
 
 const BASE: ApiOverrides = {
@@ -48,17 +44,18 @@ const SOURCE_TEXT = Array.from(
     `第 ${i + 1} 段。夜色压低了城墙的轮廓，巡夜人提着灯从箭楼下走过，风把旗子吹得猎猎作响。沈砚停在拐角，听见护城河那边传来一声闷响，像是什么沉甸甸的东西落了水。他没有回头，只把灯往袖子里收了收，沿着墙根慢慢往河边走去。`,
 ).join("\n\n");
 
-function scriptlessProject(episode: Record<string, unknown>): ApiOverrides[string] {
-  const { script_file: _scriptFile, script_status: _scriptStatus, ...recordedEpisode } = project.project.episodes[0];
+function scriptlessProject(episode: Record<string, unknown>): ApiOverrides {
+  const { script_file: _scriptFile, script_status: _scriptStatus, ...baseEpisode } = recordedEpisode;
   return {
-    status: 200,
-    body: {
-      ...project,
-      project: {
-        ...project.project,
-        episodes: [{ ...recordedEpisode, status: "draft", ...episode }],
-      },
-      scripts: {},
+    "GET /api/v1/projects/demo/workspace": {
+      status: 200,
+      body: buildWorkspaceBody({
+        episodes: [{ ...baseEpisode, script_file: "", script_status: "none", status: "draft", ...episode }],
+      }),
+    },
+    "GET /api/v1/projects/demo/scripts/episode_1.json": {
+      status: 404,
+      body: { detail: "Script not found" },
     },
   };
 }
@@ -86,7 +83,7 @@ const SCRIPTLESS_PLAN: ApiOverrides[string] = {
 
 const CUT_EPISODE: ApiOverrides = {
   ...BASE,
-  "GET /api/v1/projects/demo": scriptlessProject({
+  ...scriptlessProject({
     title: "第一集：夜色压低了城墙的轮廓，巡夜人提着灯从箭楼下走过",
     source_origin: "whole_source",
     source_range: { source_file: "source/长夜巡城.txt", start: 12840, end: 16220 },
@@ -101,7 +98,7 @@ const CUT_EPISODE: ApiOverrides = {
 const OWN_TEXT = SOURCE_TEXT.split("\n\n").slice(0, 3).join("\n\n");
 const OWN_EPISODE: ApiOverrides = {
   ...CUT_EPISODE,
-  "GET /api/v1/projects/demo": scriptlessProject({ source_origin: "own", outline: { story_beats: BEATS.slice(0, 4) } }),
+  ...scriptlessProject({ source_origin: "own", outline: { story_beats: BEATS.slice(0, 4) } }),
   [SOURCE_PATH]: { status: 200, body: OWN_TEXT },
 };
 
@@ -241,6 +238,8 @@ async function railLayout(page: Page) {
 defineRegionScenarios("脚本规划起步态", [
   {
     name: "切自整本源文的集：起步区在上、原文只读，导览按视图宽放右栏或原文上方",
+    viewports: "both",
+    a11y: true,
     path: EPISODE_PATH,
     api: CUT_EPISODE,
     ready: cutSourceReady,
@@ -264,7 +263,6 @@ defineRegionScenarios("脚本规划起步态", [
         expect((await box(guideToggle(page))).y).toBeLessThan((await box(source)).y);
       }
     },
-    screenshot: { name: "script-plan-start", target: planPanel },
   },
   {
     name: "起步态滚到底：右栏导览固定在视野里，窄视图的导览可以收起",
@@ -319,7 +317,6 @@ defineRegionScenarios("脚本规划起步态", [
       await expect(source.getByRole("button", { name: "保存" })).toBeVisible();
       await expect(source.getByRole("button", { name: "放弃修改" })).toBeVisible();
     },
-    screenshot: { name: "script-plan-start-editing", target: sourceRegion },
   },
   {
     name: "制作进度的下一步跳到起步区并聚焦附加指令",
@@ -349,7 +346,6 @@ defineRegionScenarios("脚本规划起步态", [
       await expect(instructions(page)).toHaveCount(0);
       await expect(page.getByRole("button", { name: "AI 规划", exact: true })).toHaveCount(0);
     },
-    screenshot: { name: "script-plan-start-running", target: planPanel },
   },
 ]);
 
@@ -373,10 +369,11 @@ defineRegionScenarios("重新规划与内容确认", [
       await expect(dialog.getByRole("button", { name: "交给 Agent" })).toBeVisible();
       await expect(dialog.getByRole("button", { name: "AI 规划" })).toBeVisible();
     },
-    screenshot: { name: "script-plan-replan-dialog", target: replanDialog },
   },
   {
     name: "内容确认页：二十四条长原文分镜只在视图内滚动",
+    viewports: "both",
+    a11y: true,
     path: `${EPISODE_PATH}?view=plan`,
     api: REVIEW_STRESS,
     ready: async (page) => {
@@ -386,7 +383,6 @@ defineRegionScenarios("重新规划与内容确认", [
       await clearAgentOverlay(page);
       await expect(planPanel(page).getByRole("combobox", { name: "分镜 1 时长" })).toBeVisible();
     },
-    screenshot: { name: "script-plan-review", target: planPanel },
   },
   {
     name: "内容确认页展开分镜时长下拉",

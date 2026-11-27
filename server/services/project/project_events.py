@@ -18,7 +18,8 @@ from typing import Any
 
 from lib import PROJECT_ROOT
 from lib.episode.episode_paths import AGENT_PROTECTED_SCRIPT_PLAN_FILENAMES
-from lib.infra.content_digest import FileIdentity, file_identity
+from lib.infra.content_digest import FileIdentity, file_identity, file_version
+from lib.infra.path_safety import try_safe_join
 from lib.project.project_change_hints import (
     ProjectChangeBatch,
     ProjectChangeSource,
@@ -26,11 +27,13 @@ from lib.project.project_change_hints import (
     register_project_change_listener,
 )
 from lib.project.project_manager import ProjectManager
+from lib.script.script_skeleton import SKELETON_ENTITY_TYPES
 from server.services.project.project_state_projection import (
     ProjectSnapshot,
     ProjectState,
     build_snapshot,
     diff_snapshots,
+    locate_items,
     script_plan_state_key,
 )
 from server.sse_channel import IDLE, DropSubscriber, SseChannel, empty_stream
@@ -269,7 +272,9 @@ class ProjectEventService:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    async def _subscribe(self, project_name: str) -> tuple[SseChannel, asyncio.Queue, dict[str, Any]]:
+    async def _subscribe(
+        self, project_name: str, episode: int | None = None
+    ) -> tuple[SseChannel, asyncio.Queue, dict[str, Any]]:
         """Register a queue for *project_name* and return it with the initial snapshot.
 
         Private: the only consumer is :meth:`stream_events`, which owns the
@@ -284,12 +289,32 @@ class ProjectEventService:
 
         try:
             await channel.ready_event.wait()
+            payload = self._build_snapshot_payload(project_name, channel)
+            if episode is not None and channel.snapshot is not None:
+                entry = channel.snapshot.data["episodes"].get(str(episode), {})
+                binding = entry.get("script_file")
+                filename = (
+                    ProjectManager.normalize_script_filename(binding) if isinstance(binding, str) and binding else None
+                )
+
+                def current_file_version() -> str | None:
+                    if filename is None:
+                        return None
+                    path = try_safe_join(self.pm.get_project_path(project_name) / "scripts", filename)
+                    identity = _file_stat(path) if path else None
+                    return file_version(identity) if identity else None
+
+                payload["episode_script"] = {
+                    "episode": episode,
+                    "filename": filename,
+                    "file_version": await asyncio.to_thread(current_file_version),
+                }
+            return channel.sse, queue, payload
         except BaseException:
             if channel.sse.unsubscribe_nowait(queue) and channel.task is not None:
                 channel.task.cancel()
                 self._channels.pop(project_name, None)
             raise
-        return channel.sse, queue, self._build_snapshot_payload(project_name, channel)
 
     async def _unsubscribe(self, project_name: str, queue: asyncio.Queue) -> None:
         """Remove a queue; the last-subscriber hook stops the watch task."""
@@ -300,7 +325,7 @@ class ProjectEventService:
 
     @contextlib.asynccontextmanager
     async def stream_events(
-        self, project_name: str, *, idle_timeout: float = 1.0
+        self, project_name: str, *, idle_timeout: float = 1.0, episode: int | None = None
     ) -> AsyncGenerator[AsyncIterator[tuple[str, Any] | dict[str, Any]]]:
         """Subscribe to a project's events as a self-cleaning async iterator.
 
@@ -322,7 +347,7 @@ class ProjectEventService:
         if self._stopping:
             yield empty_stream()
             return
-        sse, queue, snapshot = await self._subscribe(project_name)
+        sse, queue, snapshot = await self._subscribe(project_name, episode)
 
         async def _iter() -> AsyncIterator[tuple[str, Any] | dict[str, Any]]:
             if self._stopping:
@@ -342,6 +367,10 @@ class ProjectEventService:
         channel = self._channels.get(project_name)
         if channel is not None:
             channel.sse.broadcast(("task_progress", payload))
+
+    def locate_items(self, project_name: str, ids: list[str]) -> list[dict[str, Any]]:
+        channel = self._channels.get(project_name)
+        return locate_items(channel.snapshot if channel else None, ids)
 
     def publish_assistant_session_resumed(self, project_name: str, session_id: str) -> None:
         """向项目订阅者广播会话回到 running；没有订阅者时丢弃。须在事件循环线程调用。"""
@@ -483,6 +512,20 @@ class ProjectEventService:
         changes: list[dict[str, Any]],
     ) -> None:
         """向订阅者广播一批变更（轮询扫描与显式重建两条路径共用同一 payload 形状）。"""
+        pending = [
+            change
+            for change in changes
+            if change.get("entity_type") in SKELETON_ENTITY_TYPES.values() and "position" not in change
+        ]
+        for change, location in zip(
+            pending, self.locate_items(project_name, [c["entity_id"] for c in pending]), strict=True
+        ):
+            change.update(
+                item_id=location["item_id"],
+                location_status=location["status"],
+                position=location["position"],
+                episode=change.get("episode") or location["episode"],
+            )
         payload = {
             "project_name": project_name,
             "batch_id": uuid.uuid4().hex,

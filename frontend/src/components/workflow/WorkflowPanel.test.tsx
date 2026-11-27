@@ -6,7 +6,7 @@ import { useAdScriptStore } from "@/stores/ad-script-store";
 import { useAppStore } from "@/stores/app-store";
 import { useAssistantStore } from "@/stores/assistant-store";
 import { useEpisodeSurfaceStore } from "@/stores/episode-surface-store";
-import { useProjectsStore } from "@/stores/projects-store";
+import { episodeScriptRevisionKey, useProjectsStore } from "@/stores/projects-store";
 import { useScriptPlanStore } from "@/stores/script-plan-store";
 import { defaultTaskStats, useTasksStore } from "@/stores/tasks-store";
 import { useWorkflowStore } from "@/stores/workflow-store";
@@ -242,12 +242,12 @@ describe("WorkflowPanel 准入与置灰", () => {
     expect(within(next).queryByRole("button", { name: "交给 Agent" })).not.toBeInTheDocument();
     fireEvent.click(within(next).getByRole("button", { name: "从空白开始" }));
     await waitFor(() => expect(start).toHaveBeenCalledWith("proj", 1));
-    await waitFor(() => expect(refresh).toHaveBeenCalledWith("proj", undefined));
+    await waitFor(() => expect(refresh).toHaveBeenCalledWith("proj", { scope: { episodes: [1] } }));
   });
 
   it("从空白开始建出脚本后项目刷新失败时提示", async () => {
     vi.spyOn(API, "startBlankScript").mockResolvedValue({ success: true, script_file: "episode_1.json" });
-    vi.spyOn(API, "getProject").mockRejectedValue(new Error("offline"));
+    vi.spyOn(API, "getWorkspace").mockRejectedValue(new Error("offline"));
     const pushToast = vi.spyOn(useAppStore.getState(), "pushToast");
     await renderExpanded(
       scenario({
@@ -333,14 +333,14 @@ describe("WorkflowPanel 剪辑", () => {
     fireEvent.click(within(screen.getByTestId("workflow-next-step")).getByRole("button", { name: "新建剪辑时间线" }));
 
     await waitFor(() => expect(create).toHaveBeenCalledWith("proj", 1, "完整版 2"));
-    await waitFor(() => expect(refresh).toHaveBeenCalledWith("proj", undefined));
+    await waitFor(() => expect(refresh).toHaveBeenCalledWith("proj", { scope: { episodes: [1] } }));
     await waitFor(() => expect(vi.mocked(API.getWorkflowPlan).mock.calls.length).toBeGreaterThan(plans));
   });
 
   it("新建剪辑时间线后项目刷新失败时只提示刷新失败，不同时报告新建成功", async () => {
     vi.spyOn(API, "listEditTimelines").mockResolvedValue({ timelines: [] });
     vi.spyOn(API, "createEditTimeline").mockResolvedValue(createdTimeline("tl-1", "完整版"));
-    vi.spyOn(API, "getProject").mockRejectedValue(new Error("offline"));
+    vi.spyOn(API, "getWorkspace").mockRejectedValue(new Error("offline"));
     const pushToast = vi.spyOn(useAppStore.getState(), "pushToast");
     await renderExpanded(scenario({ next: nextAction("create_edit_timeline"), status: videosReady }));
 
@@ -996,6 +996,92 @@ describe("WorkflowPanel 刷新纪律", () => {
       await waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
     } finally {
       act(() => setRefreshScope(null));
+    }
+  });
+
+  it("queued→running 过渡、非当前集任务与未引用资产任务不触发计划重算", async () => {
+    const spy = mockPlan(
+      scenario({
+        next: nextAction("generate_videos"),
+        status: {
+          artifacts: {
+            asset_sheets: { character: { state: "current", current_ids: ["林默"], stale_ids: [], missing_ids: [] } },
+          },
+        },
+      }),
+    );
+    render(<WorkflowPanel projectName="proj" episode={1} />);
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      seedTasks([makeTask({ task_id: "t-ep1", project_name: "proj", task_type: "video", resource_id: "E1S01", status: "queued" })]);
+    });
+    await settleDebounce();
+    expect(spy).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      seedTasks([makeTask({ task_id: "t-ep1", project_name: "proj", task_type: "video", resource_id: "E1S01", status: "running" })]);
+    });
+    await settleDebounce();
+    expect(spy).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      seedTasks([
+        makeTask({ task_id: "t-ep1", project_name: "proj", task_type: "video", resource_id: "E1S01", status: "running" }),
+        makeTask({ task_id: "t-ep2", project_name: "proj", task_type: "video", resource_id: "E2S01", status: "queued" }),
+        makeTask({ task_id: "t-ep2-done", project_name: "proj", task_type: "video", resource_id: "E2S02", status: "succeeded" }),
+        makeTask({ task_id: "t-asset-other", project_name: "proj", task_type: "character", resource_id: "路人甲", status: "succeeded" }),
+      ]);
+    });
+    await settleDebounce();
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it("同一写入的集修订变化与任务终态在同一防抖窗口内合并为一次计划刷新", async () => {
+    const spy = mockPlan(makePlan());
+    render(<WorkflowPanel projectName="proj" episode={1} />);
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      seedTasks([makeTask({ task_id: "t1", project_name: "proj", task_type: "video", resource_id: "E1S01", status: "succeeded" })]);
+      useProjectsStore.setState((s) => ({
+        episodeRevisions: { ...s.episodeRevisions, [episodeScriptRevisionKey("proj", 1)]: 1 },
+      }));
+    });
+    await settleDebounce();
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it("后台标签页延后计划刷新，切回前台时补取一次", async () => {
+    const originalVisibility = Object.getOwnPropertyDescriptor(document, "visibilityState");
+    let visibility: DocumentVisibilityState = "visible";
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => visibility,
+    });
+    try {
+      const spy = mockPlan(makePlan());
+      render(<WorkflowPanel projectName="proj" episode={1} />);
+      await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+
+      visibility = "hidden";
+      act(() => {
+        seedTasks([makeTask({ task_id: "t1", project_name: "proj", task_type: "video", resource_id: "E1S01", status: "succeeded" })]);
+      });
+      await settleDebounce();
+      expect(spy).toHaveBeenCalledTimes(1);
+
+      visibility = "visible";
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
+    } finally {
+      if (originalVisibility) {
+        Object.defineProperty(document, "visibilityState", originalVisibility);
+      } else {
+        delete (document as { visibilityState?: DocumentVisibilityState }).visibilityState;
+      }
     }
   });
 });

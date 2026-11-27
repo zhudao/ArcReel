@@ -1,10 +1,9 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { Page } from "@playwright/test";
 import { clearAgentOverlay } from "../support/region-helpers.ts";
 import { defineRegionScenarios } from "../support/scenarios.ts";
-import { RECORDED_ACCESS_TOKEN, RECORDED_DIR, type RecordedResponse } from "../support/recorded.ts";
+import { RECORDED_ACCESS_TOKEN } from "../support/recorded.ts";
 import { expect, test, type ApiOverrides } from "../support/test.ts";
+import { buildWorkspaceBody, workspaceOverride } from "../support/workspace-override.ts";
 
 
 const LOBBY_PATH = "/app/projects";
@@ -60,10 +59,6 @@ async function advance(page: Page, steps: number) {
   for (let i = 0; i < steps; i++) await next(page);
 }
 
-const PROJECT = "GET /api/v1/projects/demo";
-const recordedProject = (
-  JSON.parse(readFileSync(join(RECORDED_DIR, "project-demo.json"), "utf8")) as RecordedResponse
-).body as { project: Record<string, unknown> };
 const OVERVIEW = {
   synopsis: "灯塔守夜人在雾季收到一封三十年前寄出的信，循着邮戳找回失踪的邮差。",
   genre: "悬疑",
@@ -72,13 +67,7 @@ const OVERVIEW = {
 };
 const SOURCE_ONLY: ApiOverrides = {
   "GET /api/v1/projects/demo/events/stream": { status: 404, body: { detail: "页面级套件不回放事件流" } },
-  [PROJECT]: {
-    status: 200,
-    body: {
-      ...recordedProject,
-      project: { ...recordedProject.project, overview: undefined, whole_source_files: [{ source_file: "source/novel.txt" }] },
-    },
-  },
+  ...workspaceOverride({ overview: undefined, whole_source_files: [{ source_file: "source/novel.txt" }] }),
 };
 
 defineRegionScenarios("新手引导", [
@@ -86,17 +75,19 @@ defineRegionScenarios("新手引导", [
     name: "首次进入大厅：欢迎气泡居中，遮罩盖住页面",
     path: LOBBY_PATH,
     api: UNSEEN,
+    viewports: "both",
+    a11y: true,
     ready: tourReady,
     act: async (page) => {
       await expect(tourTitle(page)).toHaveText("欢迎使用 ArcReel");
       await expect(tour(page)).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "onboarding-welcome" },
   },
   {
     name: "第 6 步：空大厅上方出现「示例项目」区块，空状态保持不变",
     path: LOBBY_PATH,
     api: EMPTY_LOBBY,
+    viewports: "both",
     ready: tourReady,
     act: async (page) => {
       await advance(page, 5);
@@ -107,7 +98,6 @@ defineRegionScenarios("新手引导", [
       await expectPopoverBesideAnchor(page);
       await expect(tour(page)).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "onboarding-demo-section" },
   },
   {
     name: "第 7 步：演示 Agent 面板，工序行与禁用的输入框",
@@ -122,7 +112,6 @@ defineRegionScenarios("新手引导", [
       await expect(page.getByRole("textbox", { name: /./ }).last()).toBeDisabled();
       await expect(tour(page)).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "onboarding-demo-agent" },
   },
   {
     name: "第 10 步：落到集页的分镜视图",
@@ -160,6 +149,7 @@ defineRegionScenarios("新手引导", [
   {
     name: "演示工作台：顶栏「演示 · 只读」徽标聚焦后显示说明",
     path: DEMO_PATH,
+    a11y: true,
     ready: async (page) => {
       await page.getByText("演示 · 只读").waitFor();
     },
@@ -169,7 +159,6 @@ defineRegionScenarios("新手引导", [
       await expect(page.getByText("演示 · 只读")).toBeFocused();
       await expect(page.locator("[data-slot=tooltip-content]")).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "onboarding-demo-badge", target: (page) => page.getByRole("banner") },
   },
   {
     name: "故事设定从原文生成后，底部出现一次性提示",
@@ -182,14 +171,15 @@ defineRegionScenarios("新手引导", [
       await page.route("**/api/v1/projects/demo/generate-overview", (route) =>
         route.fulfill({ json: { success: true, overview: OVERVIEW } }),
       );
-      await page.route("**/api/v1/projects/demo", (route) => route.fulfill({ json: { ...recordedProject, project: { ...recordedProject.project, overview: OVERVIEW } } }));
+      await page.route("**/api/v1/projects/demo/workspace", (route) =>
+        route.fulfill({ json: buildWorkspaceBody({ overview: OVERVIEW }) }),
+      );
       await clearAgentOverlay(page);
       await page.getByRole("button", { name: "从原文生成" }).click();
       const tip = page.getByRole("status").filter({ hasText: "故事设定已提炼完成" });
       await tip.scrollIntoViewIfNeeded();
       await expect(tip).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "overview-handoff-tip", target: (page) => page.getByRole("status").filter({ hasText: "故事设定已提炼完成" }) },
   },
 ]);
 

@@ -2,7 +2,7 @@ name: domain-filter
 description: >-
   按变更域裁剪 CI：输出 workflow / backend / frontend / docker / website 五个域是否
   被本次变更命中。workflow 域（CI 配置本身）变更时另外四个域保守全量触发；full 输入
-  为 true 时跳过路径过滤，所有域视为已变更（供 nightly 全量与 schedule 事件使用——
+  为 true 时跳过路径过滤，所有域视为已变更（供 Weekly 与发布候选全域巡检使用——
   paths-filter 不支持 schedule 事件的变更比对）。
 
 inputs:
@@ -12,6 +12,9 @@ inputs:
     default: "false"
 
 outputs:
+  recording:
+    description: 录制器、种子、归一化或录制环境输入变更
+    value: ${{ inputs.full == 'true' || steps.filter.outputs.recording == 'true' }}
   workflow:
     description: CI 配置域（.github/、.codecov.yml、.gitignore）是否变更
     value: ${{ steps.gate.outputs.workflow }}
@@ -36,6 +39,19 @@ runs:
       id: filter
       with:
         filters: |
+          recording:
+            - 'scripts/e2e_record_backend.py'
+            - 'tests/fixtures/catalog.json'
+            - 'lib/app_version.py'
+            - 'lib/catalog/lifecycle.py'
+            - 'lib/catalog/query.py'
+            - 'frontend/pnpm-lock.yaml'
+            - 'pyproject.toml'
+            - 'uv.lock'
+            - 'frontend/e2e/record-fixtures.ts'
+            - 'frontend/e2e/support/recorded.ts'
+            - 'frontend/e2e/fixtures/comfyui.ts'
+            - 'frontend/package.json'
           workflow:
             - '.github/**'
             - '.codecov.yml'

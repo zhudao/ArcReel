@@ -13,6 +13,7 @@ import { selectActiveResourceIds, selectHasActiveTaskForScriptFile, useTasksStor
 import { StudioCanvasRouter } from "@/components/canvas/StudioCanvasRouter";
 import { episodeEditViewPath } from "@/app-routes";
 import { DEMO_PROJECT_NAME } from "@/onboarding/demo-project";
+import { makeWorkspaceResponse } from "@/test/factories";
 import type { AdEpisodeScript, EpisodeScript, ProjectData } from "@/types";
 
 vi.mock("@/components/workflow/WorkflowPanel", () => ({
@@ -22,6 +23,7 @@ vi.mock("@/components/workflow/WorkflowPanel", () => ({
     onRegenerate?: (stepId: string, unitIds: string[]) => void;
   }) => (
     <div data-testid="workflow-panel" data-can-regenerate={onRegenerate ? "yes" : "no"}>
+      <button onClick={() => onRegenerate?.("storyboard", ["SEG-1", "SEG-2"])}>workflow-regenerate-all</button>
       <button onClick={() => onRegenerate?.("storyboard", ["SEG-1"])}>workflow-regenerate</button>
       <button onClick={() => onRegenerate?.("video", ["SEG-1"])}>workflow-regenerate-video</button>
     </div>
@@ -349,6 +351,15 @@ async function renameEpisode(title: string) {
 }
 
 function renderAt(path: string) {
+  const episode = Number(/^\/episodes\/(\d+)/.exec(path)?.[1]);
+  const state = useProjectsStore.getState();
+  const file = state.currentProjectData?.episodes.find((ep) => ep.episode === episode)?.script_file?.replace(/^scripts\//, "");
+  if (file && state.currentScripts[file] && state.activeEpisodeScript.status === "idle") {
+    useProjectsStore.setState({
+      activeEpisodeScript: { ...state.activeEpisodeScript, projectName: state.currentProjectName,
+        episode, scriptFile: file, status: "ready" },
+    });
+  }
   const { hook } = memoryLocation({ path });
   return render(
     <Router hook={hook}>
@@ -988,6 +999,63 @@ describe("StudioCanvasRouter", () => {
     });
   });
 
+  it("blocks single-shot and workflow requests until the bound script recovers", async () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo", currentProjectData: makeProjectData(),
+      currentScripts: { "episode_1.json": makeScript() },
+      activeEpisodeScript: { ...useProjectsStore.getState().activeEpisodeScript, projectName: "demo",
+        episode: 1, scriptFile: "episode_1.json", status: "loading" },
+    });
+    const storyboard = vi.spyOn(API, "generateStoryboard").mockRejectedValue(new Error("unexpected request"));
+    const video = vi.spyOn(API, "generateVideo").mockRejectedValue(new Error("unexpected request"));
+    renderAt("/episodes/1");
+    const generate = () => {
+      for (const label of ["generate-storyboard", "generate-video", "workflow-regenerate", "workflow-regenerate-video"]) {
+        fireEvent.click(screen.getByText(label));
+      }
+    };
+    generate();
+    const target = useProjectsStore.getState().activeEpisodeScript;
+    act(() => useProjectsStore.setState({ activeEpisodeScript: { ...target, status: "error" } }));
+    generate();
+    expect(storyboard).not.toHaveBeenCalled();
+    expect(video).not.toHaveBeenCalled();
+
+    const fresh = makeScript();
+    if (!("segments" in fresh)) throw new Error("expected narration");
+    fresh.segments[0].image_prompt = "fresh image";
+    fresh.segments[0].video_prompt = "fresh video";
+    act(() => useProjectsStore.setState({
+      currentScripts: { "episode_1.json": fresh }, activeEpisodeScript: { ...target, status: "ready" },
+    }));
+    await act(async () => generate());
+    expect(storyboard).toHaveBeenCalledTimes(2);
+    expect(video).toHaveBeenCalledTimes(2);
+    expect(storyboard.mock.calls.every(([, , prompt]) => prompt === "fresh image")).toBe(true);
+    expect(video.mock.calls.every(([, , prompt]) => prompt === "fresh video")).toBe(true);
+  });
+
+  it("rechecks the prompt before sending each workflow item", async () => {
+    const script = makeScript();
+    if (!("segments" in script)) throw new Error("expected narration");
+    script.segments.push({ ...script.segments[0], segment_id: "SEG-2" });
+    useProjectsStore.setState({
+      currentProjectName: "demo", currentProjectData: makeProjectData(),
+      currentScripts: { "episode_1.json": script },
+    });
+    const storyboard = vi.spyOn(API, "generateStoryboard").mockImplementationOnce(async () => {
+      useProjectsStore.setState(({ activeEpisodeScript }) => ({
+        activeEpisodeScript: { ...activeEpisodeScript, projectName: "demo",
+          episode: 1, scriptFile: "episode_1.json", status: "loading" },
+      }));
+      return { success: true, task_id: "first", deduped: false, message: "ok" };
+    });
+    renderAt("/episodes/1");
+    await act(async () => fireEvent.click(screen.getByText("workflow-regenerate-all")));
+    expect(storyboard).toHaveBeenCalledTimes(1);
+    expect(storyboard.mock.calls[0][1]).toBe("SEG-1");
+  });
+
   it("runs timeline callbacks and handles generation failures", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
@@ -1064,6 +1132,10 @@ describe("StudioCanvasRouter", () => {
     });
     expect(updateSegment).toHaveBeenCalledTimes(1);
     expect(screen.getByText("update-prompt-await")).toHaveAttribute("data-update-pending", "true");
+
+    const storyboard = vi.spyOn(API, "generateStoryboard").mockRejectedValue(new Error("unexpected request"));
+    fireEvent.click(screen.getByText("workflow-regenerate"));
+    expect(storyboard).not.toHaveBeenCalled();
 
     resolveUpdate({ success: true });
 
@@ -1167,10 +1239,9 @@ describe("StudioCanvasRouter", () => {
       currentScripts: { "episode_1.json": script },
     });
 
-    vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData({ content_mode: "ad" }),
-      scripts: { "episode_1.json": script },
-    });
+    vi.spyOn(API, "getWorkspace").mockResolvedValue(
+      makeWorkspaceResponse(makeProjectData({ content_mode: "ad" })),
+    );
     const moveSpy = vi.spyOn(API, "moveScriptItem").mockResolvedValue({ success: true });
 
     renderAt("/episodes/1");
@@ -1232,7 +1303,7 @@ describe("StudioCanvasRouter", () => {
       currentScripts: { "episode_1.json": script },
     });
 
-    vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+    vi.spyOn(API, "getWorkspace").mockRejectedValue(new Error("network down"));
     vi.spyOn(API, "moveScriptItem").mockResolvedValue({ success: true });
 
     renderAt("/episodes/1");
@@ -1250,7 +1321,7 @@ describe("StudioCanvasRouter", () => {
       currentProjectData: makeProjectData({ content_mode: "ad" }),
       currentScripts: { "episode_1.json": script },
     });
-    vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+    vi.spyOn(API, "getWorkspace").mockRejectedValue(new Error("network down"));
     vi.spyOn(API, "moveScriptItem").mockResolvedValue({ success: true });
 
     renderAt("/episodes/1");
@@ -1272,7 +1343,7 @@ describe("StudioCanvasRouter", () => {
         currentProjectData: makeProjectData({ content_mode: "ad" }),
         currentScripts: { "episode_1.json": script },
       });
-      vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+      vi.spyOn(API, "getWorkspace").mockRejectedValue(new Error("network down"));
       const editSpy = vi.spyOn(API, apiMethod).mockResolvedValue({ success: true } as never);
 
       renderAt("/episodes/1");
@@ -1494,10 +1565,7 @@ describe("StudioCanvasRouter", () => {
       currentScripts: { "episode_1.json": makeScript() },
     });
 
-    vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData(),
-      scripts: { "episode_1.json": makeScript() },
-    });
+    vi.spyOn(API, "getWorkspace").mockResolvedValue(makeWorkspaceResponse(makeProjectData()));
     vi.spyOn(API, "updateEpisode").mockResolvedValue({ success: true });
 
     renderAt("/episodes/1");
@@ -1505,7 +1573,7 @@ describe("StudioCanvasRouter", () => {
     await renameEpisode("新标题");
     await waitFor(() => {
       expect(API.updateEpisode).toHaveBeenCalledWith("demo", 1, { title: "新标题" });
-      expect(API.getProject).toHaveBeenCalled();
+      expect(API.getWorkspace).toHaveBeenCalled();
     });
     await waitFor(() => expect(screen.queryByRole("textbox", { name: "编辑分集标题" })).not.toBeInTheDocument());
     expect(useAppStore.getState().toast).toBeNull();
@@ -1517,7 +1585,7 @@ describe("StudioCanvasRouter", () => {
       currentProjectData: makeProjectData(),
       currentScripts: { "episode_1.json": makeScript() },
     });
-    vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+    vi.spyOn(API, "getWorkspace").mockRejectedValue(new Error("network down"));
     vi.spyOn(API, "updateEpisode").mockResolvedValue({ success: true });
 
     renderAt("/episodes/1");
@@ -1537,7 +1605,7 @@ describe("StudioCanvasRouter", () => {
         currentProjectData: makeProjectData(),
         currentScripts: { "episode_1.json": makeScript() },
       });
-      vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+      vi.spyOn(API, "getWorkspace").mockRejectedValue(new Error("network down"));
 
       renderAt("/characters");
 

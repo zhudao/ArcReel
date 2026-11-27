@@ -285,6 +285,7 @@ defineRegionScenarios("使用记录", [
   },
   {
     name: "记录满一页且名称很长，表格滚到底后最后一行与分页可见",
+    a11y: true,
     path: USAGE,
     api: STRESS,
     ready: recordsReady,
@@ -298,17 +299,20 @@ defineRegionScenarios("使用记录", [
       await expect(page.getByRole("button", { name: "下一页" })).toBeInViewport();
     },
     // 记录区比视口高，截区域会留下滚出视口的空白；截滚到底后的主区域，即用户看到的最后几行与分页。
-    screenshot: { name: "usage-records", target: (page) => page.getByRole("main") },
   },
   {
     name: "趋势、构成与需要关注在压力数据下不裁切",
+    viewports: "both",
     path: USAGE,
     api: STRESS,
     ready: recordsReady,
-    screenshot: { name: "usage-overview", target: (page) => page.getByRole("region", { name: "趋势" }) },
+    act: async (page) => {
+      await page.evaluate(() => document.fonts.ready);
+    },
   },
   {
     name: "从深链打开长提示词的详情弹窗，只有弹窗主体滚动",
+    a11y: true,
     path: `${USAGE}&record=7`,
     api: STRESS,
     ready: async (page) => {
@@ -319,7 +323,6 @@ defineRegionScenarios("使用记录", [
       await expect(dialog).toBeInViewport({ ratio: 1 });
       await expect(dialog.getByRole("button", { name: "关闭" })).toBeInViewport();
     },
-    screenshot: { name: "usage-detail", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "打开项目筛选下拉，长标题选项留在视口内",
@@ -349,10 +352,10 @@ defineRegionScenarios("使用记录", [
       await main.evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
       await expect(page.getByRole("button", { name: "下一页" })).toBeInViewport();
     },
-    screenshot: { name: "usage-agent-session-detail", target: (page) => page.getByRole("table", { name: /第 1 次分镜讨论/ }) },
   },
   {
     name: "顶栏使用记录弹层在进行中与已结束都很多时，两栏各自滚动、底部链接可见",
+    viewports: "both",
     path: EPISODE_PATH,
     api: POPOVER_STRESS,
     ready: async (page) => {
@@ -365,6 +368,5 @@ defineRegionScenarios("使用记录", [
       await expect(popover).toBeInViewport({ ratio: 1 });
       await expect(popover.getByRole("link", { name: "查看全部记录" })).toBeInViewport();
     },
-    screenshot: { name: "usage-popover", target: (page) => page.getByRole("dialog", { name: "使用记录" }) },
   },
 ]);

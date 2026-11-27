@@ -50,8 +50,8 @@ function statusRows(names: string[], stale: Set<string>, missing: Set<string>) {
 }
 
 function projectWith(characters: Record<string, Character>, episodeTitles?: string[]) {
-  const recorded = loadRecordedResponses().get(recordedKey("GET", "/api/v1/projects/demo"));
-  if (!recorded) throw new Error("没有录制 GET /api/v1/projects/demo");
+  const recorded = loadRecordedResponses().get(recordedKey("GET", "/api/v1/projects/demo/workspace"));
+  if (!recorded) throw new Error("没有录制 GET /api/v1/projects/demo/workspace");
   const body = structuredClone(recorded.body) as { project: Record<string, unknown> };
   body.project.characters = characters;
   if (episodeTitles) {
@@ -100,8 +100,8 @@ const RUNNING_TASKS = {
 
 const BASE: ApiOverrides = {
   "GET /api/v1/projects/demo/events/stream": { status: 404, body: { detail: "页面级套件不回放事件流" } },
-  "GET /api/v1/projects/demo": projectWith(CHARACTERS),
-  "GET /api/v1/projects/demo/asset-sheets/status": statusRows(
+  "GET /api/v1/projects/demo/workspace": projectWith(CHARACTERS),
+  "GET /api/v1/projects/demo/asset-sheets/status?include=derivative_references": statusRows(
     Object.keys(CHARACTERS),
     new Set(["沈砚"]),
     new Set(["阿岚", "小满"]),
@@ -141,15 +141,15 @@ const MANY: Record<string, Character> = Object.fromEntries(
 );
 const MANY_API: ApiOverrides = {
   ...BASE,
-  "GET /api/v1/projects/demo": projectWith(MANY),
-  "GET /api/v1/projects/demo/asset-sheets/status": { status: 200, body: { assets: [] } },
+  "GET /api/v1/projects/demo/workspace": projectWith(MANY),
+  "GET /api/v1/projects/demo/asset-sheets/status?include=derivative_references": { status: 200, body: { assets: [] } },
   "GET /api/v1/tasks/active?project_name=demo": { status: 200, body: { items: [], truncated: false } },
 };
 
 const DELETE_PREVIEW_KEY = "DELETE /api/v1/projects/demo/characters/林夕?dry_run=true";
 const DELETE_API: ApiOverrides = {
   ...BASE,
-  "GET /api/v1/projects/demo": projectWith(CHARACTERS, ["茶馆开张", "夜访账房", "说书先生"]),
+  "GET /api/v1/projects/demo/workspace": projectWith(CHARACTERS, ["茶馆开张", "夜访账房", "说书先生"]),
   [DELETE_PREVIEW_KEY]: {
     status: 200,
     body: {
@@ -168,7 +168,7 @@ const DELETE_API: ApiOverrides = {
 const MANY_EPISODES = Array.from({ length: 30 }, (_, i) => `${LONG_NAME}的第 ${i + 1} 段故事`);
 const DELETE_MANY_API: ApiOverrides = {
   ...BASE,
-  "GET /api/v1/projects/demo": projectWith(CHARACTERS, MANY_EPISODES),
+  "GET /api/v1/projects/demo/workspace": projectWith(CHARACTERS, MANY_EPISODES),
   [DELETE_PREVIEW_KEY]: {
     status: 200,
     body: {
@@ -217,8 +217,8 @@ const VIEWER_API: ApiOverrides = {
 };
 const VIEWER_MANY_API: ApiOverrides = {
   ...BASE,
-  "GET /api/v1/projects/demo": projectWith({ [LONG_NAME]: { description: LONG_DESCRIPTION, character_sheet: sheetSvg(200) }, ...CHARACTERS }),
-  "GET /api/v1/projects/demo/asset-sheets/status": { status: 200, body: { assets: [] } },
+  "GET /api/v1/projects/demo/workspace": projectWith({ [LONG_NAME]: { description: LONG_DESCRIPTION, character_sheet: sheetSvg(200) }, ...CHARACTERS }),
+  "GET /api/v1/projects/demo/asset-sheets/status?include=derivative_references": { status: 200, body: { assets: [] } },
   [`GET /api/v1/projects/demo/versions/characters/${LONG_NAME}`]: versionsOf(LONG_NAME, 60),
 };
 
@@ -263,6 +263,7 @@ defineRegionScenarios("资产画廊", [
     name: "浏览卡网格按画布宽度加列，状态标记在图片左上角",
     path: PATH,
     api: BASE,
+    a11y: true,
     ready: galleryReady,
     act: async (page) => {
       const xiaoman = page.getByRole("article", { name: "小满" });
@@ -274,12 +275,12 @@ defineRegionScenarios("资产画廊", [
         expect(await columnCount(page)).toBe(2);
       }
     },
-    screenshot: { name: "asset-gallery", target: (page) => page.getByRole("region", { name: "角色" }) },
   },
   {
     name: "条目多且名字与描述很长：卡片不撑破网格，工具栏留在顶部",
     path: PATH,
     api: MANY_API,
+    viewports: "both",
     ready: async (page) => {
       await expect(cards(page)).toHaveCount(40);
     },
@@ -308,12 +309,12 @@ defineRegionScenarios("资产画廊", [
     name: "打开卡片的「更多」菜单",
     path: PATH,
     api: BASE,
+    a11y: true,
     ready: galleryReady,
     act: async (page) => {
       const menu = await openMenu(page, "林夕");
       await expect(menu.getByRole("menuitem", { name: "并入…" })).toBeVisible();
     },
-    screenshot: { name: "asset-gallery-menu", target: (page) => page.getByRole("menu") },
   },
   {
     name: "从菜单打开版本历史",
@@ -328,7 +329,6 @@ defineRegionScenarios("资产画廊", [
       await waitForEntrance(popover);
       await expect(popover.getByRole("button", { name: "v3" })).toBeVisible();
     },
-    screenshot: { name: "asset-gallery-versions", target: (page) => page.getByRole("dialog", { name: "历史版本" }) },
   },
   {
     name: "从菜单打开局部修改",
@@ -385,7 +385,6 @@ defineRegionScenarios("资产画廊", [
       await expect(dialog.getByRole("button", { name: "改为并入…" })).toBeVisible();
       await expect(dialog.getByRole("button", { name: "删除" })).toBeEnabled();
     },
-    screenshot: { name: "asset-gallery-delete", target: (page) => page.getByRole("alertdialog") },
   },
   {
     name: "删除被很多集引用的资产：只有影响清单滚动，按钮留在视野里",
@@ -404,6 +403,7 @@ defineRegionScenarios("资产画廊", [
     name: "查看大图：←/→ 只在有资产图的资产之间切换",
     path: PATH,
     api: VIEWER_API,
+    a11y: true,
     ready: galleryReady,
     act: async (page) => {
       let viewer = await openViewer(page, "林夕");
@@ -423,7 +423,6 @@ defineRegionScenarios("资产画廊", [
       await expect(viewer.getByRole("img", { name: "「林夕」的资产图，第 3 版" })).toBeVisible();
       await expect(viewer.getByRole("button", { name: "编辑" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "asset-viewer", target: (page) => page.getByRole("dialog", { name: "林夕", exact: true }) },
   },
   {
     name: "查看大图：点旧版本只查看，还原要单独确认",
@@ -440,12 +439,12 @@ defineRegionScenarios("资产画廊", [
       await waitForEntrance(confirm);
       await expect(confirm.getByRole("button", { name: "还原" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "asset-viewer-restore", target: (page) => page.getByRole("alertdialog") },
   },
   {
     name: "查看大图：名字很长、版本很多时版本条横向滚动，操作留在视野里",
     path: PATH,
     api: VIEWER_MANY_API,
+    viewports: "both",
     ready: async (page) => {
       await expect(cards(page).first()).toBeVisible();
     },

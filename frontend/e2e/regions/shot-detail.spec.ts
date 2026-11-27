@@ -1,19 +1,12 @@
 import { box, viewport, waitForEntrance, clearAgentOverlay } from "../support/region-helpers.ts";
 import type { Page } from "@playwright/test";
-import { defineRegionScenarios } from "../support/scenarios.ts";
-import { recorded } from "../support/recorded.ts";
+import { defineRegionScenarios, defineViewportContracts } from "../support/scenarios.ts";
 import { expect, test, type ApiOverrides } from "../support/test.ts";
+import { recordedDemoScript, workspaceOverride } from "../support/workspace-override.ts";
 
 const BOARD_PATH = "/app/projects/demo/episodes/1";
 
-
-interface RecordedProject {
-  project: Record<string, unknown>;
-  scripts: Record<string, Record<string, unknown>>;
-}
-
-const project = recorded<RecordedProject>("project-demo.json");
-const recordedScript = project.scripts["episode_1.json"];
+const recordedScript = recordedDemoScript().script;
 
 const shotId = (n: number) => `E1S${String(n).padStart(2, "0")}`;
 
@@ -92,24 +85,21 @@ const scenes = Array.from({ length: SHOT_COUNT }, (_, i) => {
 
 const API: ApiOverrides = {
   "GET /api/v1/projects/demo/events/stream": { status: 404, body: { detail: "页面级套件不回放事件流" } },
-  "GET /api/v1/projects/demo": {
-    status: 200,
-    body: {
-      ...project,
-      project: {
-        ...project.project,
-        content_mode: "drama",
-        characters: Object.fromEntries(
-          CHARACTERS.map((name, i) => [name, { description: `${name}的设定`, character_sheet: refSvg(i * 50) }]),
-        ),
-        scenes: { [SCENE]: { description: "茶馆二楼", scene_sheet: refSvg(200) } },
-        props: Object.fromEntries(PROPS.map((name, i) => [name, { description: name, prop_sheet: refSvg(260 + i * 40) }])),
-      },
+  ...workspaceOverride(
+    {
+      content_mode: "drama",
+      characters: Object.fromEntries(
+        CHARACTERS.map((name, i) => [name, { description: `${name}的设定`, character_sheet: refSvg(i * 50) }]),
+      ),
+      scenes: { [SCENE]: { description: "茶馆二楼", scene_sheet: refSvg(200) } },
+      props: Object.fromEntries(PROPS.map((name, i) => [name, { description: name, prop_sheet: refSvg(260 + i * 40) }])),
+    },
+    {
       scripts: {
         "episode_1.json": { ...recordedScript, content_mode: "drama", segments: undefined, scenes },
       },
     },
-  },
+  ),
   "GET /api/v1/projects/demo/versions/storyboards/E1S01": {
     status: 200,
     body: {
@@ -153,7 +143,6 @@ const API_WITH_DURATIONS: ApiOverrides = {
 
 
 const shotList = (page: Page) => page.getByRole("navigation", { name: "分镜列表" });
-const detail = (page: Page) => page.getByRole("tabpanel");
 const agentToggle = (page: Page) => page.getByRole("button", { name: "Agent", exact: true });
 const storyboard = (page: Page) => page.getByRole("img", { name: "分镜 1 分镜图" });
 
@@ -167,30 +156,25 @@ defineRegionScenarios("分镜详情", [
     name: "中栏先引用后提示词与台词，媒体栏放分镜图与视频",
     path: BOARD_PATH,
     api: API,
+    viewports: "both",
+    a11y: true,
     ready: boardReady,
     act: async (page) => {
       await expect(shotList(page).getByRole("button", { name: /^分镜 1(?!\d)/ })).toHaveAttribute("aria-current", "true");
-      const { width } = viewport(page);
-      if (width === 1440) {
+      if (viewport(page).width === 1440) {
         await expect(agentToggle(page)).toHaveAttribute("aria-pressed", "true");
         await expect(page.getByRole("heading", { name: "引用" })).toBeInViewport();
         await expect(page.getByRole("heading", { name: "发声序列" })).toBeInViewport();
       }
-      if (width === 1920) {
-        const image = await box(storyboard(page));
-        const video = await box(page.getByRole("heading", { name: "视频", exact: true }));
-        expect(video.x).toBeGreaterThan(image.x + image.width - 1);
-        expect(Math.abs(video.y - image.y)).toBeLessThan(80);
-      }
       await expect(page.getByRole("button", { name: "对应原文与参考" })).toHaveAttribute("aria-expanded", "false");
       await clearAgentOverlay(page);
     },
-    screenshot: { name: "shot-detail-board", target: detail },
   },
   {
     name: "收起分镜列表后只剩序号列，详情跟着变宽",
     path: BOARD_PATH,
     api: API,
+    viewports: "both",
     ready: boardReady,
     act: async (page) => {
       const before = await box(shotList(page));
@@ -228,12 +212,12 @@ defineRegionScenarios("分镜详情", [
       await expect(popover.getByRole("textbox")).toBeFocused();
       await waitForEntrance(popover);
     },
-    screenshot: { name: "shot-detail-notes", target: (page) => page.getByRole("dialog", { name: "备注" }) },
   },
   {
     name: "打开分镜图的版本历史并预览旧版本",
     path: BOARD_PATH,
     api: API,
+    viewports: "both",
     ready: boardReady,
     act: async (page) => {
       await clearAgentOverlay(page);
@@ -250,7 +234,6 @@ defineRegionScenarios("分镜详情", [
       expect(rect.y + rect.height).toBeLessThanOrEqual(height);
       expect(rect.x + rect.width).toBeLessThanOrEqual(width);
     },
-    screenshot: { name: "shot-detail-versions", target: (page) => page.getByRole("dialog", { name: "历史版本" }) },
   },
   {
     name: "改了提示词后出现未保存提示条，生成按钮改为保存并生成",
@@ -265,7 +248,21 @@ defineRegionScenarios("分镜详情", [
       await expect(page.getByRole("button", { name: "放弃修改" })).toBeVisible();
       await expect(page.getByRole("button", { name: /^保存并生成/ }).first()).toBeAttached();
     },
-    screenshot: { name: "shot-detail-unsaved", target: detail },
+  },
+  {
+    name: "从单集返回项目概览时可继续编辑并保留草稿",
+    path: BOARD_PATH,
+    api: API,
+    ready: boardReady,
+    act: async (page) => {
+      await clearAgentOverlay(page);
+      const prompt = page.getByRole("textbox", { name: "分镜图提示词" });
+      await prompt.fill("保留这次修改");
+      await page.getByRole("link", { name: "项目概览", exact: true }).click();
+      await page.getByRole("alertdialog").getByRole("button", { name: "继续编辑" }).click();
+      await expect(prompt).toHaveValue("保留这次修改");
+      await expect(page).toHaveURL(/episodes\/1/);
+    },
   },
   {
     name: "有未保存修改时按 J 切换分镜先询问",
@@ -280,10 +277,10 @@ defineRegionScenarios("分镜详情", [
       await expect(dialog.getByRole("button", { name: "保存并切换" })).toBeVisible();
       await waitForEntrance(dialog);
     },
-    screenshot: { name: "shot-detail-leave-confirm", target: (page) => page.getByRole("alertdialog") },
   },
   {
     name: "打开时长弹层",
+    viewports: "both",
     path: BOARD_PATH,
     api: API_WITH_DURATIONS,
     ready: boardReady,
@@ -297,12 +294,12 @@ defineRegionScenarios("分镜详情", [
       expect(rect.y + rect.height).toBeLessThanOrEqual(height);
       expect(rect.x + rect.width).toBeLessThanOrEqual(width);
     },
-    screenshot: { name: "shot-detail-duration", target: (page) => page.getByRole("dialog", { name: "时长选择" }) },
   },
   {
     name: "打开引用编辑对话框并改动引用",
     path: BOARD_PATH,
     api: API,
+    a11y: true,
     ready: boardReady,
     act: async (page) => {
       await clearAgentOverlay(page);
@@ -312,7 +309,6 @@ defineRegionScenarios("分镜详情", [
       await expect(dialog.getByText("引用有改动，确定后生效")).toBeVisible();
       await waitForEntrance(dialog);
     },
-    screenshot: { name: "shot-detail-refs-dialog", target: (page) => page.getByRole("dialog", { name: /引用/ }) },
   },
   {
     name: "把文本提示词切回结构化前确认",
@@ -345,24 +341,45 @@ defineRegionScenarios("分镜详情", [
       expect((await move).postDataJSON()).toEqual({ script_file: "episode_1.json", after_id: null });
     },
   },
+]);
+
+defineViewportContracts("分镜详情", [
+  {
+    name: "宽屏下分镜图与视频并排展示",
+    viewport: { width: 1920, height: 1080 },
+    path: BOARD_PATH,
+    api: API,
+    ready: boardReady,
+    act: async (page) => {
+      const image = await box(storyboard(page));
+      const video = await box(page.getByRole("heading", { name: "视频", exact: true }));
+      expect(video.x).toBeGreaterThan(image.x + image.width - 1);
+      expect(Math.abs(video.y - image.y)).toBeLessThan(80);
+    },
+  },
   {
     name: "500 镜仍可流畅滚动并用单次方向键排序",
+    viewport: { width: 1440, height: 900 },
     path: BOARD_PATH,
     api: {
       ...API,
-      "GET /api/v1/projects/demo": {
-        status: 200,
-        body: {
-          ...project,
-          project: { ...project.project, content_mode: "drama" },
-          scripts: { "episode_1.json": { ...recordedScript, content_mode: "drama", segments: undefined,
-            scenes: Array.from({ length: 500 }, (_, i) => ({ ...scenes[1], scene_id: shotId(i + 1) })),
-          } },
+      ...workspaceOverride(
+        { content_mode: "drama" },
+        {
+          scripts: {
+            "episode_1.json": {
+              ...recordedScript,
+              content_mode: "drama",
+              segments: undefined,
+              scenes: Array.from({ length: 500 }, (_, i) => ({ ...scenes[1], scene_id: shotId(i + 1) })),
+            },
+          },
         },
-      },
+      ),
       "POST /api/v1/projects/demo/script-items/E1S500/move": { status: 200, body: { success: true } },
     },
     ready: boardReady,
+    layout: false,
     slow: true,
     act: async (page) => {
       const list = shotList(page);
@@ -380,8 +397,6 @@ defineRegionScenarios("分镜详情", [
         }
         return intervals;
       });
-      // 帧耗时只在单 worker 运行时断言（CI 的 frontend-e2e 每片单 worker）：30 帧滚动不应出现半秒主线程停顿
-      // 或累计超过 2 秒。多 worker 并行时 CPU 争用会拉长帧间隔，量到的不是页面自身的耗时，只跑后面的排序部分。
       if (test.info().config.workers === 1) {
         expect(Math.max(...frames), `500 镜滚动帧间隔：${JSON.stringify(frames)}`).toBeLessThan(500);
         expect(frames.reduce((sum, value) => sum + value, 0)).toBeLessThan(2000);
@@ -401,5 +416,5 @@ defineRegionScenarios("分镜详情", [
       await page.keyboard.press("Space");
       expect((await move).postDataJSON()).toEqual({ script_file: "episode_1.json", after_id: "E1S498" });
     },
-  }
+  },
 ]);

@@ -1,31 +1,21 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { defineRegionScenarios } from "../support/scenarios.ts";
 import { waitForEntrance } from "../support/region-helpers.ts";
-import { RECORDED_DIR, type RecordedResponse } from "../support/recorded.ts";
+import { recorded } from "../support/recorded.ts";
 import { expect, type ApiOverrides } from "../support/test.ts";
+import { recordedDemoEpisode, recordedDemoWorkspace, workspaceOverride } from "../support/workspace-override.ts";
 
 const OVERVIEW_PATH = "/app/projects/demo";
-const PROJECT = "GET /api/v1/projects/demo";
 const EVENT_STREAM: ApiOverrides = {
   "GET /api/v1/projects/demo/events/stream": { status: 404, body: { detail: "页面级套件不回放事件流" } },
 };
 
-interface RecordedProject {
-  project: Record<string, unknown> & { episodes: Record<string, unknown>[]; status: Record<string, unknown> };
-}
-
-const recordedProject = (
-  JSON.parse(readFileSync(join(RECORDED_DIR, "project-demo.json"), "utf8")) as RecordedResponse
-).body as RecordedProject;
-const recordedCost = (
-  JSON.parse(readFileSync(join(RECORDED_DIR, "project-demo-cost-estimate.json"), "utf8")) as RecordedResponse
-).body as Record<string, unknown>;
-const [firstEpisode] = recordedProject.project.episodes;
+const recordedWorkspace = recordedDemoWorkspace();
+const recordedCost = recorded<Record<string, unknown>>("project-demo-cost-estimate.json");
+const firstEpisode = recordedDemoEpisode();
 
 function withProject(project: Record<string, unknown>): ApiOverrides {
-  return { [PROJECT]: { status: 200, body: { ...recordedProject, project: { ...recordedProject.project, ...project } } } };
+  return workspaceOverride(project);
 }
 
 const repeat = (text: string, times: number) => Array.from({ length: times }, () => text).join("");
@@ -55,12 +45,12 @@ const LONG_PROJECT: ApiOverrides = {
       duration_seconds: 95,
     })),
     status: {
-      ...recordedProject.project.status,
+      ...recordedWorkspace.summary,
       assets: {
-        character: { total: 128, available: 120, stale: 14 },
-        scene: { total: 96, available: 61, stale: 7 },
-        prop: { total: 210, available: 210, stale: 23 },
-        product: { total: 0, available: 0, stale: 0 },
+        character: { total: 128, available: 120 },
+        scene: { total: 96, available: 61 },
+        prop: { total: 210, available: 210 },
+        product: { total: 0, available: 0 },
       },
     },
   }),
@@ -138,6 +128,8 @@ defineRegionScenarios("项目概览", [
     name: "录制的演示项目：页头元信息、资产与费用两行、空的故事设定",
     path: OVERVIEW_PATH,
     api: EVENT_STREAM,
+    viewports: "both",
+    a11y: true,
     ready: overviewReady,
     act: async (page) => {
       await expect(page.getByRole("heading", { level: 1, name: "演示项目" })).toBeVisible();
@@ -148,18 +140,18 @@ defineRegionScenarios("项目概览", [
       const padding = canvas.width >= 768 ? 32 : 24;
       expect(column.x - canvas.x).toBe(padding);
       expect(column.width).toBeLessThanOrEqual(760);
-      if ((page.viewportSize()?.width ?? 0) >= 2560) expect(column.width).toBe(760);
+      if ((page.viewportSize()?.width ?? 0) >= 1440) expect(column.width).toBe(760);
     },
-    screenshot: { name: "overview-column", target: (page) => storySetting(page).locator("xpath=..") },
   },
   {
-    name: "长文本故事设定与多条资产过期：字段随内容撑高，由画布滚动到底",
+    name: "长文本故事设定与多类资产计数：字段随内容撑高，由画布滚动到底",
     path: OVERVIEW_PATH,
     api: LONG_PROJECT,
+    viewports: "both",
     ready: overviewReady,
     act: async (page) => {
       await collapseAgentPanel(page);
-      await expect(page.getByRole("link", { name: "道具 210/210 · 23 过期" })).toBeVisible();
+      await expect(page.getByRole("link", { name: "道具 210/210" })).toBeVisible();
       const world = storySetting(page).getByRole("textbox", { name: "世界观" });
       await world.scrollIntoViewIfNeeded();
       await expect(world).toBeInViewport();
@@ -169,6 +161,7 @@ defineRegionScenarios("项目概览", [
     name: "费用明细：多币种与历史支出在弹层里分两列，底部链接到使用记录",
     path: OVERVIEW_PATH,
     api: LONG_PROJECT,
+    a11y: true,
     ready: overviewReady,
     act: async (page) => {
       await collapseAgentPanel(page);
@@ -177,7 +170,6 @@ defineRegionScenarios("项目概览", [
       await popover.waitFor();
       await expect(popover.getByRole("link", { name: "查看使用记录" })).toBeInViewport();
     },
-    screenshot: { name: "overview-cost-details", target: (page) => page.getByRole("dialog", { name: "费用明细" }) },
   },
   {
     name: "费用拿不到完整数字：说明原因，列出没有价格的模型并链接到设置价格",
@@ -195,10 +187,6 @@ defineRegionScenarios("项目概览", [
       );
       await lastModel.scrollIntoViewIfNeeded();
       await expect(lastModel).toBeInViewport();
-    },
-    screenshot: {
-      name: "overview-cost-unpriced",
-      target: (page) => page.getByText("设置价格：").locator("xpath=../../.."),
     },
   },
   {
@@ -240,7 +228,6 @@ defineRegionScenarios("项目概览", [
       await storySetting(page).getByRole("button", { name: "从原文生成" }).click();
       await expect(storySetting(page).getByRole("status")).toHaveText("正在读取原文…");
     },
-    screenshot: { name: "overview-reading-source", target: storySetting },
   },
   {
     name: "空项目欢迎页：标题、一句说明、拖放区与从空白开始的指引",
@@ -250,9 +237,5 @@ defineRegionScenarios("项目概览", [
       await page.getByRole("heading", { name: "开始制作《演示项目》" }).waitFor();
     },
     act: collapseAgentPanel,
-    screenshot: {
-      name: "overview-welcome",
-      target: (page) => page.getByRole("heading", { name: "开始制作《演示项目》" }).locator("xpath=../.."),
-    },
   },
 ]);

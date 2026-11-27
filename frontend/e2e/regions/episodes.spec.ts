@@ -1,9 +1,8 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { defineRegionScenarios } from "../support/scenarios.ts";
-import { FIXED_NOW, RECORDED_DIR, type RecordedResponse } from "../support/recorded.ts";
+import { FIXED_NOW } from "../support/recorded.ts";
 import { expect, type ApiOverrides } from "../support/test.ts";
+import { recordedDemoEpisode, workspaceOverride } from "../support/workspace-override.ts";
 
 const PATH = "/app/projects/demo/episodes";
 const API: ApiOverrides = {
@@ -12,14 +11,7 @@ const API: ApiOverrides = {
 
 const STANDARD_TIER_MIN_WIDTH = 1280;
 
-interface RecordedProject {
-  project: { episodes: Record<string, unknown>[] };
-}
-
-const recordedProject = (
-  JSON.parse(readFileSync(join(RECORDED_DIR, "project-demo.json"), "utf8")) as RecordedResponse
-).body as RecordedProject;
-const [firstEpisode] = recordedProject.project.episodes;
+const firstEpisode = recordedDemoEpisode();
 
 
 const PARAGRAPHS = [
@@ -169,17 +161,10 @@ const VIEW = {
 
 const POPULATED: ApiOverrides = {
   ...API,
-  "GET /api/v1/projects/demo": {
-    status: 200,
-    body: {
-      ...recordedProject,
-      project: {
-        ...recordedProject.project,
-        episodes: episodeMeta,
-        whole_source_files: files.map((file) => ({ source_file: file.source_file })),
-      },
-    },
-  },
+  ...workspaceOverride({
+    episodes: episodeMeta,
+    whole_source_files: files.map((file) => ({ source_file: file.source_file })),
+  }),
   "GET /api/v1/projects/demo/episodes-view": { status: 200, body: VIEW },
 };
 
@@ -317,6 +302,7 @@ defineRegionScenarios("分集视图", [
     name: "规划失败的长原因与展开详情在弹层内可读",
     path: PATH,
     api: { ...POPULATED, ...FAILED_TASK },
+    a11y: true,
     ready: populatedReady,
     act: async (page) => {
       await revealCanvasRight(page);
@@ -355,12 +341,13 @@ defineRegionScenarios("分集视图", [
     act: async (page) => {
       await expect(outline(page).getByRole("link", { name: /第 1 集/ })).toBeVisible();
     },
-    screenshot: { name: "episodes-empty", target: canvas },
   },
   {
     name: "整本源文按集分段，集目录与原文各自滚动，正文行长受控",
     path: PATH,
     api: POPULATED,
+    viewports: "both",
+    a11y: true,
     ready: populatedReady,
     act: async (page) => {
       await expectOnlyColumnsScroll(page);
@@ -371,7 +358,6 @@ defineRegionScenarios("分集视图", [
       expect(rail.width).toBeGreaterThanOrEqual(240);
       expect(rail.width).toBeLessThanOrEqual(300);
     },
-    screenshot: { name: "episodes-manuscript", target: canvas },
   },
   {
     name: "滚动原文时集目录高亮当前集，点击集目录让原文滚到这一集",
@@ -400,7 +386,6 @@ defineRegionScenarios("分集视图", [
       const menu = page.getByRole("menu");
       await expect(menu.getByRole("menuitem", { name: "从这一集开始重新规划" })).toBeVisible();
     },
-    screenshot: { name: "episodes-episode-menu", target: (page) => page.getByRole("menu") },
   },
   {
     name: "页头的「AI 规划分集」弹层",
@@ -413,7 +398,6 @@ defineRegionScenarios("分集视图", [
       const popover = page.getByRole("dialog");
       await expect(popover.getByRole("button", { name: "交给 Agent" })).toBeVisible();
     },
-    screenshot: { name: "episodes-plan-popover", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "上传原文的分体按钮展开上传方式",
@@ -451,12 +435,12 @@ defineRegionScenarios("分集视图", [
       const dialog = page.getByRole("dialog", { name: "处理还没用上的文件" });
       await expect(dialog.getByRole("listitem")).toHaveCount(4);
     },
-    screenshot: { name: "episodes-unregistered", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "有新的分集方案时集目录让位，原文右侧是方案栏",
     path: PATH,
     api: WITH_REPLAN,
+    viewports: "both",
     ready: async (page) => {
       await page.getByRole("region", { name: "新的分集方案" }).waitFor();
       await manuscript(page).getByRole("article").first().waitFor();
@@ -468,6 +452,5 @@ defineRegionScenarios("分集视图", [
       expect(column.width).toBeGreaterThanOrEqual(320);
       expect(column.width).toBeLessThanOrEqual(400);
     },
-    screenshot: { name: "episodes-replan", target: canvas },
   },
 ]);

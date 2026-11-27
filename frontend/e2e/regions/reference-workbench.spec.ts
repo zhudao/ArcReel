@@ -1,18 +1,11 @@
 import { box, clearAgentOverlay, waitForEntrance } from "../support/region-helpers.ts";
 import type { Page } from "@playwright/test";
-import { defineRegionScenarios } from "../support/scenarios.ts";
-import { recorded } from "../support/recorded.ts";
+import { defineRegionScenarios, defineViewportContracts } from "../support/scenarios.ts";
 import { expect, type ApiOverrides } from "../support/test.ts";
+import { workspaceOverride } from "../support/workspace-override.ts";
 
 const UNITS_PATH = "/app/projects/demo/episodes/1?view=board";
 const UNITS_API = "/api/v1/projects/demo/reference-videos/episodes/1/units";
-
-
-interface RecordedProject {
-  project: Record<string, unknown>;
-}
-
-const project = recorded<RecordedProject>("project-demo.json");
 
 const unitId = (n: number) => `E1U${n}`;
 const LONG_LINE =
@@ -82,17 +75,13 @@ function movedUnits(id: string, afterId: string | null) {
 
 const API: ApiOverrides = {
   "GET /api/v1/projects/demo/events/stream": { status: 404, body: { detail: "页面级套件不回放事件流" } },
-  "GET /api/v1/projects/demo": {
-    status: 200,
-    body: { ...project, project: { ...project.project, generation_mode: "reference_video" } },
-  },
+  ...workspaceOverride({ generation_mode: "reference_video" }),
   [`GET ${UNITS_API}`]: unitsResponse(UNITS),
   [`POST ${UNITS_API}/E1U2/move`]: { status: 200, body: { units: movedUnits("E1U2", null) } },
 };
 
 const EDITOR_MIN_HEIGHT = 192;
 
-const workbench = (page: Page) => page.getByRole("tabpanel", { name: "视频单元" });
 const editor = (page: Page) => page.getByRole("combobox", { name: "视频单元提示词" });
 const previewFrame = (page: Page) => page.getByTestId("reference-preview-frame");
 
@@ -125,6 +114,7 @@ defineRegionScenarios("参考视频工作台", [
     name: `直接打开视频单元链接后，目标单元进入列表视口（${time ? "带时间点" : "无时间点"}）`,
     path: `${UNITS_PATH}&unit=E1U24${time}&from=agent`,
     api: { ...API, [`GET ${UNITS_API}`]: unitsResponse(LONG_UNIT_LIST) },
+    viewports: "both" as const,
     ready: async (page: Page) => {
       await expect(page).toHaveURL(`${UNITS_PATH}&from=agent`);
     },
@@ -138,6 +128,8 @@ defineRegionScenarios("参考视频工作台", [
     name: "单元列表、文稿编辑器与竖屏预览，选中单元带重新规划与参考图分裂提示",
     path: UNITS_PATH,
     api: API,
+    viewports: "both",
+    a11y: true,
     ready: workbenchReady,
     act: async (page) => {
       await expect(page.getByRole("tab", { name: "视频单元" })).toHaveAttribute("aria-selected", "true");
@@ -146,24 +138,6 @@ defineRegionScenarios("参考视频工作台", [
       await expect(editor(page)).toHaveValue(UNITS[0].text);
       await expectHeightFloors(page);
       await expect(previewFrame(page)).toHaveAttribute("data-aspect", "9:16");
-    },
-    screenshot: { name: "reference-workbench", target: workbench },
-  },
-  {
-    name: "1440×700 与 1280×720 下编辑器与预览不低于高度下限",
-    path: UNITS_PATH,
-    api: API,
-    ready: workbenchReady,
-    act: async (page) => {
-      const original = page.viewportSize()!;
-      for (const size of [
-        { width: 1440, height: 700 },
-        { width: 1280, height: 720 },
-      ]) {
-        await page.setViewportSize(size);
-        await expectHeightFloors(page);
-      }
-      await page.setViewportSize(original);
     },
   },
   {
@@ -183,6 +157,7 @@ defineRegionScenarios("参考视频工作台", [
     name: "聚焦把手后用键盘把单元移到最前",
     path: UNITS_PATH,
     api: API,
+    viewports: "both",
     ready: workbenchReady,
     act: async (page) => {
       const handle = page.getByRole("button", { name: "调整「视频单元 2」的顺序" });
@@ -211,6 +186,7 @@ defineRegionScenarios("参考视频工作台", [
     name: "移除单元前的确认弹层",
     path: UNITS_PATH,
     api: API,
+    a11y: true,
     ready: workbenchReady,
     act: async (page) => {
       await clearAgentOverlay(page);
@@ -219,6 +195,24 @@ defineRegionScenarios("参考视频工作台", [
       await expect(dialog.getByText("移除视频单元 1？")).toBeVisible();
       await expect(dialog.getByRole("button", { name: "取消" })).toBeFocused();
     },
-    screenshot: { name: "reference-workbench-remove", target: (page) => page.getByRole("alertdialog") },
+  },
+]);
+
+defineViewportContracts("参考视频工作台", [
+  {
+    name: "1440×700 下编辑器与预览不低于高度下限",
+    viewport: { width: 1440, height: 700 },
+    path: UNITS_PATH,
+    api: API,
+    ready: workbenchReady,
+    act: expectHeightFloors,
+  },
+  {
+    name: "1280×720 下编辑器与预览不低于高度下限",
+    viewport: { width: 1280, height: 720 },
+    path: UNITS_PATH,
+    api: API,
+    ready: workbenchReady,
+    act: expectHeightFloors,
   },
 ]);

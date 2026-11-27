@@ -59,6 +59,7 @@ async function editIndex(page: Page) {
 defineRegionScenarios("Agent 记忆", [
   {
     name: "没有记忆文件：详情栏是新建表单",
+    a11y: true,
     path: "/app/settings?section=agent-memory",
     ready: (page) => page.getByRole("heading", { level: 2, name: "新建记忆文件" }).waitFor(),
     act: async (page) => {
@@ -67,6 +68,7 @@ defineRegionScenarios("Agent 记忆", [
   },
   {
     name: "文件很多、索引很长（压力）：文件列表与编辑框各自滚动",
+    viewports: "both",
     path: "/app/settings?section=agent-memory",
     api: USER_FILES,
     ready: async (page) => {
@@ -87,7 +89,6 @@ defineRegionScenarios("Agent 记忆", [
       expect(await nav.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
       await expect(page.getByRole("heading", { level: 2, name: "MEMORY.md" })).toBeInViewport();
     },
-    screenshot: { name: "agent-memory-editor", target: (page) => page.getByRole("main") },
   },
   {
     name: "改动索引（压力）：内联提示条在编辑框下方完整可见",
@@ -101,7 +102,6 @@ defineRegionScenarios("Agent 记忆", [
       await expect(page.getByRole("button", { name: "保存" })).toBeInViewport({ ratio: 1 });
       await expect(page.getByRole("button", { name: "放弃修改" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "agent-memory-unsaved", target: (page) => page.getByRole("main") },
   },
   {
     name: "打开更多操作菜单，菜单留在视口内",
@@ -117,6 +117,7 @@ defineRegionScenarios("Agent 记忆", [
   },
   {
     name: "删除确认：标题与按钮完整可见",
+    a11y: true,
     path: "/app/settings?section=agent-memory",
     api: USER_FILES,
     ready: async (page) => {
@@ -128,7 +129,6 @@ defineRegionScenarios("Agent 记忆", [
       await dialog.waitFor();
       await expect(dialog.getByRole("button", { name: "删除" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "agent-memory-delete-dialog", target: (page) => page.getByRole("alertdialog") },
   },
   {
     name: "删除失败原因很长：确认正文可聚焦并用键盘滚动",
@@ -167,6 +167,5 @@ defineRegionScenarios("项目记忆", [
       await page.getByRole("main").evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
       await expect(page.getByRole("link", { name: "新建记忆文件" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "project-memory", target: (page) => page.getByRole("main") },
   },
 ]);

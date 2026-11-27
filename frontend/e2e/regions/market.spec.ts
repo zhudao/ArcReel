@@ -185,7 +185,6 @@ const INSTALL: ApiOverrides = {
   },
 };
 
-const main = (page: Page) => page.getByRole("main");
 const sourceList = (page: Page) => page.getByRole("region", { name: "市场源" });
 
 async function browseReady(page: Page) {
@@ -208,10 +207,11 @@ defineRegionScenarios("市场", [
       await page.getByRole("region", { name: "安装量与评分来自 ArcReel 官方服务" }).waitFor();
       await page.getByText("启用的市场源里还没有条目").waitFor();
     },
-    screenshot: { name: "market-first-visit", target: main },
   },
   {
     name: "条目多、名称与说明长：失败的源列在筛选行之上，网格靠左排开",
+    viewports: "both",
+    a11y: true,
     path: MARKET_PATH,
     api: MANY,
     ready: async (page) => {
@@ -224,7 +224,6 @@ defineRegionScenarios("市场", [
       const card = await page.getByRole("article").first().boundingBox();
       expect(card?.x).toBe(tabs?.x);
     },
-    screenshot: { name: "market-browse", target: main },
   },
   {
     name: "按来源与媒体类型筛选后没有匹配的条目",
@@ -259,14 +258,13 @@ defineRegionScenarios("市场", [
     ready: async (page) => {
       await page.getByRole("link", { name: `${LONG_ENTRY} 12` }).waitFor();
     },
-    screenshot: { name: "market-shared", target: main },
   },
   {
     name: "设置：市场源多、地址与错误长",
+    a11y: true,
     path: SETTINGS_PATH,
     api: MANY,
     ready: settingsReady,
-    screenshot: { name: "market-settings", target: main },
   },
   {
     name: "设置：改了代理前缀后，底行的保存栏在视口内可用",
@@ -349,6 +347,8 @@ defineRegionScenarios("市场", [
   },
   {
     name: "安装弹窗：定义长、地址多，正文在弹窗里滚动，操作按钮留在视口内",
+    viewports: "both",
+    a11y: true,
     path: MARKET_PATH,
     api: INSTALL,
     ready: browseReady,
@@ -359,6 +359,5 @@ defineRegionScenarios("市场", [
       await expect(install).toBeEnabled();
       await expect(install).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "market-install-dialog", target: (page) => page.getByRole("dialog") },
   },
 ]);

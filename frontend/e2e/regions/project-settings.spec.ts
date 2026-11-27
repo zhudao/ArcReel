@@ -6,7 +6,7 @@ import { expect, type ApiOverrides } from "../support/test.ts";
 
 
 const RECORDED = loadRecordedResponses();
-const PROJECT_KEY = "GET /api/v1/projects/demo";
+const PROJECT_KEY = "GET /api/v1/projects/demo/workspace";
 
 function settings(tab?: string) {
   return tab ? `/app/projects/demo/settings?tab=${tab}` : "/app/projects/demo/settings";
@@ -141,6 +141,8 @@ async function tabReady(page: Page, title: string) {
 defineRegionScenarios("项目设置", [
   {
     name: "基础分页：改动后侧栏标出修改，外壳底行的保存栏在表单滚到底时完整可见",
+    viewports: "both",
+    a11y: true,
     path: settings(),
     ready: (page) => tabReady(page, "基础"),
     act: async (page) => {
@@ -151,7 +153,6 @@ defineRegionScenarios("项目设置", [
       await expect(page.getByRole("button", { name: "保存" })).toBeInViewport({ ratio: 1 });
       await expect(page.getByRole("button", { name: "保存" })).toBeEnabled();
     },
-    screenshot: { name: "project-settings-basics", target: (page) => page.getByRole("main") },
   },
   {
     name: "广告项目的基础分页：目标总时长自定义输入无效时的行内提示",
@@ -167,6 +168,7 @@ defineRegionScenarios("项目设置", [
   },
   {
     name: "风格分页：「更换」打开风格对话框，只有对话框正文滚动",
+    a11y: true,
     path: settings("style"),
     api: projectWith({ style_template_id: "live_premium_drama" }),
     ready: (page) => tabReady(page, "风格"),
@@ -179,10 +181,10 @@ defineRegionScenarios("项目设置", [
       await body.evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
       await expect(dialog.getByRole("button", { name: "使用此风格" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "project-settings-style-dialog", target: (page) => page.getByRole("dialog") },
   },
   {
     name: "模型分页（压力）：覆盖说明条、通道来源与展开的细分区，滚到底仍可保存",
+    viewports: "both",
     path: settings("models"),
     api: manyModelsOverrides(),
     ready: async (page) => {
@@ -196,7 +198,6 @@ defineRegionScenarios("项目设置", [
       await page.getByRole("main").evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
       await expect(page.getByRole("button", { name: "保存" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "project-settings-models", target: (page) => page.getByRole("main") },
   },
   {
     name: "模型分页：打开默认视频模型下拉，弹层留在视口内",
@@ -221,7 +222,6 @@ defineRegionScenarios("项目设置", [
       await expect(page.getByRole("combobox", { name: "画质" })).toContainText("LOW");
       await page.getByRole("button", { name: "恢复自动" }).scrollIntoViewIfNeeded();
     },
-    screenshot: { name: "project-settings-image-quality", target: (page) => page.getByRole("main") },
   },
   {
     name: "配音分页：参考生视频项目使用 TTS 配音，显示角色声音绑定",
@@ -244,7 +244,6 @@ defineRegionScenarios("项目设置", [
       await page.getByRole("radiogroup", { name: "角色声音绑定方式" }).waitFor();
       await page.getByRole("main").evaluate((el) => el.scrollTo({ top: el.scrollHeight }));
     },
-    screenshot: { name: "project-settings-voice", target: (page) => page.getByRole("main") },
   },
   {
     name: "项目记忆分页：入口在 Agent 组，不显示外壳保存栏",
@@ -266,7 +265,6 @@ defineRegionScenarios("项目设置", [
       await page.getByRole("button", { name: "重置为内置配置" }).click();
       await page.getByRole("alertdialog", { name: "重置 Agent 配置？" }).waitFor();
     },
-    screenshot: { name: "project-settings-agent-reset", target: (page) => page.getByRole("alertdialog") },
   },
   {
     name: "侧栏：模型分页的覆盖数与修改标记",
@@ -277,6 +275,5 @@ defineRegionScenarios("项目设置", [
       await page.getByRole("button", { name: "图片模型：恢复全局" }).click();
       await expect(sidebar(page).getByRole("link", { name: /^模型.*有未保存的修改/ })).toBeVisible();
     },
-    screenshot: { name: "project-settings-sidebar", target: (page) => sidebar(page) },
   },
 ]);

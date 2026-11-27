@@ -69,9 +69,9 @@ dev = [
     "time-machine>=3.6.0",
     "tree-sitter-language-pack==0.13.0",
     "tree-sitter>=0.25,<0.27",
-]
-mutation = [
-    "mutmut==3.7.0",
+    "hypothesis>=6.170.17",
+    "coverage>=7.15.4",
+    "psutil>=7.2.2",
 ]
 
 [tool.uv.workspace]
@@ -89,7 +89,7 @@ build-backend = "hatchling.build"
 packages = ["lib", "server"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "packages/arcreel-catalog-core/tests/test_*_invariants.py"]
 addopts = "--strict-markers --durations=25"
 asyncio_mode = "auto"
 timeout = 120
@@ -97,6 +97,8 @@ timeout = 120
 # 正常、可归因）；thread 法以 os._exit 硬杀进程，xdist 下等价于 worker crash。
 timeout_method = "signal"
 markers = [
+    "released_archive: 真实旧发行版导出包的升级回归",
+    "invariant: 高危域的属性、状态机与反例重放",
     "unit: 快速、隔离的测试；可只读访问仓库内已提交的文件，写文件只落在 tmp_path，不触达真实 DB、子进程、网络或外部服务",
     "integration: 跨模块真实协作测试；禁止 mock 被测 module 的公共入口（否则是在测 mock 本身）",
     "e2e: 端到端、依赖真实外部资源（远程 API、大模型调用、重型 ffmpeg 等）的测试；CI 默认跳过",
@@ -279,12 +281,14 @@ DEP002 = [
     "python-multipart", # Starlette 解析 multipart/form-data 的后端
     "socksio",          # httpx 的 SOCKS 代理传输后端
     "lxml",             # BeautifulSoup 的 lxml / lxml-xml 解析器后端
-    "mutmut",           # 变异测试 CLI，源码不 import 它；变异后的模块只在 mutants/ 副本里 import
     "pytest-testmon",   # pytest 插件，经 entry point 加载；按改动选测试，用法见 docs/agents/testing.md
 ]
 DEP004 = [
+    "psutil",
     "anyio",          # 回归测试直接构造 httpx 所用的 anyio 取消域
     "pytest",
+    "coverage",
+    "hypothesis",
     "_pytest",        # pytest 的内部模块，根 conftest 复用其选择参数解析器
     "pytest_asyncio", # pytest 的 asyncio 插件，测试内直接用 @pytest_asyncio.fixture（本规则按模块名匹配）
     "respx",
@@ -440,35 +444,3 @@ reportGeneralTypeIssues = "none"
 reportCallIssue = "none"
 reportIndexIssue = "none"
 reportMissingImports = "none"
-
-[tool.mutmut]
-# 必须显式写：不写时 mutmut 只推断出 lib/，漏掉 server/
-source_paths = ["lib", "server"]
-# tests/integration/lib/generation/test_task_failure_capability.py 里三个用例用 ast 扫 lib/ server/ 源码里的 capability code
-# 字面量并与登记表比对；mutants/ 里的源文件同时含全部字符串 mutant 变体（XXcodeXX / CODE），扫描必报「未登记」，
-# stats 阶段直接失败。凡读源码文本而非 import 模块的用例都要这样按 nodeid --deselect，不整文件 --ignore：
-# 同文件其余用例是 bound_reason / collapse_cascade_reason / 级联渲染的行为测试，其中部分路径由它们独家覆盖，
-# 整文件排除会让 lib/generation/task_failure.py 的真变异体记成存活。
-# 只排除扫描用例同样只会多出假存活：它们独家能杀的只有 code 字面量的变体，而各 backend 用例都断言 exc.code。
-pytest_add_cli_args = [
-    "-p",
-    "tests.mutmut_plugin",
-    "--deselect=tests/integration/lib/generation/test_task_failure_capability.py::test_capability_codes_registered_no_drift",
-    "--deselect=tests/integration/lib/generation/test_task_failure_capability.py::test_no_unscannable_capability_construction_sites",
-    "--deselect=tests/integration/lib/generation/test_task_failure_capability.py::test_capability_construction_sites_supply_every_template_param",
-]
-# pytest_add_cli_args_test_selection 不设：走全量 testpaths。仅 tests/unit 快 5.5 倍，
-# 但存活集合约 45% 是假存活，复核每个都要跑一次全量套件，总账反而更贵。
-# timeout_multiplier / timeout_constant 保持默认（15 / 1.0），不要调小。
-# 预算按关联用例的运行时长外推，调小只会让慢用例上的真存活记成超时（⏰），每个都得新进程复核。
-also_copy = [
-    "agent_runtime_profile",
-    "alembic",
-    "alembic.ini",
-    "scripts",
-    "skills",
-    "skills-lock.json",
-    "public",
-    ".github",
-    "frontend/src",
-]

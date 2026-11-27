@@ -3,15 +3,17 @@ import { defineRegionScenarios } from "../support/scenarios.ts";
 defineRegionScenarios("登录页", [
   {
     name: "未登录打开登录页",
+    viewports: "both",
+    a11y: true,
     path: "/login",
     auth: "signed-out",
     ready: async (page) => {
       await page.getByRole("button", { name: "登录" }).waitFor();
     },
-    screenshot: { name: "login", target: (page) => page.locator("[data-testid=login-page] > div") },
   },
   {
     name: "登录失败显示错误提示",
+    a11y: true,
     path: "/login",
     auth: "signed-out",
     api: { "POST /api/v1/auth/token": { status: 401, body: { detail: "用户名或密码错误" } } },

@@ -19,9 +19,10 @@ import tempfile
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi import Path as FastAPIPath
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
@@ -66,8 +67,10 @@ from lib.infra.async_thread import (
     run_noninterruptible_sync,
     run_sync_transaction,
 )
+from lib.infra.content_digest import file_identity, file_version
 from lib.infra.data_root_layout import DataRootLayout
 from lib.infra.json_io import domain_error_on_value_error
+from lib.infra.path_safety import safe_join
 from lib.material.formal_objects import formal_commit_on, release_holder
 from lib.project import deleted_projects
 from lib.project.asset_fingerprints import compute_asset_fingerprints
@@ -94,6 +97,9 @@ from lib.speech.speech_rate import MAX_SPEECH_RATE_UPS, MIN_SPEECH_RATE_UPS, SPE
 from lib.workflow.workflow_plan import WorkflowPlan, WorkflowPlanRequest
 from lib.workflow.workflow_state import (
     EpisodeNextSteps,
+    EpisodeProductionStatus,
+    EpisodeScriptStatus,
+    EpisodesSummary,
     ProjectSummary,
     WorkflowRequestError,
     WorkflowStateService,
@@ -111,7 +117,7 @@ from server.routers._script_edits import (
 from server.routers._validators import split_video_backend_query, validate_backend_value
 from server.services.admission.prompt_preview import ScriptItemNotFound, preview_item_prompts
 from server.services.project import workflow_planner as workflow_plan_service
-from server.services.project.episode_display import present_episode_diagnostics
+from server.services.project.episode_display import present_episode_diagnostics, with_problem_locations
 from server.services.project.episode_id_records import recorded_episode_ids_on
 from server.services.project.narration_settings import (
     NarrationSettingsInput,
@@ -844,6 +850,112 @@ async def get_workflow_plan(
         raise BadRequestError("request_invalid") from exc
 
 
+class RegisteredCount(BaseModel):
+    total: int
+    available: int
+
+
+class WorkspaceEpisode(BaseModel):
+    episode: int
+    script_status: EpisodeScriptStatus
+    status: EpisodeProductionStatus
+    item_count: int
+    duration_seconds: int
+    needs_replan: int
+    videos: RegisteredCount
+    storyboards: RegisteredCount
+
+
+class WorkspaceSummary(BaseModel):
+    currency: Literal["registered"] = "registered"
+    needs_repair: bool
+    repair_reason: str | None
+    assets: dict[str, RegisteredCount]
+    episodes_summary: EpisodesSummary | None = None
+    episodes: list[WorkspaceEpisode]
+    source_remaining: bool
+
+
+class WorkspaceResponse(BaseModel):
+    project: dict[str, Any]
+    summary: WorkspaceSummary
+    asset_fingerprints: dict[str, int]
+
+
+@router.get("/projects/{name}/workspace", response_model=WorkspaceResponse)
+async def get_workspace(
+    name: str,
+    _t: Translator,
+    summaries: WorkflowStateServiceDep,
+    current_user: CurrentUser,
+    coalescer: ProjectReads,
+    episodes: Annotated[list[int] | None, Query()] = None,
+):
+    manager = get_project_manager()
+
+    def read():
+        try:
+            project = manager.load_project(name)
+        except FileNotFoundError as exc:
+            raise NotFoundError("project_not_found", name=name) from exc
+        start = perf_counter()
+        media_paths: set[str] | None = None if episodes is None else set()
+        try:
+            summary = summaries.get_project_summary(
+                name,
+                project=project,
+                currency="registered",
+                workspace=True,
+                episode_numbers=episodes,
+                media_paths=media_paths,
+            )
+        except WorkflowRequestError as exc:
+            raise BadRequestError("request_invalid") from exc
+        summarized = perf_counter()
+        fingerprints = compute_asset_fingerprints(manager.get_project_path(name), media_paths)
+        scanned = perf_counter()
+        return (
+            project,
+            WorkspaceSummary.model_validate(summary, from_attributes=True),
+            fingerprints,
+            summarized - start,
+            scanned - summarized,
+        )
+
+    key = (
+        "workspace",
+        "registered",
+        1,
+        id(manager),
+        name,
+        current_user.id,
+        current_user.role,
+        None if episodes is None else tuple(sorted(episodes)),
+    )
+    project, data, fingerprints, summary_time, fingerprint_time = await coalescer.run(
+        key, lambda: run_sync_transaction(read)
+    )
+
+    def present():
+        start = perf_counter()
+        summary = data.model_dump()
+        if episodes is not None:
+            summary["episodes_summary"] = None
+        if data.repair_reason:
+            summary["repair_reason"] = present_episode_diagnostics(data.repair_reason, project, _t)
+        response = JSONResponse({"project": project, "summary": summary, "asset_fingerprints": fingerprints})
+        logger.info(
+            "workspace %s summary=%.4fs fingerprints=%.4fs serialization=%.4fs",
+            name,
+            summary_time,
+            fingerprint_time,
+            perf_counter() - start,
+        )
+        return response
+
+    return await run_sync_transaction(present)
+
+
 @router.get("/projects/{name}")
 async def get_project(
     name: str,
@@ -862,24 +974,21 @@ async def get_project(
 
             project = manager.load_project(name)
 
-            summary = summaries.get_project_summary(name)
-            project = _merge_episode_summaries(project, summary)
-
+            preloaded: dict[str, dict[str, Any] | None] = {}
+            summary = summaries.get_project_summary(name, project=project, detail_scripts=preloaded)
             scripts = {}
             for ep in project.get("episodes", []):
-                script_file = ep.get("script_file", "")
-                if script_file:
+                script_file = ep.get("script_file")
+                if not script_file:
+                    continue
+                if script_file not in preloaded:
                     try:
-                        script = manager.load_script(name, script_file)
-                        key = (
-                            script_file.replace("scripts/", "", 1)
-                            if script_file.startswith("scripts/")
-                            else script_file
-                        )
-                        scripts[key] = script
+                        preloaded[script_file] = manager.load_script(name, script_file)
                     except FileNotFoundError:
-                        logger.debug("剧本文件不存在，跳过: %s/%s", name, script_file)
-
+                        preloaded[script_file] = None
+                if (script := preloaded[script_file]) is not None:
+                    scripts[script_file.removeprefix("scripts/")] = script
+            project = _merge_episode_summaries(project, summary)
             project = annotate_derivative_references(project, scripts.values())
 
             project_path = manager.get_project_path(name)
@@ -1174,12 +1283,42 @@ async def purge_deleted_project(deleted_id: str):
 
 
 @router.get("/projects/{name}/scripts/{script_file}")
-async def get_script(name: str, script_file: str, _t: Translator):
+async def get_script(name: str, script_file: str, request: Request, _t: Translator):
     """获取剧本内容"""
     try:
-        script = await run_sync_transaction(get_project_manager().load_script, name, script_file)
-        return {"script": script, "revision": script_revision(script)}
+
+        def read():
+            manager = get_project_manager()
+            version_mode = request.headers.get("X-ArcReel-Script-Version")
+            if version_mode in {"include", "only"}:
+                path = safe_join(
+                    manager.get_project_path(name) / "scripts", manager.normalize_script_filename(script_file)
+                )
+                if version_mode == "only":
+                    try:
+                        version = file_version(file_identity(path.stat()))
+                    except FileNotFoundError:
+                        version = None
+                    return JSONResponse({"file_version": version}, headers={"Cache-Control": "no-store"})
+
+                for _ in range(3):
+                    before = file_identity(path.stat())
+                    script = manager.load_script(name, script_file)
+                    if before == file_identity(path.stat()):
+                        return JSONResponse(
+                            {"script": script, "revision": script_revision(script)},
+                            headers={"X-ArcReel-Script-Version": file_version(before), "Cache-Control": "no-store"},
+                        )
+                raise HTTPException(status_code=409, detail=_t("script_conversion_conflict"))
+            script = manager.load_script(name, script_file)
+            return {"script": script, "revision": script_revision(script)}
+
+        return await run_sync_transaction(read)
     except FileNotFoundError as exc:
+        if request.headers.get("X-ArcReel-Optional-Read") == "1":
+            return JSONResponse(
+                content=None, headers={"Cache-Control": "no-store", "X-ArcReel-Script-Version": "missing"}
+            )
         raise NotFoundError("script_not_found", name=script_file) from exc
     except (HTTPException, ApiError):
         raise
@@ -1195,6 +1334,7 @@ async def get_script(name: str, script_file: str, _t: Translator):
 )
 async def edit_script_batch(
     name: str,
+    request: Request,
     command: ScriptBatchEditCommand,
     _t: Translator,
     make_script_batch_editor: ScriptBatchEditorFactoryDep,
@@ -1213,7 +1353,10 @@ async def edit_script_batch(
 
         with project_change_source("webui"):
             result = await run_sync_transaction(make_script_batch_editor(manager).execute, name, command)
-        return JSONResponse(status_code=script_batch_status(result), content=result.model_dump(mode="json"))
+        payload = result.model_dump(mode="json")
+        if not result.success:
+            payload = with_problem_locations(request, payload)
+        return JSONResponse(status_code=script_batch_status(result), content=payload)
     except FileNotFoundError as exc:
         if manager is None or not await asyncio.to_thread(manager.project_exists, name):
             raise NotFoundError("project_not_found", name=name) from exc

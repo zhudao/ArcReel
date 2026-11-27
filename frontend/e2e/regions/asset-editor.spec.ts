@@ -47,8 +47,8 @@ const PRODUCTS: Record<string, Asset> = {
 };
 
 function projectWith(fields: Record<string, unknown>) {
-  const recorded = loadRecordedResponses().get(recordedKey("GET", "/api/v1/projects/demo"));
-  if (!recorded) throw new Error("没有录制 GET /api/v1/projects/demo");
+  const recorded = loadRecordedResponses().get(recordedKey("GET", "/api/v1/projects/demo/workspace"));
+  if (!recorded) throw new Error("没有录制 GET /api/v1/projects/demo/workspace");
   const body = structuredClone(recorded.body) as { project: Record<string, unknown> };
   Object.assign(body.project, fields);
   return { status: recorded.status, body };
@@ -101,15 +101,15 @@ const NO_TASKS = { status: 200, body: { items: [], total: 0, page: 1, page_size:
 
 const BASE: ApiOverrides = {
   "GET /api/v1/projects/demo/events/stream": { status: 404, body: { detail: "页面级套件不回放事件流" } },
-  "GET /api/v1/projects/demo": projectWith({ characters: CHARACTERS }),
-  "GET /api/v1/projects/demo/asset-sheets/status": statusRows("character", Object.keys(CHARACTERS)),
+  "GET /api/v1/projects/demo/workspace": projectWith({ characters: CHARACTERS }),
+  "GET /api/v1/projects/demo/asset-sheets/status?include=derivative_references": statusRows("character", Object.keys(CHARACTERS)),
   "GET /api/v1/tasks?page_size=200&project_name=demo": NO_TASKS,
   "GET /api/v1/projects/demo/characters/林夕/derivatives": derivativeSheets(CHARACTERS.林夕.derivatives as Record<string, Asset>),
 };
 
 const DERIVATIVES_API: ApiOverrides = {
   ...BASE,
-  "GET /api/v1/projects/demo": projectWith({
+  "GET /api/v1/projects/demo/workspace": projectWith({
     characters: { ...CHARACTERS, 林夕: { ...CHARACTERS.林夕, derivatives: MANY_DERIVATIVES } },
   }),
   "GET /api/v1/projects/demo/characters/林夕/derivatives": derivativeSheets(MANY_DERIVATIVES, ["外观 3"]),
@@ -117,13 +117,13 @@ const DERIVATIVES_API: ApiOverrides = {
 
 const PRODUCT_API: ApiOverrides = {
   ...BASE,
-  "GET /api/v1/projects/demo": projectWith({ products: PRODUCTS }),
+  "GET /api/v1/projects/demo/workspace": projectWith({ products: PRODUCTS }),
   "GET /api/v1/projects/demo/asset-sheets/status": statusRows("product", Object.keys(PRODUCTS)),
 };
 
 const LONG_API: ApiOverrides = {
   ...BASE,
-  "GET /api/v1/projects/demo": projectWith({
+  "GET /api/v1/projects/demo/workspace": projectWith({
     character_voice_binding: "reference_audio",
     characters: {
       [LONG_NAME]: {
@@ -136,12 +136,12 @@ const LONG_API: ApiOverrides = {
       沈砚: CHARACTERS.沈砚,
     },
   }),
-  "GET /api/v1/projects/demo/asset-sheets/status": statusRows("character", [LONG_NAME, "沈砚"]),
+  "GET /api/v1/projects/demo/asset-sheets/status?include=derivative_references": statusRows("character", [LONG_NAME, "沈砚"]),
 };
 
 const STALE_IMPACT_FAILED_API: ApiOverrides = {
   ...BASE,
-  "GET /api/v1/projects/demo/asset-sheets/status": {
+  "GET /api/v1/projects/demo/asset-sheets/status?include=derivative_references": {
     status: 200,
     body: {
       assets: statusRows("character", Object.keys(CHARACTERS)).body.assets.map((row) =>
@@ -240,6 +240,7 @@ defineRegionScenarios("资产详情 Sheet", [
     name: "打开角色详情：资产图、原图、描述、声音、别名与衍生",
     path: CHARACTERS_PATH,
     api: BASE,
+    a11y: true,
     ready: galleryReady,
     act: async (page) => {
       const sheet = await openSheet(page, "林夕");
@@ -248,7 +249,6 @@ defineRegionScenarios("资产详情 Sheet", [
       await expect(sheet.getByRole("button", { name: "下一个" })).toBeEnabled();
       await expect(sheet.getByRole("button", { name: "关闭" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "asset-editor", target: (page) => page.getByRole("dialog", { name: "林夕" }) },
   },
   {
     name: "改了描述：底部出现未保存提示条，生成与预览都先保存",
@@ -262,12 +262,13 @@ defineRegionScenarios("资产详情 Sheet", [
       await expect(sheet.getByRole("button", { name: "保存并预览" })).toBeVisible();
       await expect(sheet.getByRole("button", { name: "保存", exact: true })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "asset-editor-unsaved", target: (page) => page.getByRole("dialog", { name: "林夕" }) },
   },
   {
     name: "重新生成过期资产图：连带影响统计失败的说明很长，只有正文滚动，按钮完整可见",
     path: CHARACTERS_PATH,
     api: STALE_IMPACT_FAILED_API,
+    viewports: "both",
+    a11y: true,
     ready: galleryReady,
     act: async (page) => {
       const sheet = await openSheet(page, "林夕");
@@ -301,7 +302,6 @@ defineRegionScenarios("资产详情 Sheet", [
       await waitForEntrance(leave);
       await expect(leave.getByRole("button", { name: "保存并切换" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "asset-editor-leave", target: (page) => page.getByRole("alertdialog") },
   },
   {
     name: "离开拦截里点「继续编辑」：回到原资产，修改还在",
@@ -324,6 +324,7 @@ defineRegionScenarios("资产详情 Sheet", [
     name: "添加角色：在 Sheet 里打开空白表单",
     path: CHARACTERS_PATH,
     api: BASE,
+    a11y: true,
     ready: galleryReady,
     act: async (page) => {
       await clearAgentOverlay(page);
@@ -334,7 +335,6 @@ defineRegionScenarios("资产详情 Sheet", [
       await expect(form.getByRole("button", { name: "创建" })).toBeDisabled();
       await expect(form.getByRole("button", { name: "创建" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "asset-editor-create", target: (page) => page.getByRole("dialog", { name: "添加角色" }) },
   },
   {
     name: "商品详情：商品原图、品牌与卖点",
@@ -408,12 +408,12 @@ defineRegionScenarios("资产详情 Sheet", [
       await expect(row.getByRole("button", { name: "复制引用记号 @[林夕/夜行装]" })).toBeInViewport({ ratio: 1 });
       await expect(row.getByRole("button", { name: "重新生成" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "asset-editor-derivatives", target: (page) => derivativesSection(page.getByRole("dialog", { name: "林夕" })) },
   },
   {
     name: "衍生多且名称与外观变化很长：只有正文滚动，末条的操作完整可见",
     path: CHARACTERS_PATH,
     api: DERIVATIVES_API,
+    viewports: "both",
     ready: galleryReady,
     act: async (page) => {
       const sheet = await openSheet(page, "林夕");
@@ -460,7 +460,6 @@ defineRegionScenarios("资产详情 Sheet", [
       await waitForEntrance(menu);
       await expect(menu.getByRole("menuitem", { name: "删除" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "asset-editor-derivative-menu", target: (page) => page.getByRole("menu") },
   },
   {
     name: "打开「新增衍生」弹层",
@@ -495,7 +494,6 @@ defineRegionScenarios("资产详情 Sheet", [
       await expect(confirm.getByRole("button", { name: "取消" })).toBeFocused();
       await expect(confirm.getByRole("button", { name: "删除" })).toBeInViewport({ ratio: 1 });
     },
-    screenshot: { name: "asset-editor-derivative-delete", target: (page) => page.getByRole("alertdialog") },
   },
   {
     name: "查看衍生图大图：Esc 只关闭大图，Sheet 留在原处",

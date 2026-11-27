@@ -1,8 +1,11 @@
+import { createDeferred } from "@/test/deferred";
 import { seedTaskState, seedTasks } from "@/test/task-state";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { API } from "@/api";
 import i18n from "@/i18n";
 import { useAppStore } from "@/stores/app-store";
+import { useItemLocationsStore } from "@/stores/item-locations-store";
+import { useProjectsStore } from "@/stores/projects-store";
 import {
   defaultTaskStats,
   selectActiveResourceIds,
@@ -127,6 +130,31 @@ describe("enqueueStoryboard", () => {
 
     expect(occupied("demo", "storyboard", "seg-1")).toBe(false);
     expect(markCounts().resource).toBe(0);
+  });
+
+  it("跨集条目在未加载该集剧本时通过 item-locations 展示人类可读位置", async () => {
+    useItemLocationsStore.getState().reset(null);
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: {
+        title: "Demo",
+        content_mode: "narration",
+        style: "",
+        characters: {},
+        episodes: [{ episode: 2, title: "雨夜", script_file: "scripts/episode_2.json" }],
+      },
+      currentScripts: {},
+    });
+    vi.spyOn(API, "generateStoryboard").mockResolvedValue(SINGLE_OK);
+    const lookup = createDeferred<Awaited<ReturnType<typeof API.locateItems>>>();
+    const locateSpy = vi.spyOn(API, "locateItems").mockReturnValue(lookup.promise);
+    const result = await enqueueStoryboard("demo", "E2S03", "img prompt", "episode_2.json");
+
+    expect(result.taskIds).toEqual([SINGLE_OK.task_id]);
+    expect(useAppStore.getState().toast?.text).toContain("雨夜 · S03");
+    expect(locateSpy).toHaveBeenCalledWith("demo", ["E2S03"], expect.anything());
+    lookup.resolve({ items: [{ episode: 2, item_id: "E2S03", position: 3, status: "found" }] });
+    await vi.waitFor(() => expect(useAppStore.getState().toast?.text).toContain("雨夜 · 3"));
   });
 });
 

@@ -104,14 +104,16 @@ updates:
         patterns:
           - "anyio"
           - "pytest*"
+          - "coverage"
+          - "hypothesis"
           - "ruff"
           - "basedpyright"
           - "deptry"
+          - "psutil"
           - "pre-commit"
           - "python-docx"
           - "import-linter"
           - "respx"
-          - "mutmut"
           - "blockbuster"
           - "time-machine"
           - "tree-sitter*"
@@ -205,6 +207,7 @@ updates:
           - "patch"
       testing:
         patterns:
+          - "fast-check"
           - "vitest"
           - "@vitest/*"
           - "@testing-library/*"
