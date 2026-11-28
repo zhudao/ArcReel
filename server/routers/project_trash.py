@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from fastapi import APIRouter, Depends, Query
 from lib.infra.api_errors import BadRequestError, NotFoundError
 from lib.infra.async_thread import run_sync_transaction
 from lib.material.formal_objects import reconcile_and_collect
+from lib.material.work_files import fetch_archived_file
 from lib.project import project_trash
 from lib.project.project_change_hints import project_change_source
 from lib.project.project_manager import get_project_manager
@@ -70,10 +72,22 @@ async def download_trash_record_file(project_name: str, record_id: str, path: st
     name = Path(path).name
 
     def _sync():
-        handle, info = project_trash.open_record_file(_project_dir(project_name), record_id, path)
-        return handle, info.st_size, content_media_type(name)
+        directory = _project_dir(project_name)
+        media_type = content_media_type(name)
+        try:
+            handle, info = project_trash.open_record_file(directory, record_id, path)
+        except NotFoundError:
+            remote = project_trash.archived_remote_file(directory, record_id, path)
+            if remote is None:
+                raise
+            return None, 0, remote, media_type
+        return handle, info.st_size, None, media_type
 
-    handle, size, media_type = await asyncio.to_thread(_sync)
+    handle, size, remote, media_type = await asyncio.to_thread(_sync)
+    if remote is not None:
+        data = await fetch_archived_file(remote)
+        handle, size = io.BytesIO(data), len(data)
+    assert handle is not None
     return stream_file(handle, size, name, media_type, download=True)
 
 

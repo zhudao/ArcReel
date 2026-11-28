@@ -168,7 +168,19 @@ describe("AppRoutes", () => {
       props: {},
     });
     const workspace = createDeferred<typeof ws>();
-    vi.spyOn(API, "getWorkspace").mockReturnValue(workspace.promise);
+    const broad = createDeferred<typeof ws>();
+    const projection = (episode: number) => ({
+      ...ws,
+      project: {
+        ...ws.project,
+        episodes: ws.project.episodes.map(({ script_status: _status, ...row }) => row),
+      },
+      summary: { ...ws.summary, episodes_summary: null, episodes: ws.summary.episodes.filter((row) => row.episode === episode) },
+    });
+    vi.spyOn(API, "getWorkspace").mockImplementation((_name, options) => {
+      if (options?.episodes?.[0] === 2) return Promise.resolve(projection(2));
+      return options?.episodes ? workspace.promise : broad.promise;
+    });
     const ep1Deferred = createDeferred<Awaited<ReturnType<typeof API.getScript>>>();
     const ep2Deferred = createDeferred<Awaited<ReturnType<typeof API.getScript>>>();
     let ep1Signal: AbortSignal | undefined;
@@ -188,15 +200,20 @@ describe("AppRoutes", () => {
     );
 
     await waitFor(() => {
-      expect(API.getWorkspace).toHaveBeenCalledWith("demo", { signal: expect.any(AbortSignal) });
+      expect(API.getWorkspace).toHaveBeenCalledWith("demo", { episodes: [1], signal: expect.any(AbortSignal) });
       expect(getScriptSpy).toHaveBeenCalledWith("demo", "episode_1.json", { speculative: true, onVersion: expect.any(Function), signal: expect.any(AbortSignal) });
     });
 
-    await act(async () => workspace.resolve(ws));
+    await act(async () => workspace.resolve(projection(1)));
+    expect(useProjectsStore.getState().currentProjectData?.status).toBeUndefined();
+    expect(useProjectsStore.getState().currentProjectData?.episodes[0].script_status).toBe("generated");
     act(() => navigate("/app/projects/demo/episodes/2"));
     await waitFor(() => {
       expect(getScriptSpy).toHaveBeenCalledWith("demo", "episode_2.json", { signal: expect.any(AbortSignal) });
     });
+    expect(useProjectsStore.getState().currentProjectData?.status).toBeUndefined();
+    expect(useProjectsStore.getState().currentProjectData?.episodes[0].script_status).toBe("generated");
+    expect(useProjectsStore.getState().currentProjectData?.episodes[1].script_status).toBe("generated");
     expect(ep1Signal?.aborted).toBe(true);
 
     await act(async () => {
@@ -207,9 +224,103 @@ describe("AppRoutes", () => {
       expect(Object.keys(useProjectsStore.getState().currentScripts)).toEqual(["episode_2.json"]);
       expect(useProjectsStore.getState().activeEpisodeScript.episode).toBe(2);
     });
+    await act(async () => broad.resolve(ws));
+    expect(getScriptSpy).toHaveBeenCalledTimes(2);
     await act(async () => ep1Deferred.resolve({ script: { episode: 1, segments: [] }, revision: "r1" } as never));
     expect(Object.keys(useProjectsStore.getState().currentScripts)).toEqual(["episode_2.json"]);
     expect(useProjectsStore.getState().activeEpisodeScript.episode).toBe(2);
+  });
+
+  it.each([true, false])("切到未生成剧本分集后更新状态并清空旧脚本（先切集：%s）", async (switchFirst) => {
+    const ws = makeWorkspaceResponse({
+      title: "Demo",
+      content_mode: "narration",
+      style: "Anime",
+      episodes: [
+        { episode: 1, title: "EP1", script_file: "scripts/episode_1.json", script_status: "generated" },
+        { episode: 2, title: "EP2", script_file: "", script_status: "segmented" },
+      ],
+      characters: {},
+      scenes: {},
+      props: {},
+    });
+    const projection = (episode: number) => ({
+      ...ws,
+      project: {
+        ...ws.project,
+        episodes: ws.project.episodes.map(({ script_status: _status, ...row }) => row),
+      },
+      summary: { ...ws.summary, episodes_summary: null, episodes: ws.summary.episodes.filter((row) => row.episode === episode) },
+    });
+    const broad = createDeferred<typeof ws>();
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      expect(options?.signal).toBeInstanceOf(AbortSignal);
+      switch (String(input)) {
+        case "/api/v1/projects/demo/workspace?episodes=1": return Response.json(projection(1));
+        case "/api/v1/projects/demo/workspace?episodes=2": return Response.json(projection(2));
+        case "/api/v1/projects/demo/workspace": return Response.json(await broad.promise);
+        case "/api/v1/projects/demo/scripts/episode_1.json":
+          return Response.json({ script: { episode: 1, segments: [] }, revision: "r1" });
+        default: throw new Error(`Unexpected request ${input}`);
+      }
+    });
+
+    const { hook, navigate } = memoryLocation({ path: "/app/projects/demo/episodes/1" });
+    render(<Router hook={hook}><AppRoutes /></Router>);
+
+    await waitFor(() => {
+      expect(useProjectsStore.getState().activeEpisodeScript.status).toBe("ready");
+      expect(useProjectsStore.getState().activeEpisodeScript.episode).toBe(1);
+    });
+
+    if (switchFirst) await act(async () => navigate("/app/projects/demo/episodes/2"));
+    const episodeTwoRequests = fetchSpy.mock.calls.filter(([url]) => url === "/api/v1/projects/demo/workspace?episodes=2");
+    expect(episodeTwoRequests).toHaveLength(switchFirst ? 1 : 0);
+    expect(useProjectsStore.getState().currentProjectData?.episodes[1].script_status).toBe(switchFirst ? "segmented" : undefined);
+    await act(async () => broad.reject(new Error("timeout")));
+    await waitFor(() => expect(useProjectsStore.getState().projectDetailLoading).toBe(false));
+    if (!switchFirst) act(() => navigate("/app/projects/demo/episodes/2"));
+    await waitFor(() => {
+      expect(useProjectsStore.getState().currentProjectData?.episodes[1].script_status).toBe("segmented");
+      expect(useProjectsStore.getState().activeEpisodeScript.episode).toBeNull();
+      expect(useProjectsStore.getState().currentScripts).toEqual({});
+    });
+  });
+
+  it("全量 workspace 先于按集预览失败时丢弃迟到的按集预览", async () => {
+    const ws = makeWorkspaceResponse({
+      title: "Demo",
+      content_mode: "narration",
+      style: "Anime",
+      episodes: [{ episode: 1, title: "EP1", script_file: "scripts/episode_1.json", script_status: "generated" }],
+      characters: {},
+      scenes: {},
+      props: {},
+    });
+    const partial = createDeferred<typeof ws>();
+    const broad = createDeferred<typeof ws>();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      expect(options?.signal).toBeInstanceOf(AbortSignal);
+      switch (String(input)) {
+        case "/api/v1/projects/demo/workspace?episodes=1": return Response.json(await partial.promise);
+        case "/api/v1/projects/demo/workspace": return Response.json(await broad.promise);
+        case "/api/v1/projects/demo/scripts/episode_1.json":
+          return Response.json({ script: { episode: 1, segments: [] }, revision: "r1" });
+        default: throw new Error(`Unexpected request ${input}`);
+      }
+    });
+
+    const { hook } = memoryLocation({ path: "/app/projects/demo/episodes/1" });
+    render(<Router hook={hook}><AppRoutes /></Router>);
+
+    await act(async () => broad.reject(new Error("boom")));
+    await waitFor(() => expect(useProjectsStore.getState().projectDetailLoading).toBe(false));
+
+    await act(async () => partial.resolve({
+      ...ws,
+      summary: { ...ws.summary, episodes_summary: null },
+    }));
+    expect(useProjectsStore.getState().currentProjectData).toBeNull();
   });
 
   it("自定义绑定的剧本读取期间切到同项目概览会结束工作台加载", async () => {

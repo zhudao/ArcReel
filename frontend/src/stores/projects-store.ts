@@ -1,8 +1,10 @@
+import { hasEpisodeDraft } from "@/utils/episode-display";
 import i18n from "@/i18n";
 import { errMsg } from "@/utils/async";
 import { stripScriptsPrefix } from "@/utils/task-target";
 import { create } from "zustand";
 import type {
+  EpisodeMeta,
   EpisodeScript,
   ProjectData,
   ProjectEventSnapshotPayload,
@@ -57,6 +59,16 @@ export function normalizeScriptFile(scriptFile: string | null | undefined): stri
   return normalized || null;
 }
 
+export function canPreviewEpisode(
+  episode: EpisodeMeta | undefined,
+  active: ActiveEpisodeScriptState,
+): boolean {
+  if (!episode || !hasEpisodeDraft(episode)) return false;
+  if (episode.script_status === "segmented") return true;
+  return active.status === "ready" && active.episode === episode.episode &&
+    active.scriptFile === normalizeScriptFile(episode.script_file);
+}
+
 export function episodeScriptRevisionKey(projectName: string, episode: number): string {
   return `${projectName}::${episode}`;
 }
@@ -98,6 +110,7 @@ export function mergeWorkspaceProject(res: WorkspaceResponse, previous?: Project
       videos: row.videos,
     };
   });
+  if (summary.episodes_summary === null && !previous?.status) return { ...res.project, episodes, status: undefined };
   const status: ProjectStatus = {
     currency: summary.currency,
     needs_repair: summary.needs_repair,
@@ -200,6 +213,12 @@ interface ProjectsState {
   ) => Promise<RefreshProjectResult>;
   receiveScriptBaseline: (project: string, proof: ProjectEventSnapshotPayload["episode_script"]) => void;
   clearActiveEpisodeScript: () => void;
+  hydrateEpisodeWorkspace: (
+    projectName: string,
+    episode: number,
+    options?: { onError?: (err: unknown) => void },
+  ) => Promise<RefreshProjectResult>;
+  cancelEpisodeWorkspaceHydration: () => void;
   refreshProject: (name: string, options?: RefreshProjectOptions) => Promise<RefreshProjectResult>;
 }
 
@@ -214,6 +233,7 @@ export const useProjectsStore = create<ProjectsState>((set, get) => {
   let queuedResolvers: Array<(result: WorkspaceRefreshResult) => void> = [];
 
   let projectScope = new AbortController();
+  let previewScope = new AbortController();
   let scriptScope = new AbortController();
   let scriptGeneration = 0;
   let pendingScript: Promise<RefreshProjectResult> | null = null;
@@ -240,11 +260,18 @@ export const useProjectsStore = create<ProjectsState>((set, get) => {
     });
   };
 
+  const rotatePreviewScope = () => {
+    previewScope.abort();
+    previewScope = new AbortController();
+    return previewScope.signal;
+  };
+
   const rotateProjectScope = () => {
     baseline = undefined;
     degradedRead = undefined;
     projectScope.abort();
     projectScope = new AbortController();
+    rotatePreviewScope();
   };
 
   const rotateScriptScope = () => {
@@ -509,6 +536,9 @@ export const useProjectsStore = create<ProjectsState>((set, get) => {
         useItemLocationsStore.getState().reset(name);
       }
     }
+    if (name === null || data === null || Boolean(data.status)) {
+      rotatePreviewScope();
+    }
     set((s) => {
       const nextScripts =
         scripts !== undefined
@@ -639,7 +669,7 @@ export const useProjectsStore = create<ProjectsState>((set, get) => {
         const isCurrentProject =
           currentProjectName === curName || (currentProjectName === null && !hasLoadedAnyProject);
         if (!supersededByOtherProject && !signal.aborted && isCurrentProject) {
-          const wasInitialLoad = currentProjectData === null;
+          const wasInitialLoad = prior === null;
           const partial = res.summary.episodes_summary === null;
           const merged = mergeWorkspaceProject(res, partial ? currentProjectData : null);
           const fingerprints = partial ? { ...get().assetFingerprints, ...res.asset_fingerprints } : res.asset_fingerprints;
@@ -755,6 +785,33 @@ export const useProjectsStore = create<ProjectsState>((set, get) => {
           generation: scriptGeneration,
         },
       }));
+    },
+
+    hydrateEpisodeWorkspace: async (projectName, episode, options) => {
+      if (!projectName || isDemoProject(projectName)) return "cancelled";
+      const previewSignal = rotatePreviewScope();
+      const signal = AbortSignal.any([projectScope.signal, previewSignal]);
+      try {
+        const response = await API.getWorkspace(projectName, { episodes: [episode], signal });
+        if (signal.aborted) return "cancelled";
+        const state = get();
+        if (state.currentProjectName !== projectName || state.currentProjectData?.status) return "cancelled";
+        if (!state.projectDetailLoading && state.currentProjectData === null) return "cancelled";
+        const target = response.summary.episodes.find((row) => row.episode === episode);
+        if (state.projectDetailLoading && (!hasEpisodeDraft(target) || response.summary.needs_repair)) return "cancelled";
+        const merged = mergeWorkspaceProject(response, state.currentProjectData);
+        const fingerprints = { ...state.assetFingerprints, ...response.asset_fingerprints };
+        commitCurrentProject(projectName, merged, undefined, fingerprints, { episodes: [episode] }, false);
+        return "success";
+      } catch (error) {
+        if (signal.aborted) return "cancelled";
+        if (!get().projectDetailLoading) options?.onError?.(error);
+        return "failed";
+      }
+    },
+
+    cancelEpisodeWorkspaceHydration: () => {
+      rotatePreviewScope();
     },
 
     refreshProject: (name, options) => {

@@ -1,15 +1,6 @@
 """脚本条目离开正式脚本时，名下的媒体与版本历史移进项目回收站（``docs/adr/0107``）。
 
-两种离开：结构移除（批量编辑与 Agent 的 remove、覆盖正式脚本时旧脚本里不再有的条目），以及身份替换
-（重插新条目、覆盖正式脚本时新条目沿用了旧编号）。替换时留着旧条目的版本历史或当前文件，下一次生成会把旧内容
-接成新条目的历史，回滚就能回到不属于它的画面，所以两种都把旧条目的文件整个移走。
-
-每个条目一条带结构快照的删除记录，快照里是改写前的剧本，恢复见 :mod:`lib.project.script_entry_trash`。
-结构移除的条目即使没有文件也建记录（恢复的是条目本身）；覆盖正式脚本时旧脚本里的条目都算结构移除。
-批量编辑里只被替换、不在改前脚本里的编号没有条目可恢复，没有文件时不建记录。
-
-单列一个模块是因为它同时需要 :mod:`lib.artifacts.version_manager`（历史）与
-:mod:`lib.project.resource_paths`（当前文件路径）。
+主动移除时按条目留存可恢复的结构快照。确认整份新剧本时，只归档被替换剧本、旧条目的文件及版本记录。
 """
 
 from __future__ import annotations
@@ -23,12 +14,11 @@ from lib.artifacts.formal_write import formal_write_transaction
 from lib.artifacts.version_manager import VersionManager
 from lib.infra.path_safety import try_safe_join
 from lib.project import project_trash
+from lib.project.project_trash import SCRIPT_ENTRY_KIND, SCRIPT_OVERWRITE_KIND
 from lib.project.resource_paths import END_FRAME_RESOURCE_TYPE, resource_relative_path
 from lib.script.item_excerpt import position_snapshot
 from lib.speech.narration_config import POST_PRODUCTION, USE_TTS
 from lib.speech.speech_presentation import presentation_artifact_paths
-
-SCRIPT_ENTRY_KIND = "script_entry"
 
 ENTRY_MEDIA_RESOURCE_TYPES: tuple[str, ...] = (
     "storyboards",
@@ -60,6 +50,14 @@ def entry_derived_paths(episode: int, entry_id: str) -> list[str]:
         return []
 
 
+def _existing_project_files(project_dir: Path, candidates: Iterable[str]) -> list[str]:
+    return [
+        rel
+        for rel in dict.fromkeys(candidates)
+        if (path := try_safe_join(project_dir, rel)) is not None and path.is_file() and not path.is_symlink()
+    ]
+
+
 def entry_files(project_dir: Path, episode: int, entry_id: str) -> tuple[list[str], dict[str, dict[str, Any]]]:
     """``project_dir`` 里属于这个条目的普通文件与版本记录；删除时取当前项目，恢复时取迁移后的临时项目。
 
@@ -72,12 +70,49 @@ def entry_files(project_dir: Path, episode: int, entry_id: str) -> tuple[list[st
         *entry_derived_paths(episode, entry_id),
         *versions.snapshot_files(history),
     ]
-    files = [
-        rel
-        for rel in dict.fromkeys(candidates)
-        if (path := try_safe_join(project_dir, rel)) is not None and path.is_file() and not path.is_symlink()
-    ]
-    return files, history
+    return _existing_project_files(project_dir, candidates), history
+
+
+def archive_script_overwrite(
+    project_dir: Path,
+    episode: int,
+    filename: str,
+    removed_ids: Collection[str],
+    before: Mapping[str, bytes],
+    then: Callable[[], None] | None,
+) -> None:
+    versions = VersionManager(project_dir)
+    resources = [(kind, uid) for uid in removed_ids for kind in ENTRY_MEDIA_RESOURCE_TYPES]
+    with formal_write_transaction(versions.versions_file):
+        history = versions.resource_records(resources)
+        candidates = [
+            path for uid in removed_ids for path in (*entry_media_paths(uid), *entry_derived_paths(episode, uid))
+        ]
+        candidates.extend(versions.snapshot_files(history))
+        files = _existing_project_files(project_dir, candidates)
+        from lib.material.work_files import archived_remote_files
+
+        remote = archived_remote_files(history)
+        script = f"scripts/{filename}"
+        archived = {script: before[script]}
+        if history:
+            archived["versions/versions.json"] = json.dumps(history, ensure_ascii=False).encode()
+        record = project_trash.record_deletion(
+            project_dir,
+            {"kind": SCRIPT_OVERWRITE_KIND, "episode": episode, "path": script},
+            files,
+            archived_bytes=archived,
+            remote_files=tuple(rel for rel in remote if rel in candidates),
+            download_only=True,
+        )
+        try:
+            if history:
+                versions.detach_resources(_resources(history))
+            if then is not None:
+                then()
+        except BaseException:
+            project_trash.withdraw(project_dir, record.id, moved_files=files)
+            raise
 
 
 def trash_entries(
@@ -99,6 +134,8 @@ def trash_entries(
     versions = VersionManager(project_dir)
     records: list[project_trash.TrashRecord] = []
     script_before = _script_before(before, script_file)
+    detached = []
+    shared_snapshot: dict[str, Path] | None = {} if versions.sqlite.path.is_file() else None
     with formal_write_transaction(versions.versions_file):
         try:
             for entry_id, item_kind in entries.items():
@@ -115,10 +152,21 @@ def trash_entries(
                 }
                 records.append(
                     project_trash.record_deletion(
-                        project_dir, obj, files, snapshot=True, before=before, histories=history
+                        project_dir,
+                        obj,
+                        files,
+                        snapshot=True,
+                        before=before,
+                        histories=history,
+                        shared_snapshot=shared_snapshot,
                     )
                 )
-                versions.detach_resources(_resources(history))
+                if shared_snapshot is not None:
+                    detached.extend(_resources(history))
+                else:
+                    versions.detach_resources(_resources(history))
+            if detached:
+                versions.detach_resources(detached)
             if then is not None:
                 then()
         except BaseException:

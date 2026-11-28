@@ -1,7 +1,8 @@
+import { hasEpisodeDraft } from "@/utils/episode-display";
 import { stripScriptsPrefix } from "@/utils/task-target";
 import { useCallback, useRef } from "react";
 import { errMsg, voidPromise } from "@/utils/async";
-import { Route, Switch, Redirect } from "wouter";
+import { Route, Switch, Redirect, useRoute } from "wouter";
 import {
   WORKSPACE_ROUTE_CHARACTERS,
   WORKSPACE_ROUTE_SCENES,
@@ -11,7 +12,7 @@ import {
   WORKSPACE_ROUTE_FILES,
 } from "@/app-routes";
 import { useTranslation } from "react-i18next";
-import { normalizeScriptFile, useProjectsStore } from "@/stores/projects-store";
+import { canPreviewEpisode, normalizeScriptFile, useProjectsStore } from "@/stores/projects-store";
 import { refreshAfterWrite } from "@/components/canvas/shared/refreshAfterWrite";
 import { useDemoWorkbench } from "@/onboarding/use-demo-workbench";
 import { isDemoProject } from "@/onboarding/demo-project";
@@ -100,6 +101,7 @@ export function StudioCanvasRouter() {
     activeEpisodeScript,
     projectDetailLoading,
   } = useProjectsStore();
+  const [, episodeParams] = useRoute(EPISODE_ROUTE_PATH);
   const demoMode = useDemoWorkbench();
 
   const capabilitiesEnabled = !demoMode && !isDemoProject(currentProjectName);
@@ -391,7 +393,9 @@ export function StudioCanvasRouter() {
     void handleGenerateProduct(...args).catch(console.error);
   }, [handleGenerateProduct]);
 
-  if (!currentProjectName || projectDetailLoading) {
+  const targetEpisode = currentProjectData?.episodes.find((ep) => ep.episode === Number(episodeParams?.episodeId));
+  const episodeReady = canPreviewEpisode(targetEpisode, activeEpisodeScript);
+  if (!currentProjectName || (projectDetailLoading && !episodeReady)) {
     return (
       <div className="flex h-full items-center justify-center text-muted-foreground">
         {t("loading_placeholder")}
@@ -494,8 +498,7 @@ export function StudioCanvasRouter() {
           const durationWarningReason = (seconds: number) =>
             durationOutOfRangeReason(seconds, capabilities);
           const durationEndpointFixed = capabilities.durationEndpointFixed;
-          const hasDraft =
-            episode?.script_status === "segmented" || episode?.script_status === "generated";
+          const hasDraft = hasEpisodeDraft(episode);
           const isAd = currentProjectData?.content_mode === "ad";
           return (
             <EpisodePage
